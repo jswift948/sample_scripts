@@ -1,0 +1,2307 @@
+#!/bin/bash
+# dist_tool
+# Purpose: This scripts job is to distribute files from the source directory
+# to remote systems using a control file that defines where to install the file.
+
+# Requirements: The dnsg script is required
+
+# Written By: Jon Swift 02/11
+# Updated 08/11, corrected bug with using rsync control file
+# Updated 09/11, corrected bug in the building the array SYS_INVENTORY
+# Updated 09/11, corrected bug when running in non-interactive mode
+# Updated 01/12, Added support for WPB
+# Updated 08/13, Removed Canoga subnets, and 224 WPB subnet
+# Updated 11/15, Changed to work with the service account svccpcrra
+# Updated 12/16, Added subnet 139 to CANOGA_SERVER_SUBNETS
+
+PROG=`basename $0`
+OS=`uname -s`
+PID=$$
+TTY=`tty | awk -F/ '{print $NF}'`
+HOST=`uname -n`
+FILE_DEPOT=/var/tmp/${PROG}_file_depot
+FILE_DEPOT_CONTROL=/var/tmp/${PROG}_file_depot_control
+EMAIL_LIST=jsswift
+WAIT=10
+LOCK_FILE=/tmp/${PROG}_lock.${TTY}
+INVENTORY_SCRIPT=/stds/admin/bin/inventory
+INVENTORY_DIR=/var/tmp/dist_tool_inventory
+DNSG=/usr/local/bin/dnsg
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/ucb:/apps/gnu/bin
+PPid=`ps -aef | grep -w ${PID} | gawk -v pid=${PID} '{if($2==pid)print $3}'`
+LOG=/tmp/${PROG}.log.${TTY}
+SITES="CANOGA WPB"
+TIMEOUT=NO
+CANOGA_BASENET="172.19"
+CANOGA_SERVER_SUBNETS="130 132 133 134 135 139"
+WPB_BASENET="10.11"
+WPB_SERVER_SUBNETS="15 224 252"
+US="us[0-3][0-9][0-9]"
+DOMAIN="pwrutc\.com"
+EXTRA_HOSTS="tele-cpc-|cfd00|node0|fslhuntvnbm1"
+EXCLUDE_HOSTS_PART1='^drac-|^idrac-|^ilo-|^ipmi-|^alom-|-back[1,2]|desoto-console|-samba|pwrcphmc1'
+EXCLUDE_HOSTS_PART2='clariion|bfcs|-vip|-scan|-1t|-t|dev-cpc-hpc0|^cmc1-|pwr-plv-0|pwr-dns-0|^pusw'
+EXCLUDE_HOSTS_PART3='Received|1H|20M|8H|Address:|510accxes|^hercules|^pwr-vm|^wpp|^arwppprt|^fcswwp'
+EXCLUDE_HOSTS="${EXCLUDE_HOSTS_PART1}|${EXCLUDE_HOSTS_PART2}|${EXCLUDE_HOSTS_PART3}"
+> ${LOG}
+chmod 666 ${LOG}
+
+# Confirm this script is run as svccpcrra
+################################################################################
+if [ `whoami` != svccpcrra ];then
+	echo -e "\nError: ${PROG} must be run as svccpcrra\n"
+	exit
+fi
+
+# Create $FILE_DEPOT as needed
+################################################################################
+[ ! -d ${FILE_DEPOT} ] && mkdir -p ${FILE_DEPOT}
+
+# Create $FILE_DEPOT_CONTROL as needed
+################################################################################
+[ ! -d ${FILE_DEPOT_CONTROL} ] && mkdir -p ${FILE_DEPOT_CONTROL}
+
+# Create $INVENTORY_DIR as needed
+################################################################################
+[ ! -d ${INVENTORY_DIR} ] && mkdir -p ${INVENTORY_DIR}
+
+# Set OS specefic variables
+################################################################################
+if [ ${OS} = Linux ];then
+	PING () {
+	ping -f -i .3 -w 1 ${SYSTEM} | grep -c '100% packet loss'
+	}
+
+	if [ -f /etc/redhat-release ];then
+		if [ `egrep -c "release 6|release 7" /etc/redhat-release` -eq 1 ];then
+			TIMEOUT=YES
+		fi
+	fi
+
+elif [ ${OS} = SunOS ];then
+	PING () {
+	ping -c2 ${SYSTEM} 2 | grep -c 'no answer'
+	}
+else
+	echo -e "\nError: ${PROG} not supported on ${OS}\n"
+	exit
+fi
+
+
+# Set INTERACTIVE to yse if it's being used interactively
+################################################################################
+tty -s
+if [ $? -eq 0 ];then
+	INTERACTIVE=YES
+else
+	INTERACTIVE=NO
+fi
+
+# Confirm $DNSG exists
+################################################################################
+if [ ! -x ${DNSG} ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The required script, \"${DNSG}\" does not exist on ${HOST}, ${DATE_TIME}\n"
+
+	if [ ${INTERACTIVE} = YES ];then
+       		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+       		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Confirm this script is not already running
+################################################################################
+if [ `ps -aef | grep ${PROG} | egrep -v "${PID}|${PPid}|grep" | wc -l` -ge 1 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The ${PROG} is already running on ${HOST}, unable to continue, ${DATE_TIME}\n" 
+
+	if [ ${INTERACTIVE} = YES ];then
+       		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+       		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Function to display Usage
+################################################################################
+USAGE () {
+echo -e "\nUsage: ${PROG}\n
+ \t ** Function Options **\n
+ -C cmd\t\tExecute command on remote system(s)
+ -F\t\tDistribute file to remote system(s)
+ -I\t\tInventory remote system(s)\n
+\t ** System Name Options **\n
+ -A\t\tAll System(s)
+\t\t\tAll is defined as: server subnets, all usxxx, plus EXTRA_SYSTEMS
+ -H file\tFile defining host name(s)
+ -N sub\t\tAll systems on network subnet
+ -S sys\t\tSingle system, sys
+ -X sys\t\tExclude system, sys
+\t\t\tThe -A, -H, -N and -S options are mutually exclusive
+\n\t ** All System Name secondary options **\n
+ -c ver\t\tAll CentOS Linux 4, 5 or 6 systems
+ -h\t\tAll HP-UX systems
+ -i\t\tAll IBM AIX systems
+ -n\t\tAll Novell SuSE Linux systems
+ -r ver\t\tAll RedHat Linux 4, 5 or 6 systems
+ -s ver\t\tAll SunOS 8, 9 or 10 systems
+\t\t\tUse \"all\" to define all versions of an OS
+\n\t ** File Distribution secondary options **\n
+ -a\t\tDistribute all file(s) in the directory,
+\t\t\t\"${FILE_DEPOT}\" using the control file(s)
+\t\t\tfound in, \"${FILE_DEPOT_CONTROL}\" to
+\t\t\tdefine where to distribute the file(s). One control file per
+\t\t\tfile to be distributed. The control file must be named the
+\t\t\tsame as the file to be distributed with a .control extension.
+\t\t\tTo distribute a new file, add file to be distributed to
+\t\t\t${FILE_DEPOT}. Then copy 
+\t\t\t${FILE_DEPOT}/TEMPLATE.control to
+\t\t\t${FILE_DEPOT_CONTROL}/FileName.control. Then
+\t\t\tedit ${FILE_DEPOT_CONTROL}/FileName.control 
+\t\t\tto meet requirements.
+ -f file\tDistrubute the single file, \"file\"
+ -t dir\t\tTarget directory to install \"file\" into
+\t\t\tThe -a and \"-f & -t\" options are mutually exclusive
+\t\t\tThe -f and -t options must be used together
+\n\t ** Inventory option **\n
+ -d\t\tDelete existing Inventory\n
+\n\t ** Kill Timeout option **\n
+ -k secs\tTime in seconds to wait before killing ssh/rsync process
+\t\t\tDefault time period, 10 seconds\n\n
+\t ***  Required Options   ***\n
+ Select 1 Function option
+ Select 1 Remote system option
+ Select as many optional secondary options as needed\n\n
+\t ***  Examples  ***\n
+ * Inventory all systems
+\t${PROG} -I -A\n
+ * Inventory system1
+\t${PROG} -I -S system1\n
+ * Inventory all systems on subnet 172.19.130
+\t${PROG} -I -N 130\n
+ * Delete existing Inventory
+\t${PROG} -Id\n
+ * Execute \"uname -a\" on all SunOS systems
+\t${PROG} -C \"uname -a\" -A -s all\n
+ * Execute \"uname -a\" on all RedHat EL4 systems excluding system1 and system2
+\t${PROG} -C \"uname -a\" -A -r 4 -X \"system1 system2\"\n
+ * Execute \"uname -r\" and \"uname -n\" on RedHat EL4 & EL5 systems
+\t${PROG} -C \"uname -r;uname -n\" -Ar 4 -r 5\n
+ * Execute \"uname -r\" and \"uname -n\" on all CentOS systems
+\t${PROG} -C \"uname -r;uname -n\" -A -c ALL\n
+ * Execute \"uname -a\" on all CentOS systems and on RedHat EL4 systems
+\t${PROG} -C \"uname -a\" -A -c ALL -r 4\n
+ * Execute \"uname -r\" and \"uname -n\" on ractst01-04 systems & exclude ractst03
+\t${PROG} -C \"uname -r;uname -n\" -S ractst0 -X ractst03\n
+ * Execute \"/abc\" on all SunOS systems, with kill time set to 2 minutes
+\t${PROG} -C /abc -A -s all -k 120\n
+ * Distrubute the single file \"/etc/issue\" to the directory \"/etc\" 
+   on system1 and system2
+\t${PROG} -F -f /etc/issue -t /etc -S \"system1 system2\"\n
+ * Distrubute the single file \"/etc/issue\" to the directory \"/etc\"
+   to the systems listed in the file \"/tmp/system_list1\"
+\t${PROG} -F -f /etc/issue -t /etc -H /tmp/system_list1\n
+ * Distrubute all files in ${FILE_DEPOT}/
+\tto systems defined in ${FILE_DEPOT_CONTROL}/
+\t${PROG} -Fa" | more
+exit
+}
+
+# Display usage as needed
+################################################################################
+[ $# -eq 0 ] && USAGE
+
+# Parse command line options
+################################################################################
+while getopts "AC:FH:IN:S:X:ac:df:hik:l:nr:s:t:" OPT
+do
+	case ${OPT} in
+
+		A ) # Defines ALL remote systems
+		#########################################
+		ALL_SYSTEMS=YES
+
+		# Confirm only $ALL_SYSTEMS is set
+		if [ "${SINGLE_SYSTEM}" = YES -o "${FILE_SYSTEM}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		C ) # Command Execution
+		#########################################
+		COMMAND=YES
+		COMMANDS=${OPTARG}
+
+		# Confirm that $FILE_DIST and $INVENTORY are not set
+		if [ "${FILE_DIST}" = YES -o "${INVENTORY}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		F ) # File Distrubtion
+		#########################################
+		FILE_DIST=YES
+
+		# Confirm that $COMMAND and $INVENTORY are not set
+		if [ "${COMMAND}" = YES -o "${INVENTORY}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		H ) # Define FILE_SYSTEM
+		#########################################
+		FILE_SYSTEM=YES
+		HOSTS_FILE=${OPTARG}
+
+		# Confirm only $FILE_SYSTEM is set
+		if [ "${SINGLE_SYSTEM}" = YES -o "${ALL_SYSTEMS}" = YES -o "${SINGLE_SUBNET}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+
+		# Confirm that the file $HOSTS_FILE exists
+		if [ ! -s ${HOSTS_FILE} ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		I ) # Create Inventory
+		#########################################
+		INVENTORY=YES
+
+		# Confirm that $FILE_DIST and $COMMAND are not set
+		if [ "${FILE_DIST}" = YES -o "${COMMAND}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+	
+		S ) # Define single remote system	
+		#########################################
+		SINGLE_SYSTEM=YES
+		SYSTEMS="${OPTARG}"
+
+		# Confirm $FILE_DIST is set to YES
+		if [ "${ALL_SYSTEMS}" = YES -o "${FILE_SYSTEM}" = YES -o "${SINGLE_SUBNET}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		N ) # Define subnet
+		#########################################
+		SINGLE_SUBNET=YES
+		SUBNET=${OPTARG}
+
+		# Confirm $FILE_DIST is set to YES
+		if [ "${ALL_SYSTEMS}" = YES -o "${FILE_SYSTEM}" = YES -o "${SINGLE_SYSTEM}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+	
+		X ) # Exclude system(s)
+		#########################################
+		EXCLUDE_SYSTEMS="${OPTARG}"
+
+		# Confirm $EXCLUDE_SYSTEMS is set
+		if [ "${EXCLUDE_SYSTEMS}" = "" ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		a ) # Distrubute all files in $SOURCE
+		#########################################
+		ALL_FILES=YES
+
+		# Confirm $COMMAND is not set
+		if [ "${COMMAND}" = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		c ) #  All CentOS Linux 4, 5 or 6 systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		
+		if [ "${OPTARG}" = all -o "${OPTARG}" = ALL ] ;then 
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS="Linux Linux Linux"
+				OS_TYPES="CentOS CentOS CentOS"
+				OS_VERSIONS="4 5 6"
+			else
+				OSS="${OSS} Linux Linux Linux"
+				OS_TYPES="${OS_TYPES} CentOS CentOS CentOS"
+				OS_VERSIONS="${OS_VERSIONS} 4 5 6"
+			fi
+		else
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS=Linux
+				OS_TYPES=CentOS
+				OS_VERSIONS=${OPTARG}
+			else
+				OSS="${OSS} Linux"
+				OS_TYPES="${OS_TYPES} CentOS"
+				OS_VERSIONS="${OS_VERSIONS} ${OPTARG}"
+			fi
+	
+			# Confirm $OS_VERSIONS is set properly
+			if [ `echo ${OS_VERSIONS} | grep -c '[4-6]'` -eq 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+				sleep 2
+				USAGE
+			fi
+		fi
+		;;
+
+		d ) # Delete Inventory files
+		#########################################
+
+		# Confirm $INVENTORY is set to YES
+		if [ "${INVENTORY}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+
+		echo -e "\nDeleting existing inventory files\n"
+		rm -rf ${INVENTORY_DIR}
+		mkdir -p ${INVENTORY_DIR}
+		exit
+		;;
+	
+		f ) # Define a single file	
+		#########################################
+		SINGLE_FILE=YES
+		FILE=${OPTARG}
+
+		# Confirm $COMMAND is not set
+		if [ "${COMMAND}" = YES ];then
+			echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+	
+		# Confirm ${FILE} exists
+		if [ ! -f ${FILE} ];then 
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required file \"${FILE}\" does not exist on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+        			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+        			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		else
+
+			# Set LOCAL_FILE to just the file name part of $FILE
+			LOCAL_FILE=`basename ${FILE}`
+		fi
+
+		# Confirm $LOCAL_FILE is set
+		if [ "${LOCAL_FILE}" = "" ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable \"LOCAL_FILE\" not set on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+        			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+        			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+		;;
+
+		h ) # All HPUX systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+
+		# Set OSS, OS_TYPES, and OS_VERSIONS
+		if [ "${OSS}" = "" ];then
+			OSS=HP-UX
+			OS_TYPES=NA
+			OS_VERSIONS=NA
+		else
+			OSS="${OSS} HP-UX"
+			OS_TYPES="${OS_TYPES} NA"
+			OS_VERSIONS="${OS_VERSION} NA"
+		fi
+		;;
+
+		i ) # All IBM AIX systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+
+		# Set OSS, OS_TYPES, and OS_VERSIONS
+		if [ "${OSS}" = "" ];then
+			OSS=AIX
+			OS_TYPES=NA
+			OS_VERSIONS=NA
+		else
+			OSS="${OSS} AIX"
+			OS_TYPES="${OS_TYPES} NA"
+			OS_VERSIONS="${OS_VERSION} NA"
+		fi
+		;;
+
+		k ) # Set $WAIT to desired wait kill time
+		#########################################
+		WAIT=${OPTARG}
+
+		# Confirm $WAIT is set to a number
+		if [ `echo ${WAIT} | grep -c '[^0-9]'` -eq 1 ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		n ) # All Novell SuSE Linux systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+
+		# Set OSS, OS_TYPES, and OS_VERSIONS
+		if [ "${OSS}" = "" ];then
+			OSS=Linux
+			OS_TYPES=SuSE
+			OS_VERSIONS=10
+		else
+			OSS="${OSS} Linux"
+			OS_TYPES="${OS_TYPES} SuSE"
+			OS_VERSIONS="${OS_VERSION} 10"
+		fi
+		;;
+
+		r ) #  All RedHat Linux 4, 5 or 6 systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		
+		if [ "${OPTARG}" = all -o "${OPTARG}" = ALL ] ;then 
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS="Linux Linux Linux"
+				OS_TYPES="RedHat RedHat RedHat"
+				OS_VERSIONS="4 5 6"
+			else
+				OSS="${OSS} Linux Linux Linux"
+				OS_TYPES="${OS_TYPES} RedHat RedHat RedHat"
+				OS_VERSIONS="${OS_VERSIONS} 4 5 6"
+			fi
+		else
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS=Linux
+				OS_TYPES=RedHat
+				OS_VERSIONS=${OPTARG}
+			else
+				OSS="${OSS} Linux"
+				OS_TYPES="${OS_TYPES} RedHat"
+				OS_VERSIONS="${OS_VERSIONS} ${OPTARG}"
+			fi
+	
+			# Confirm $OS_VERSIONS is set properly
+			if [ `echo ${OS_VERSIONS} | grep -c '[4-6]'` -eq 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+				sleep 2
+				USAGE
+			fi
+		fi
+		;;
+
+		s ) #  All SunOS 8, 9 or 10 systems
+		#########################################
+		PARTIAL=YES
+
+		# Confirm $ALL_SYSTEMS is set to YES
+		if [ "${ALL_SYSTEMS}" != YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		fi
+		
+		if [ "${OPTARG}" = all -o "${OPTARG}" = ALL ] ;then 
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS="SunOS SunOS SunOS"
+				OS_TYPES="Solaris Solaris Solaris"
+				OS_VERSIONS="8 9 10"
+			else
+				OSS="${OSS} SunOS SunOS SunOS"
+				OS_TYPES="${OS_TYPES} Solaris Solaris Solaris"
+				OS_VERSIONS="${OS_VERSIONS} 8 9 10"
+			fi
+		else
+
+			# Set OSS, OS_TYPES, and OS_VERSIONS
+			if [ "${OSS}" = "" ];then
+				OSS=SunOS
+				OS_TYPES=Solaris
+				OS_VERSIONS=${OPTARG}
+			else
+				OSS="${OSS} SunOS"
+				OS_TYPES="${OS_TYPES} Solaris"
+				OS_VERSIONS="${OS_VERSIONS} ${OPTARG}"
+			fi
+	
+			# Confirm $OS_VERSIONS is set properly
+			if [ `echo ${OS_VERSIONS} | grep -c '[8,9,10]'` -eq 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+				sleep 2
+				USAGE
+			fi
+		fi
+		;;
+
+		t ) # Target directory to install $FILE into on remote system
+		#########################################
+		TARGET_DIR=YES
+		REMOTE_DIR=${OPTARG}
+
+		# Confirm ${REMOTE_DIR starts with a slash "/"
+		if [ `echo ${REMOTE_DIR} | cut -c1` != / ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nError: \"${REMOTE_DIR}\" must begin with a slash \"/\""
+			[ ${INTERACTIVE} = YES ] && echo -e "Invalid syntax"
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		* ) # Error
+		#########################################
+		if [ ${INTERACTIVE} = YES ];then
+			[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+			sleep 2
+			USAGE
+		else
+			exit
+		fi
+		;;
+	esac
+done
+
+# Confirm the correct syntax was used
+################################################################################
+if [ "${FILE_DIST}" = "" -a "${COMMAND}" = "" -a "${INVENTORY}" = "" ];then
+
+	[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+	sleep 2
+	USAGE
+
+elif [ "${ALL_SYSTEMS}" != YES -a "${SINGLE_SYSTEM}" != YES -a "${FILE_SYSTEM}" != YES \
+	-a "${SINGLE_SUBNET}" != YES -a "${FILE_DIST}" != YES ];then
+
+	[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+	sleep 2
+	USAGE
+fi
+
+if [ "${FILE_DIST}" = YES -a "${ALL_FILES}" = YES ];then
+	if [ "${TARGET_DIR}" = YES -o "${SINGLE_FILE}" = YES ];then
+
+		[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+		sleep 2
+		USAGE
+	fi
+elif [ "${FILE_DIST}" = YES -a "${ALL_FILES}" != YES ];then
+	if [ "${TARGET_DIR}" != YES -o "${SINGLE_FILE}" != YES ];then
+
+		[ ${INTERACTIVE} = YES ] && echo -e "\nInvalid syntax"
+		sleep 2
+		USAGE
+	else
+		FILE_USER_DEFINED=YES
+		REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+	fi
+fi
+
+# The BUILD_SYS_INVENTORY function is used build the array SYS_INVENTORY
+# which contains inventory information on each system
+################################################################################
+BUILD_SYS_INVENTORY () {
+	# set -x
+
+	# Clear all old entrys in SYS_INVENTORY
+	unset SYS_INVENTORY[*]
+
+	# cd to inventory directory
+	cd ${INVENTORY_DIR}
+
+	# Confirm there are inventory files
+	if [ `ls -1 * | wc -l` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: There are no inventory files on ${HOST}. Run \"${PROG} -IA\" to resolve problem, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Add each line from each file in $INVENTORY_DIR to $SYS_INVENTORY
+	###########################################################################
+	LOOP=1
+	for SYSTEM_TO_INVENTORY in `ls -1 *`
+	do
+
+		# Set DATA to all of the inventory data in $SYSTEM_TO_INVENTORY
+		if [ -s ${SYSTEM_TO_INVENTORY} ];then
+			DATA=""
+			DATA=`cat ${SYSTEM_TO_INVENTORY}`
+
+			# Confirm $DATA is set
+			if [ "${DATA}" = "" ];then
+
+				# remove zero sized files
+				rm -f ${SYSTEM_TO_INVENTORY}
+
+				# Move onto next file
+				continue
+
+			# Confirm $DATA is set properly
+			elif [ `echo ${DATA} | egrep -c 'SYSTEM'` -eq 0 ];then
+
+				# remove zero sized files
+				rm -f ${SYSTEM_TO_INVENTORY}
+
+				# Move onto next file
+				continue
+	
+			fi
+		else
+			# remove zero sized files
+			rm -f ${SYSTEM_TO_INVENTORY}
+
+			# Move onto next file
+			continue
+		fi
+
+		# Add $DATA to $SYS_INVENTORY
+		SYS_INVENTORY[${LOOP}]=${DATA}
+
+		# Increment LOOP
+		let LOOP=${LOOP}+1
+	done
+}
+
+# The KILL_RSYNC function is used to kill rsync process that did not die by them self
+################################################################################
+KILL_RSYNC () {
+	# set -x
+
+	# Set SYSTEM to the 1st argument to this function
+	SYSTEM=""
+	SYSTEM=$1
+
+	# Confirm $SYSTEM is set
+	if [ "${SYSTEM}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"SYSTEM\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Set RSYNC_FILE to the 2nd argument to this function
+	RSYNC_FILE=""
+	RSYNC_FILE=$2	
+
+	# Confirm $RSYNC_FILE is set
+	if [ "${RSYNC_FILE}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"RSYNC_FILE\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Set REMOTE_RSYNC_FILE to the 3rd argument to this function
+	REMOTE_RSYNC_FILE=""
+	REMOTE_RSYNC_FILE=$3	
+
+	# Confirm $REMOTE_RSYNC_FILE is set
+	if [ "${REMOTE_RSYNC_FILE}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"REMOTE_RSYNC_FILE\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Set LOCK_FILE to the 4th argument to this function
+	LOCK_FILE=""
+	LOCK_FILE=$4	
+
+	# Confirm $LOCK_FILE is set
+	if [ "${LOCK_FILE}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"LOCK_FILE\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	while [ -f ${LOCK_FILE}.${SYSTEM} ]
+	do
+
+		# Set RSYNC_PID_1 to the PID used by rsync to $SYSTEM
+		RSYNC_PID_1=`pgrep -f "rsync -aq ${RSYNC_FILE} ${SYSTEM}:${REMOTE_RSYNC_FILE}"`
+
+		# Confirm $RSYNC_PID_1 is set
+		[ "${RSYNC_PID_1}" = "" ] && continue
+
+		# Wait $WAIT seconds
+		sleep ${WAIT}
+		
+		# Set RSYNC_PID_2 to the PID used by rsync to $SYSTEM
+		RSYNC_PID_2=`pgrep -f "rsync -aq ${RSYNC_FILE} ${SYSTEM}:${REMOTE_RSYNC_FILE}"`
+
+		# If after $WAIT seconds RSYNC_PID_1 is equal to RSYNC_PID_2 
+		# double check it
+		if [  "${RSYNC_PID_1}" = "${RSYNC_PID_2}" ];then
+
+			# Wait 5 seconds
+			sleep 5	
+		
+			# Set RSYNC_PID_2 to the PID used by rsync to $SYSTEM
+			RSYNC_PID_2=`pgrep -f "rsync -aq ${RSYNC_FILE} ${SYSTEM}:${REMOTE_RSYNC_FILE}"`
+
+			# If after another 5 seconds RSYNC_PID_1 is equal to RSYNC_PID_2
+			# kill the rsync process
+			if [  "${RSYNC_PID_1}" = "${RSYNC_PID_2}" ];then
+
+				# Kill $RSYNC_PID_2
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "\n${PROG} killing ${RSYNC_PID_2}, on ${SYSTEM}, ${DATE_TIME}" |
+						tee -a ${LOG}
+				else
+					echo -e "\n${PROG} killing ${RSYNC_PID_2}, on ${SYSTEM}, ${DATE_TIME}" >> ${LOG}
+				fi
+				sudo pkill -9 -f "rync -aq ${RSYNC_FILE} ${SYSTEM}:${REMOTE_RSYNC_FILE}" 
+			fi
+			rm -f ${LOCK_FILE}.${SYSTEM}
+		fi
+	done
+}
+
+# The KILL_SSH function is used to kill ssh process that do not die by them self
+################################################################################
+KILL_SSH () {
+	# set -x
+
+	# Set SYSTEM to the 1st argument to this function
+	SYSTEM=""
+	SYSTEM=$1
+
+	# Confirm $SYSTEM is set
+	if [ "${SYSTEM}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"SYSTEM\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Set LOCK_FILE to the 2nd argument to this function
+	LOCK_FILE=""
+	LOCK_FILE=$2	
+
+	# Confirm $LOCK_FILE is set
+	if [ "${LOCK_FILE}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"LOCK_FILE\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+        		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+        		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+        		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	while [ -f ${LOCK_FILE}.${SYSTEM} ]
+	do
+
+		# Set SSH_PID_1 to the PID used by ssh to $SYSTEM
+		SSH_PID_1=`pgrep -f "ssh -q ${SYSTEM}"`
+
+		# Confirm $SSH_PID_1 is set
+		[ "${SSH_PID_1}" = "" ] && continue
+
+		# Wait $WAIT seconds
+		sleep ${WAIT}
+		
+		# Set SSH_PID_2 to the PID used by ssh to $SYSTEM
+		SSH_PID_2=`pgrep -f "ssh -q ${SYSTEM}"`
+
+		# If after $WAIT seconds SSH_PID_1 is equal to SSH_PID_2 
+		# double check it
+		if [  "${SSH_PID_1}" = "${SSH_PID_2}" ];then
+
+			# Wait $WAIT seconds
+			sleep ${WAIT}	
+		
+			# Set SSH_PID_2 to the PID used by ssh to $SYSTEM
+			SSH_PID_2=`pgrep -f "ssh -q ${SYSTEM}"`
+
+			# If $SSH_PID_1 is still equal to $SSH_PID_2
+			# kill $SSH_PID_2
+			if [  "${SSH_PID_1}" = "${SSH_PID_2}" ];then
+
+				# Kill $SSH_PID_2
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "\n${PROG} killing ${SSH_PID_2}, for ${SYSTEM}, ${DATE_TIME}" |
+						tee -a ${LOG}
+				else
+					echo -e "\n${PROG} killing ${SSH_PID_2}, for ${SYSTEM}, ${DATE_TIME}" >> ${LOG}
+				fi
+				sudo kill -9 ${SSH_PID_2}
+			fi
+			rm -f ${LOCK_FILE}.${SYSTEM}
+		fi
+	done
+}
+
+# The TEST_UP_DOWN function is used to determine if $SYSTEM is up or down
+################################################################################
+TEST_UP_DOWN () {
+	# set -x
+
+	# Pre Set UP_DOWN to a null
+	UP_DOWN=""
+
+	# Determine is $SYSTEM is up
+	if [ `PING` -eq 0 ];then
+
+		if [ ${TIMEOUT} = YES ];then
+			timeout --signal=9 5s rpcinfo -p ${SYSTEM} 1> /dev/null 2>&1
+			STATUS=$?
+		else
+			rpcinfo -p ${SYSTEM} 1> /dev/null 2>&1
+			STATUS=$?
+		fi
+		if [ ${STATUS} -eq 0 ];then
+			UP_DOWN=UP
+		else
+			UP_DOWN=DOWN
+			[ ${INTERACTIVE} = YES ] && echo -e "\n${SYSTEM} is down"
+		fi
+	else
+		UP_DOWN=DOWN
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${SYSTEM} is down"
+	fi
+}
+
+# The SUB_MAIN function is used by the MAIN function
+################################################################################
+SUB_MAIN () {
+	# set -x
+
+	EXCLUDE_LOOP=0
+	SKIP=NO
+	LOG=$1
+	while [ "${EXCLUDE_SYSTEMS_ARRAY[${EXCLUDE_LOOP}]}" ]
+	do
+       		# Set EXCLUDE_SYSTEM to each line in $EXCLUDE_SYSTEMS 1 at a time
+       		EXCLUDE_SYSTEM=${EXCLUDE_SYSTEMS_ARRAY[${EXCLUDE_LOOP}]}
+		
+		# Confirm $EXCLUDE_SYSTEM is set
+		if [ "${EXCLUDE_SYSTEM}" = "" ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable, \"EXCLUDE_SYSTEM\" is not set on ${HOST}, ${DATE_TIME}\n"
+		
+			if [ ${INTERACTIVE} = YES ];then
+       					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+       					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+			fi
+		
+			# Increment EXCLUDE_LOOP
+ 			let EXCLUDE_LOOP=${EXCLUDE_LOOP}+1
+
+			if [ ${EXCLUDE_SYSTEM} = ${SYSTEM} ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nSkipping ${SYSTEM}"
+				SKIP=YES
+				break
+			else
+				SKIP=NO
+			fi
+		done
+		[ "${SKIP}" = YES ] && continue
+
+		TEST_UP_DOWN
+		if [ "${UP_DOWN}" = UP ];then 
+
+			# Create lock file controlling the KILL_SSH function
+			touch ${LOCK_FILE}.${SYSTEM}
+
+			# Set trap so if someone hits ctrl C (^C) 
+			# the lock file will be removed
+			trap 'rm -f ${LOCK_FILE}.${SYSTEM}; exit 1' 1 2 3 6 15
+	
+			if [ "${FILE_USER_DEFINED}" != YES ];then
+				# Start KILL_SSH in background
+				KILL_SSH ${SYSTEM} ${LOCK_FILE} &
+			else
+				# Start KILL_RSYNC in background
+				KILL_RSYNC ${SYSTEM} ${FILE} ${REMOTE_FILE} ${LOCK_FILE} &
+			fi
+
+			[ ${INTERACTIVE} = YES ] && echo -e "\nWorking on ${SYSTEM}"
+			echo -e "\nWorking on ${SYSTEM}" >> ${LOG}
+
+			# Run $INVENTORY_SCRIPT on $SYSTEM
+			if [ "${INVENTORY}" = YES ];then
+
+				# Only execute ${INVENTORY_SCRIPT} if the 
+				# invetory file ${INVENTORY_DIR}/${SYSTEM}
+				# does not exist
+				if [ -s ${INVENTORY_DIR}/${SYSTEM} ];then
+
+					# Remove lock file, stopping the current KILL_SSH job
+					rm -f ${LOCK_FILE}.${SYSTEM}
+				else
+					# Run inventory script on $SYSTEM	
+					rm -f ${INVENTORY_DIR}/${SYSTEM}
+					MESSAGE="${PROG} running: ssh -q ${SYSTEM} ${INVENTORY_SCRIPT}"
+					[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}\n"
+					echo "${MESSAGE}" >> ${LOG}
+					ssh -q ${SYSTEM} sudo ${INVENTORY_SCRIPT} >> ${INVENTORY_DIR}/${SYSTEM}
+				fi
+
+			# Run $COMMANDS on $SYSTEM
+			elif [ "${COMMAND}" = YES ];then
+				MESSAGE="${PROG} running: ssh -q ${SYSTEM} ${COMMANDS}"
+				[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}\n"
+				echo "${MESSAGE}" >> ${LOG}
+
+				if [ `whoami` = svccpcrra ];then
+					ssh -q ${SYSTEM} sudo ${COMMANDS} 2>&1 | tee -a ${LOG}
+				else
+					ssh -q ${SYSTEM} ${COMMANDS} 2>&1 | tee -a ${LOG}
+				fi
+
+			elif [ "${FILE_USER_DEFINED}" = YES ];then
+				MESSAGE="${PROG} running: rsync -aq ${FILE} ${SYSTEM}:${REMOTE_FILE}"
+				[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}\n"
+				echo "${MESSAGE}" >> ${LOG}
+				rsync -aq ${FILE} ${SYSTEM}:${REMOTE_FILE} >> ${LOG} 2>&1
+			fi
+
+			# Remove lock file, stopping the current KILL_SSH and or KILL_RSYNC job
+			rm -f ${LOCK_FILE}.${SYSTEM}
+		fi
+}
+
+# The MAIN function is used to do all of the real work
+################################################################################
+MAIN () {
+# set -x
+LOG=$1
+
+> ${LOG}
+
+# Expand ${EXCLUDE_SYSTEMS} as needed
+if [ "${EXCLUDE_SYSTEMS}" != "" ];then
+
+	EXCLUDE_LOOP=0
+
+	# Convert spaces to pipes "|"
+	EXCLUDE_SYSTEMS=`echo ${EXCLUDE_SYSTEMS} | sed 's/ /|/g'`
+
+	# Build the array EXCLUDE_SYSTEMS_ARRAY
+	unset EXCLUDE_SYSTEMS_ARRAY[*]
+
+	for EXCLUDE_SYSTEM in `${DNSG} "^${EXCLUDE_SYSTEMS}" | egrep '172.19.|10.11.' | 
+		sed "s/\.${DOMAIN}\.//" | awk  '{print $1}' | egrep -v "${EXCLUDE_HOSTS}" | sort`
+	do
+
+		# Add $EXCLUDE_SYSTEM to $EXCLUDE_SYSTEMS_ARRAY
+		EXCLUDE_SYSTEMS_ARRAY[${EXCLUDE_LOOP}]=${EXCLUDE_SYSTEM}
+
+		# Increment EXCLUDE_LOOP
+		let EXCLUDE_LOOP=${EXCLUDE_LOOP}+1
+	done
+fi
+
+# All Systems section
+################################################################################
+if [ "${ALL_SYSTEMS}" = YES -a "${PARTIAL}" != YES ];then
+
+	for SITE in ${SITES}
+	do
+		# Set SERVER_SUBNETS and BASENET based on $SITE
+		if [ ${SITE} = CANOGA ];then
+			SERVER_SUBNETS=${CANOGA_SERVER_SUBNETS}
+			BASENET=${CANOGA_BASENET}
+
+		elif [ ${SITE} = WPB ];then
+			SERVER_SUBNETS=${WPB_SERVER_SUBNETS}
+			BASENET=${WPB_BASENET}
+		fi
+
+		# ALL systems on $SERVER_SUBNETS
+		for SUBNET in ${SERVER_SUBNETS}
+		do
+			for SYSTEM in `${DNSG} ${BASENET}.${SUBNET} | grep . |
+				sed "s/\.${DOMAIN}\.//" | awk '{print $1}' | 
+				egrep -v "${EXCLUDE_HOSTS}" | sort`
+			do
+				export SYSTEM
+				SUB_MAIN ${LOG}
+			done
+		done
+	done
+
+	# ALL usxxx systems 
+	################################################################################
+	for SYSTEM in `${DNSG} "^${US}" | grep . | grep -v CNAME | sed "s/\.${DOMAIN}\.//" |
+		awk '{print $1}' | egrep -v "${EXCLUDE_HOSTS}" | sort`
+	do
+		export SYSTEM
+		SUB_MAIN ${LOG}
+	done
+
+	# ALL extra systems
+	################################################################################
+	for SYSTEM in `${DNSG} "^${EXTRA_HOSTS}" | grep . | grep -v CNAME | 
+		sed "s/\.${DOMAIN}\.//" | awk '{print $1}' | egrep -v "${EXCLUDE_HOSTS}" | sort`
+	do
+		export SYSTEM
+		SUB_MAIN ${LOG}
+	done
+
+# Partial ALL Systems
+################################################################################
+elif [ "${ALL_SYSTEMS}" = YES -a "${PARTIAL}" = YES ];then
+
+	# Build the Array SYS_INVENTORY
+	BUILD_SYS_INVENTORY
+
+	OS_LOOP=1
+	for OS in ${OSS}
+	do
+		# Set OS_TYPE
+		OS_TYPE=`echo ${OS_TYPES} | cut -d' ' -f${OS_LOOP}`
+	
+		# Confirm $OS_TYPE is set
+		if [ "${OS_TYPE}" = "" ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable, \"OS_TYPE\" is not set on ${HOST}, ${DATE_TIME}\n"
+	
+			if [ ${INTERACTIVE} = YES ];then
+       				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+       				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+	
+		# Set OS_VERSION
+		OS_VERSION=`echo ${OS_VERSIONS} | cut -d' ' -f${OS_LOOP}`
+	
+		# Confirm $OS_VERSION is set
+		if [ "${OS_VERSION}" = "" ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable, \"OS_VERSION\" is not set on ${HOST}, ${DATE_TIME}\n"
+	
+			if [ ${INTERACTIVE} = YES ];then
+       				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+       				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+				exit
+		fi
+	
+		# Increment OS_LOOP
+ 		let OS_LOOP=${OS_LOOP}+1
+	
+		LOOP=1
+		while [ "${SYS_INVENTORY[${LOOP}]}" ]
+		do
+       			# Set SYSTEM_DATA to each line in $SYS_INVENTORY 1 at a time
+       			SYSTEM_DATA=${SYS_INVENTORY[${LOOP}]}
+	
+			# Confirm $SYSTEM_DATA is set
+			if [ "${SYSTEM_DATA}" = "" ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="\nError: The required variable, \"SYSTEM_DATA\" is not set on ${HOST}, ${DATE_TIME}\n"
+	
+				if [ ${INTERACTIVE} = YES ];then
+       					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+       					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+			fi
+	
+			# Increment LOOP
+ 			let LOOP=${LOOP}+1
+
+			# Skip $SYSTEM_DATA if it contains "Connection refused"
+			[ `echo ${SYSTEM_DATA} | grep -ic "Connection refused"` -ge 1 ] && continue
+	
+			# Set SYSTEM to the 1st field in $SYSTEM_DATA
+			SYSTEM=`echo ${SYSTEM_DATA} | awk '{print $1}' | awk -F= '{print $2}'`
+	
+			# Confirm $SYSTEM is set
+			if [ "${SYSTEM}" = "" ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="\nError: The required variable, \"SYSTEM\" is not set on ${HOST}, ${DATE_TIME}\n"
+	
+				if [ ${INTERACTIVE} = YES ];then
+       					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+       					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+			fi
+	
+			# Skip Systems that do not match user requirements
+			if [ `echo ${SYSTEM_DATA} | grep -c " OS=${OS} OS_TYPE=${OS_TYPE} OS_VERSION=${OS_VERSION} "` -eq 0 ];then
+				continue
+			fi
+	
+			export SYSTEM
+			SUB_MAIN ${LOG}
+		done
+	done
+
+# Single Network Subnet
+################################################################################
+elif [ "${SINGLE_SUBNET}" = YES ];then
+
+	# Set BASENET based on $SUBNET
+	if [ `echo "${CANOGA_SERVER_SUBNETS}" | egrep -c ${SUBNET}` -eq 1 ];then
+		BASENET=${CANOGA_BASENET}
+	elif [ `echo "${WPB_SERVER_SUBNETS}" | egrep -c ${SUBNET}` -eq 1 ];then
+		BASENET=${WPB_BASENET}
+	else
+		echo -e "\nError: the subnet entered \"${SUBNET}\" does not match any of the local subnets\n"
+		exit
+	fi
+
+	for SYSTEM in `${DNSG} ${BASENET}.${SUBNET} | grep . |  awk '{print $1}' |
+		awk -F. '{print $1}' | egrep -v "${EXCLUDE_HOSTS}" | sort`
+	do
+		export SYSTEM
+		SUB_MAIN ${LOG}
+	done
+
+# Single system(s)
+################################################################################
+elif [ "${SINGLE_SYSTEM}" = YES ];then
+
+	for SYSTEM in ${SYSTEMS}
+	do
+
+		for SYSTEM in `${DNSG} "^${SYSTEM}" | egrep '172.19|10.11.' | sed "s/\.${DOMAIN}\.//" |
+			awk  '{print $1}' | egrep -v "${EXCLUDE_HOSTS}" | sort`
+		do
+			export SYSTEM
+			SUB_MAIN ${LOG}
+		done
+	done
+
+# ${HOSTS_FILE} Section
+################################################################################
+elif [ "${FILE_SYSTEM}" = YES ];then
+
+	for SYSTEM in `cat ${HOSTS_FILE}`
+	do
+		export SYSTEM
+		SUB_MAIN ${LOG}
+	done
+fi
+}  # End of MAIN function
+		
+# File Distrubtion Section
+################################################################################
+if [ "${FILE_DIST}" = YES -a "${ALL_FILES}" = YES ];then
+
+	SINGLE_FILE=YES
+	FILE_USER_DEFINED=YES
+	TARGET_DIR=YES
+
+	# Find the config files
+	for CONTROL in `ls ${FILE_DEPOT_CONTROL}/*.control`
+	do
+
+		# Confirm $CONTROL has valid syntax
+		if [ `grep "...=YES" ${CONTROL} | grep -v '^#' | wc -l` -eq 0 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+	
+			if [ ${INTERACTIVE} = YES ];then
+       				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+       				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+
+		elif [ `grep "..._DIR=..." ${CONTROL} | grep -v '^#' | wc -l` -eq 0 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+	
+			if [ ${INTERACTIVE} = YES ];then
+       				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+       				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+			
+		# Set FILE to $CONTROL minus .control plus the path to ${FILE_DEPOT}
+		FILE=`echo ${CONTROL} | sed 's/\.control$//'`
+		FILE=`basename ${FILE}`
+		FILE=${FILE_DEPOT}/${FILE}
+
+		# Set LOCAL_FILE to just the file name part
+		LOCAL_FILE=`basename ${FILE}`
+
+		# Confirm $FILE exists
+		if [ ! -f ${FILE} ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" does not have a matching file \"${FILE}\" on ${HOST}, ${DATE_TIME}\n"
+	
+			if [ ${INTERACTIVE} = YES ];then
+       				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+       				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+
+		# Set EXCLUDE_SYSTEMS as needed
+		EXCLUDE_SYSTEMS=`grep "^EXCLUDE_SYSTEMS" ${CONTROL} | grep -v '^#' | cut -d= -f2-`
+
+		# Confirm syntax of $EXCLUDE_SYSTEMS is good
+		if [ "${EXCLUDE_SYSTEMS}" != "" ];then
+			if [ `echo ${EXCLUDE_SYSTEMS} | wc -w` -ge 2 ];then
+
+				# Confirm double quotes are being used
+				if [ `echo ${EXCLUDE_SYSTEMS} | cut -c1` != \" ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" does has EXCLUDE_SYSTEMS set improperly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				elif [ `echo ${EXCLUDE_SYSTEMS} | awk '{print $NF}' | sed 's/\(.\)/\1 /g' |
+ 					awk '{print $NF}'` != \" ];then
+
+		
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" does has EXCLUDE_SYSTEMS set improperly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+			fi
+		fi
+
+		# Set ALL_SYSTEMS, SINGLE_SYSTEM, SYSTEMS, OSS, OS_TYPES 
+		# and OS_VERSIONS based on the content of the config file
+		for SYSTEMS in `grep "_SYSTEMS=YES" ${CONTROL} | grep -v '^#' | 
+			awk '{print $1}' | sed 's/=YES//'`
+		do
+
+			case ${SYSTEMS} in
+
+				# All Systems
+				#########################################
+				ALL_SYSTEMS )
+
+				ALL_SYSTEMS=YES
+
+				# Set REMOTE_DIR using ALL_DIR
+				REMOTE_DIR=`grep "^ALL_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/ALL_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, ALL_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# A Single system name
+				#########################################
+				SINGLE_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				SINGLE_SYSTEM=YES
+
+				# Set REMOTE_DIR using SINGLE_DIR
+				REMOTE_DIR=`grep "^SINGLE_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SINGLE_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SINGLE_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All Solaris Systems
+				#########################################
+				SOLARIS_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="SunOS SunOS SunOS"
+					OS_TYPES="Solaris Solaris Solaris"
+					OS_VERSIONS="8 9 10"
+				else
+					OSS="${OSS} SunOS SunOS SunOS"
+					OS_TYPES="${OS_TYPES} Solaris Solaris Solaris"
+					OS_VERSIONS="${OS_VERSIONS} 8 9 10"
+				fi
+
+
+				# Set REMOTE_DIR using SOLARIS_DIR
+				REMOTE_DIR=`grep "^SOLARIS_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SOLARIS_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SOLARIS_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All Solaris 8 Systems
+				#########################################
+				SOLARIS_8_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="SunOS"
+					OS_TYPES="Solaris"
+					OS_VERSIONS="8"
+				else
+					OSS="${OSS} SunOS"
+					OS_TYPES="${OS_TYPES} Solaris"
+					OS_VERSIONS="${OS_VERSIONS} 8"
+				fi
+
+
+				# Set REMOTE_DIR using SOLARIS_8_DIR
+				REMOTE_DIR=`grep "^SOLARIS_8_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SOLARIS_8_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SOLARIS_8_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All Solaris 9 Systems
+				#########################################
+				SOLARIS_9_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="SunOS"
+					OS_TYPES="Solaris"
+					OS_VERSIONS="9"
+				else
+					OSS="${OSS} SunOS"
+					OS_TYPES="${OS_TYPES} Solaris"
+					OS_VERSIONS="${OS_VERSIONS} 9"
+				fi
+
+
+				# Set REMOTE_DIR using SOLARIS_9_DIR
+				REMOTE_DIR=`grep "^SOLARIS_9_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SOLARIS_9_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SOLARIS_9_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All Solaris 10 Systems
+				#########################################
+				SOLARIS_10_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="SunOS"
+					OS_TYPES="Solaris"
+					OS_VERSIONS="10"
+				else
+					OSS="${OSS} SunOS"
+					OS_TYPES="${OS_TYPES} Solaris"
+					OS_VERSIONS="${OS_VERSIONS} 10"
+				fi
+
+				# Set REMOTE_DIR using SOLARIS_10_DIR
+				REMOTE_DIR=`grep "^SOLARIS_10_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SOLARIS_10_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SOLARIS_10_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All RedHat Systems
+				#########################################
+				REDHAT_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux Linux Linux"
+					OS_TYPES="RedHat RedHat RedHat"
+					OS_VERSIONS="4 5 6"
+				else
+					OSS="${OSS} Linux Linux Linux"
+					OS_TYPES="${OS_TYPES} RedHat RedHat RedHat"
+					OS_VERSIONS="${OS_VERSIONS} 4 5 6"
+				fi
+
+				# Set REMOTE_DIR using REDHAT_DIR
+				REMOTE_DIR=`grep "^REDHAT_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/REDHAT_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, REDHAT_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All RedHat EL4 Systems
+				#########################################
+				REDHAT_EL4_SYSTEMS )
+			
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="RedHat"
+					OS_VERSIONS="4"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} RedHat"
+					OS_VERSIONS="${OS_VERSIONS} 4"
+				fi
+
+				# Set REMOTE_DIR using REDHAT_EL4_DIR
+				REMOTE_DIR=`grep "^REDHAT_EL4_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/REDHAT_EL4_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, REDHAT_EL4_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All RedHat EL5 Systems
+				#########################################
+				REDHAT_EL5_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="RedHat"
+					OS_VERSIONS="5"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} RedHat"
+					OS_VERSIONS="${OS_VERSIONS} 5"
+				fi
+
+				# Set REMOTE_DIR using REDHAT_EL5_DIR
+				REMOTE_DIR=`grep "^REDHAT_EL5_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/REDHAT_EL5_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, REDHAT_EL5_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All RedHat EL6 Systems
+				#########################################
+				REDHAT_EL6_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="RedHat"
+					OS_VERSIONS="6"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} RedHat"
+					OS_VERSIONS="${OS_VERSIONS} 6"
+				fi
+
+				# Set REMOTE_DIR using REDHAT_EL6_DIR
+				REMOTE_DIR=`grep "^REDHAT_EL6_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/REDHAT_EL6_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, REDHAT_EL6_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All CentOS Systems
+				#########################################
+				CENTOS_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+echo NO
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux Linux Linux"
+					OS_TYPES="CentOS CentOS CentOS"
+					OS_VERSIONS="4 5 6"
+				else
+					OSS="${OSS} Linux Linux Linux"
+					OS_TYPES="${OS_TYPES} CentOS CentOS CentOS"
+					OS_VERSIONS="${OS_VERSIONS} 4 5 6"
+				fi
+
+				# Set REMOTE_DIR using CENTOS_DIR
+				REMOTE_DIR=`grep "^CENTOS_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/CENTOS_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, CENTOS_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All CentOS EL4 Systems
+				#########################################
+				CENTOS_EL4_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="CentOS"
+					OS_VERSIONS="4"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} CentOS"
+					OS_VERSIONS="${OS_VERSIONS} 4"
+				fi
+
+				# Set REMOTE_DIR using CENTOS_EL4_DIR
+				REMOTE_DIR=`grep "^CENTOS_EL4_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/CENTOS_EL4_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, CENTOS_EL4_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+				
+				# All CentOS EL5 Systems
+				#########################################
+				CENTOS_EL5_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="CentOS"
+					OS_VERSIONS="5"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} CentOS"
+					OS_VERSIONS="${OS_VERSIONS} 5"
+				fi
+
+				# Set REMOTE_DIR using CENTOS_EL5_DIR
+				REMOTE_DIR=`grep "^CENTOS_EL5_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/CENTOS_EL5_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, CENTOS_EL5_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All CentOS EL6 Systems
+				#########################################
+				CENTOS_EL6_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS="Linux"
+					OS_TYPES="CentOS"
+					OS_VERSIONS="6"
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} CentOS"
+					OS_VERSIONS="${OS_VERSIONS} 6"
+				fi
+
+				# Set REMOTE_DIR using CENTOS_EL6_DIR
+				REMOTE_DIR=`grep "^CENTOS_EL6_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/CENTOS_EL6_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, CENTOS_EL6_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All SuSE 10 Systems
+				#########################################
+				SUSE_10_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS=Linux
+					OS_TYPES=SuSE
+					OS_VERSIONS=10
+				else
+					OSS="${OSS} Linux"
+					OS_TYPES="${OS_TYPES} SuSE"
+					OS_VERSIONS="${OS_VERSIONS} 10"
+				fi
+
+				# Set REMOTE_DIR using SUSE_10_DIR
+				REMOTE_DIR=`grep "^SUSE_10_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/SUSE_10_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, SUSE_10_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				# All AIX Systems
+				#########################################
+				AIX_SYSTEMS )
+
+				# Confirm ALL_SYSTEMS is NOT set to YES
+				if [ "${ALL_SYSTEMS}" = YES ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				ALL_SYSTEMS=YES
+				PARTIAL=YES
+				if [ "${OSS}" = "" ];then
+					OSS=AIX
+					OS_TYPES=NA
+					OS_VERSIONS=NA
+				else
+					OSS="${OSS} AIX"
+					OS_TYPES="${OS_TYPES} NA"
+					OS_VERSIONS="${OS_VERSIONS} NA"
+				fi
+
+				# Set REMOTE_DIR using AIX_DIR
+				REMOTE_DIR=`grep "^AIX_DIR=..." ${CONTROL} | grep -v '^#'  | 
+					sed 's/AIX_DIR=//'`
+
+				# Confirm $REMOTE_DIR is configured properly
+				if [ "${REMOTE_DIR}" = "" -o `echo ${REMOTE_DIR} | cut -c1` != / ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly, AIX_DIR not set properly on ${HOST}, ${DATE_TIME}\n"
+			
+					if [ ${INTERACTIVE} = YES ];then
+       						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+       						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set REMOTE_FILE to the full path of the file on the remote system
+				REMOTE_FILE=${REMOTE_DIR}/${LOCAL_FILE}
+				;;
+
+				* ) # Error
+				#########################################
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="\nError: The control file \"${CONTROL}\" is not setup properly on ${HOST}, ${DATE_TIME}\n"
+			
+				if [ ${INTERACTIVE} = YES ];then
+       					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+       					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+       					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+				;;
+			esac
+			
+			# Execute the MAIN function
+			MAIN ${LOG}
+
+			# Reset Varaiables back to a null
+			ALL_SYSTEMS=""
+			PARTIAL=""
+			SINGLE_SYSTEM=""
+			SYSTEMS=""
+			OSS=""
+			OS_TYPES=""
+			REMOTE_DIR=""
+			REMOTE_FILE=""
+		done
+	done
+	
+else
+	# Execute the MAIN function
+	MAIN ${LOG}
+fi
+
+# Display complete message to interactive users
+#################################################################
+if [ ${INTERACTIVE} = YES ];then
+	echo -e "\n******************************************"
+	echo " ${PROG} Complete"
+	echo " Check log file, \"${LOG}\""
+	echo -e "******************************************\n"
+fi

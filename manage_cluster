@@ -1,0 +1,2006 @@
+#!/bin/bash
+# manage_cluster
+# Purpose: This scripts job is to manage the cluster services between a 2 node 
+# active passive cluster. The services include mounting/umounting file systems, 
+# starting/stopping NFS, starting/stopping Legato Networker & starting/stopping 
+# VIP shared by the 2 nodes.
+
+# Dependencies: 
+#	1) Private network between 2 nodes of cluster that allows root
+# 	ssh login without a password.
+#	2) That the system clocks be no more than a few seconds apart on each node of the cluster
+
+# Written By: Jon Swift 02/29/16
+# Updated 06/19/16, Added support to manage Samba
+# Updated 10/19/16, Added fsck all feature
+
+HOST=`uname -n`
+PROG=`basename $0`
+CLUSTER_FSTAB=/etc/cluster/fstab
+EXPORTS=/etc/exports
+CLUSTER_NODES="arlaplnfs03|arlaplnfs04"
+STAT_FILE=/tmp/${PROG}_stat
+TIMEOUT=20
+VIP=vip-arlaplnfs
+CLUSTER_NIC=bond0:1
+WAIT=2
+let WAIT_PLUSONE=${WAIT}+1
+SETCOLOR_GREEN="echo -en \\033[1;32m"
+SETCOLOR_RED="echo -en \\033[1;31m"
+SETCOLOR_NORMAL="echo -en \\033[0;39m"
+CLUSTER_IFCFG=/etc/sysconfig/network-scripts/ifcfg-${CLUSTER_NIC}
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+LOG=/var/log/${PROG}.log
+
+# Make sure this script is run as root
+###########################################################################
+if [ `whoami` != root ];then
+	echo -e "\nError: ${PROG} may only be run as root\n"
+	exit
+fi
+
+# Set INTERACTIVE to yes if it's being used interactively
+###########################################################################
+tty -s
+if [ $? -eq 0 ];then
+        INTERACTIVE=YES
+else
+	# Error this script may only be run interactively
+	exit
+fi
+
+# Confirm $HOST is 1 of the $CLUSTER_NODES
+###########################################################################
+if [ `echo ${HOST} | egrep -wc "${CLUSTER_NODES}"` -eq 1 ];then
+	THIS_NODE=${HOST}
+	for NODE in `echo ${CLUSTER_NODES} | sed 's/|/ /'`
+	do
+		[ ${NODE} = ${HOST} ] && continue
+		OTHER_NODE=${NODE}
+	done
+else
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nError: ${PROG} only supported on `echo ${CLUSTER_NODES} | sed 's/|/ \& /'`, ${DATE_TIME}\n" | tee -a ${LOG}
+	exit
+fi
+
+# Confirm this script is run only while in the / (root) file system
+###########################################################################
+if [ "`df -k . | grep -v Filesystem | awk '{print $NF}'`" != / ];then
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nError: ${PROG} may only be run from the / (root) file system. cd / and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+	exit
+
+# Confirm the script is not run from /export/xxx
+###########################################################################
+elif [ "`pwd | grep -c '^/export'`" -ge 1 ];then
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nError: ${PROG} may not be run from any of the /export areas. cd / and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+	exit
+fi
+
+# Set VIP to the IP rather than the hostname of $VIP
+###########################################################################
+VIP=`host ${VIP} | grep "has address" | awk '{print $4}'`
+
+# Confirm $VIP is set
+###########################################################################
+if [ "${VIP}" = "" ];then
+
+        DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        echo -e "\nError: The required variable \"VIP\" not set confirm it is in DNS, ${DATE_TIME}" | tee -a ${LOG}
+        exit
+fi
+
+# Function to determine if $OTHER_NODE is up or down
+###########################################################################
+UP_DOWN () {
+
+        # set -x
+
+        # Set UP_DOWN to UP if $OTHER_NODE is up, or to DOWN if it is down
+        ######################################################
+        UP_DOWN=""
+
+        # Determine if ic-$OTHER_NODE is up using ping
+        ######################################################
+        if [ `ping -f -i .3 -w 1 ic-${OTHER_NODE} | grep -c '100% packet loss'` -eq 0 ];then
+
+                # Double check ic-$OTHER_NODE is up using rpcinfo
+                #################################################
+                RPCINFO_DATA=`rpcinfo -p ic-${OTHER_NODE} 2>&1`
+
+                if [ `echo ${RPCINFO_DATA} | grep -c 'portmapper'` -eq 1 ];then
+			UP_DOWN=UP
+                else
+			UP_DOWN=DOWN
+			echo -e "\nError: Although ic-${OTHER_NODE} is pingable it does not appear to be working properly, unable to communicate with ic-${OTHER_NODE}. Unable to continue in this state. Correct this problem then rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}	
+			exit
+                fi
+        else
+
+        	# Confirm $OTHER_NODE is down with ping too
+        	######################################################
+        	if [ `ping -f -i .3 -w 1 ${OTHER_NODE} | grep -c '100% packet loss'` -eq 0 ];then
+
+			# Problem !!!
+			# Private network is down but primary network is up
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The private network on \"ic-${OTHER_NODE}\" is down, but primary connection to \"${OTHER_NODE}\" is up. Unable to continue in this state. Correct this problem then rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+                	UP_DOWN=DOWN
+			exit 	
+		else
+                	UP_DOWN=DOWN
+        	fi
+	fi
+
+	# If $OTHER_NODE is UP Confirm that ssh works on $OTHER_NODE
+        ######################################################
+	if [ ${UP_DOWN} = UP ];then
+
+		# Set CMD to the command being used by ssh
+		CMD="test ! -d /etc"
+
+		# Confirm ssh is working by checking for the directory /etc
+		###########################################################################
+		ERROR=NO
+		timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} && ERROR=YES
+	
+		if [ ${ERROR} = YES ];then
+
+			# Problem !!!
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			cho -e "\nError: Although ic-${OTHER_NODE} is pingable it does not appear to be working properly, unable to ssh to ic-${OTHER_NODE}. Unable to continue in this state. Correct this problem then rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+                	UP_DOWN=DOWN
+			exit 	
+		fi
+	fi
+}
+
+# Determine if $OTHER_NODE is UP
+###########################################################################
+UP_DOWN
+
+# Make sure this script is not already running
+###########################################################################
+if [ -f ${STAT_FILE} ];then
+
+	echo -e "\nError: ${PROG} already running on ${THIS_NODE}\n" | tee -a ${LOG}
+	echo -e "If ${PROG} is not really already running on ${THIS_NODE} remove the file \"${STAT_FILE}\" on ${THIS_NODE} and rerun ${PROG}\n"
+	exit
+
+fi
+
+# If $OTHER_NODE is UP, check for $STAT_FILE on OTHER_NODE
+###########################################################################
+if [ ${UP_DOWN} = UP ];then
+
+	# Set CMD to the command being used by ssh
+	CMD="test -f ${STAT_FILE}"
+
+	# Check for $STAT_FILE on $OTHER_NODE
+	ERROR=NO
+	timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} && ERROR=YES
+
+	# If $ERROR = YES, $PROG is already running on ${OTHER_NODE}
+	if [ ${ERROR} = YES ];then
+		echo -e "\nError: ${PROG} already running on ${OTHER_NODE}\n" | tee -a ${LOG}
+		echo -e "If ${PROG} is not really already running on ${OTHER_NODE} remove the file \"${STAT_FILE}\" on ${OTHER_NODE} and rerun ${PROG}\n"
+		exit
+	fi
+fi
+
+# Start trap to remove $STAT_FILE if $PROG crashes or someone hits ^C
+###########################################################################
+trap "rm -f ${STAT_FILE};exit 1" 1 2 3 6 9 15
+
+# Create $STAT_FILE
+###########################################################################
+> ${STAT_FILE}
+chmod 666 ${STAT_FILE}
+
+# Confirm that the files $CLUSTER_FSTAB and $CLUSTER_IFCFG exist on $THIS_NODE
+###########################################################################
+if [ ! -f ${CLUSTER_FSTAB} ];then
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nError: The required file ${CLUSTER_FSTAB} does not exist on ${THIS_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+	rm -f ${STAT_FILE}
+	exit
+fi
+
+if [ ! -f ${CLUSTER_IFCFG} ];then
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nError: The required file ${CLUSTER_IFCFG} does not exist on ${THIS_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+	rm -f ${STAT_FILE}
+	exit
+fi
+
+# If $OTHER_NODE is UP, confirm that the files $CLUSTER_FSTAB and $CLUSTER_IFCFG exist 
+# on $OTHER_NODE. And that they are the same as on $THIS_NODE
+###########################################################################
+if [ ${UP_DOWN} = UP ];then
+
+	# Set CMD to the command being used by ssh
+	CMD="test ! -f ${CLUSTER_FSTAB}"
+
+	# Confirm that $CLUSTER_FSTAB exist on $OTHER_NODE
+	###########################################################################
+	ERROR=NO
+	timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} && ERROR=YES
+
+	# If $ERROR = YES, $PROG is already running on ${OTHER_NODE}
+	if [ ${ERROR} = YES ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The required file ${CLUSTER_FSTAB} does not exist on ${OTHER_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+
+	# Confirm that $CLUSTER_FSTAB on $OTHER_NODE is the same as $CLUSTER_FSTAB on $THIS_NODE
+	###########################################################################
+	rm -f /tmp/fstab
+	timeout --signal=9 ${TIMEOUT}s scp -q ic-${OTHER_NODE}:${CLUSTER_FSTAB} /tmp
+
+	# Confirm /tmp/fstab exists
+	if [ ! -f /tmp/fstab ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The scp command used to copy ${CLUSTER_FSTAB} from ic-${OTHER_NODE} to /tmp failed. Correct problem and re-run ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+
+	# Confirm /tmp/fstab is the same as $CLUSTER_FSTAB
+	###########################################################################
+	if [ `diff /tmp/fstab ${CLUSTER_FSTAB} | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The ${CLUSTER_FSTAB} from ${OTHER_NODE} is different than the ${CLUSTER_FSTAB} on ${THIS_NODE}. Correct problem and re-run ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+	rm -f /tmp/fstab
+
+	# Confirm that $EXPORTS on $OTHER_NODE is the same as $EXPORTS on $THIS_NODE
+	###########################################################################
+	rm -f /tmp/exports
+	timeout --signal=9 ${TIMEOUT}s scp -q ic-${OTHER_NODE}:${EXPORTS} /tmp
+
+	# Confirm /tmp/exports exists
+	if [ ! -f /tmp/exports ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The scp command used to copy ${EXPORTS} from ic-${OTHER_NODE} to /tmp failed. Correct problem and re-run ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+
+	# Confirm /tmp/exports is the same as $EXPORTS
+	###########################################################################
+	if [ `diff /tmp/exports ${EXPORTS} | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The ${EXPORTS} from ${OTHER_NODE} is different than the ${EXPORTS} on ${THIS_NODE}. Correct problem and re-run ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+	rm -f /tmp/exports
+
+	# Set CMD to the command being used by ssh
+	CMD="test ! -f ${CLUSTER_IFCFG}"
+	
+	# Confirm that $CLUSTER_IFCFG exist on $OTHER_NODE
+	###########################################################################
+	ERROR=NO
+	timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} && ERROR=YES
+
+	if [ ${ERROR} = YES ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: The required file ${CLUSTER_IFCFG} does not exist on ${OTHER_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+fi
+
+# The STATUS function is used to collect and display cluster service status
+###########################################################################
+STATUS () {
+
+	#set -x
+
+	# Determine if either node is running cluster services
+	# The cluster services are Mounted cluster file systems, the VIP and NFS services
+	###########################################################################
+
+	# Setup the Associative arrays that hold the local and remote cluster 
+	# file system mount status
+	###########################################################################
+	unset LOCAL_MOUNTED_FS
+	declare -A LOCAL_MOUNTED_FS
+	unset REMOTE_MOUNTED_FS
+	declare -A REMOTE_MOUNTED_FS
+
+	# Set UP_DOWN to the status of $OTHER_NODE
+	###########################################################################
+	UP_DOWN	
+
+	# Check for mounted file systems
+	###########################################################################
+	for MNT in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $2}'`
+	do
+
+		# Confirm $MNT is set properly
+		###########################################################################
+		if [ "${MNT}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The required variable \"MNT\" not set. Suspect problem with ${CLUSTER_FSTAB} on ${THIS_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ! -d ${MNT} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The required mount point \"${MNT}\" does not exist on ${THIS_NODE}. Suspect the directory was never created on ${THIS_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${UP_DOWN} = UP ];then
+
+			# Set CMD to the command being used by ssh
+			CMD="test ! -d ${MNT}"
+
+			ERROR=NO
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} && ERROR=YES
+
+			if [ ${ERROR} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The required mount point \"${MNT}\" does not exist on ${OTHER_NODE}. Suspect the directory was never created on ${OTHER_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+		fi
+
+		# Determine if $MNT is mounted on $THIS_NODE
+		###########################################################################
+		if [ `grep -Pc "\s${MNT}\s" /etc/mtab` -eq 1 ];then
+			LOCAL_MOUNTED_FS[${MNT}]="YES"
+		else
+			LOCAL_MOUNTED_FS[${MNT}]="NO"
+		fi
+
+		# Determine if $MNT is mounted on $OTHER_NODE
+		###########################################################################
+		if [ ${UP_DOWN} = UP ];then
+
+			# Set CMD to the command being used by ssh
+			CMD="grep ${MNT} /etc/mtab"
+
+			if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | grep -Pc "\s${MNT}\s"` -eq 1 ];then
+				REMOTE_MOUNTED_FS[${MNT}]="YES"
+			else
+				REMOTE_MOUNTED_FS[${MNT}]="NO"
+			fi
+		else
+			REMOTE_MOUNTED_FS[${MNT}]="NO"
+		fi
+	done
+
+	# Set LOCAL_ALL_MOUNTED to YES if all the file systems are mounted on local node
+	###########################################################################
+	LOCAL_ALL_MOUNTED=YES
+	for LOCAL_MOUNT in `echo ${LOCAL_MOUNTED_FS[*]}`
+	do
+		if [ ${LOCAL_MOUNT} = NO ];then
+			LOCAL_ALL_MOUNTED=NO
+			break
+		fi
+	done
+
+	# Set LOCAL_ALL_UMOUNTED to YES if all the file systems are umounted on local node
+	###########################################################################
+	LOCAL_ALL_UMOUNTED=YES
+	for LOCAL_MOUNT in `echo ${LOCAL_MOUNTED_FS[*]}`
+	do
+		if [ ${LOCAL_MOUNT} = YES ];then
+			LOCAL_ALL_UMOUNTED=NO
+			break
+		fi
+	done
+
+	# Set REMOTE_ALL_MOUNTED to YES if all the file systems are mounted on remote node
+	###########################################################################
+	REMOTE_ALL_MOUNTED=YES
+	for REMOTE_MOUNT in `echo ${REMOTE_MOUNTED_FS[*]}`
+	do
+		if [ ${REMOTE_MOUNT} = NO ];then
+			REMOTE_ALL_MOUNTED=NO
+			break
+		fi
+	done
+
+	# Set REMOTE_ALL_UMOUNTED to YES if all the file systems are umounted on remote node
+	###########################################################################
+	REMOTE_ALL_UMOUNTED=YES
+	for REMOTE_MOUNT in `echo ${REMOTE_MOUNTED_FS[*]}`
+	do
+		if [ ${REMOTE_MOUNT} = YES ];then
+			REMOTE_ALL_UMOUNTED=NO
+			break
+		fi
+	done
+
+	# Determine if VIP is in use on the local node
+	###########################################################################
+	if [ `ifconfig ${CLUSTER_NIC} | grep inet | grep -wc ${VIP}` -eq 1 ];then
+		LOCAL_VIP=YES
+	else
+		LOCAL_VIP=NO
+	fi
+
+	# Determine if VIP is in use on the remote node
+	###########################################################################
+	if [ ${UP_DOWN} = UP ];then
+
+		# Set CMD to the command being used by ssh
+		CMD="/sbin/ifconfig ${CLUSTER_NIC}"
+
+		if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | 
+			grep inet | grep -wc ${VIP}` -eq 1 ];then
+			REMOTE_VIP=YES
+		else
+			REMOTE_VIP=NO
+		fi
+	else
+		REMOTE_VIP=NO
+	fi
+
+	# Determine if NFS services are running on the local node
+	###########################################################################
+	if [ `/etc/init.d/nfs status | grep nfsd | grep -c running` -eq 1 ];then
+		LOCAL_NFS=YES
+	else
+		LOCAL_NFS=NO
+	fi
+
+	# Determine if NFS services are running on the remote node
+	###########################################################################
+	if [ ${UP_DOWN} = UP ];then
+
+		# Set CMD to the command being used by ssh
+		CMD="/etc/init.d/nfs status"
+
+		if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | 
+			grep nfsd | grep -c running` -eq 1 ];then
+			REMOTE_NFS=YES
+		else
+			REMOTE_NFS=NO
+		fi
+	else
+		REMOTE_NFS=NO
+	fi
+
+	# Determine if Samba services are running on the local node
+	###########################################################################
+	if [ `/etc/init.d/smb status 2>/dev/null | grep -c running` -eq 1 ];then
+		LOCAL_SMB=YES
+	else
+		LOCAL_SMB=NO
+	fi
+
+	# Determine if Samba services are running on the remote node
+	###########################################################################
+	if [ ${UP_DOWN} = UP ];then
+
+		# Set CMD to the command being used by ssh
+		CMD="/etc/init.d/smb status"
+
+		if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null | 
+			grep -c nsrexecd` -eq 1 ];then
+			REMOTE_SMB=YES
+		else
+			REMOTE_SMB=NO
+		fi
+	else
+		REMOTE_SMB=NO
+	fi
+
+	# Determine if Legato Networker services are running on the local node
+	###########################################################################
+	if [ `/etc/init.d/networker status 2>/dev/null | grep -c nsrexecd` -eq 1 ];then
+		LOCAL_NSR=YES
+	else
+		LOCAL_NSR=NO
+	fi
+
+	# Determine if Legato Networker services are running on the remote node
+	###########################################################################
+	if [ ${UP_DOWN} = UP ];then
+
+		# Set CMD to the command being used by ssh
+		CMD="/etc/init.d/networker status"
+
+		if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null | 
+			grep -c nsrexecd` -eq 1 ];then
+			REMOTE_NSR=YES
+		else
+			REMOTE_NSR=NO
+		fi
+	else
+		REMOTE_NSR=NO
+	fi
+
+	# Display status
+	###########################################################################
+	if [ "$1" = VERBOSE ];then
+
+		echo -e "\n****************************"
+		echo "*    File System Status    *"
+		echo -e "****************************"
+		echo "   Local FS     -     Mounted"
+		for LOCAL_MOUNT in `echo ${!LOCAL_MOUNTED_FS[*]}`
+		do
+
+			echo -n "${LOCAL_MOUNT}"
+			if [ ${LOCAL_MOUNTED_FS[${LOCAL_MOUNT}]} = YES ];then
+				${SETCOLOR_GREEN}
+			else
+				${SETCOLOR_RED}
+			fi
+
+			echo -e "\t${LOCAL_MOUNTED_FS[${LOCAL_MOUNT}]}"
+			${SETCOLOR_NORMAL}
+		done
+	
+		echo -e "\n\n   Remote FS     -     Mounted"
+		for REMOTE_MOUNT in `echo ${!REMOTE_MOUNTED_FS[*]}`
+		do
+			echo -n "${REMOTE_MOUNT}"
+			if [ ${REMOTE_MOUNTED_FS[${REMOTE_MOUNT}]} = YES ];then
+				${SETCOLOR_GREEN}
+			else
+				${SETCOLOR_RED}
+			fi
+			echo -e "\t${REMOTE_MOUNTED_FS[${REMOTE_MOUNT}]}"
+			${SETCOLOR_NORMAL}
+		done
+		echo ""
+
+		# Setup colors
+		###########################################################################
+		if [ ${LOCAL_VIP} = YES ];then
+			LOCAL_VIP_COLOR=${SETCOLOR_GREEN}
+		else
+			LOCAL_VIP_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${REMOTE_VIP} = YES ];then
+			REMOTE_VIP_COLOR=${SETCOLOR_GREEN}
+		else
+			REMOTE_VIP_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${LOCAL_NFS} = YES ];then
+			LOCAL_NFS_COLOR=${SETCOLOR_GREEN}
+		else
+			LOCAL_NFS_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${REMOTE_NFS} = YES ];then
+			REMOTE_NFS_COLOR=${SETCOLOR_GREEN}
+		else
+			REMOTE_NFS_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${LOCAL_SMB} = YES ];then
+			LOCAL_SMB_COLOR=${SETCOLOR_GREEN}
+		else
+			LOCAL_SMB_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${REMOTE_SMB} = YES ];then
+			REMOTE_SMB_COLOR=${SETCOLOR_GREEN}
+		else
+			REMOTE_SMB_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${LOCAL_NSR} = YES ];then
+			LOCAL_NSR_COLOR=${SETCOLOR_GREEN}
+		else
+			LOCAL_NSR_COLOR=${SETCOLOR_RED}
+		fi
+		if [ ${REMOTE_NSR} = YES ];then
+			REMOTE_NSR_COLOR=${SETCOLOR_GREEN}
+		else
+			REMOTE_NSR_COLOR=${SETCOLOR_RED}
+		fi
+
+		echo -e "\n***************************"
+		echo "*       NFS Status        *"
+		echo "***************************"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Local NFS services running   -"
+		${LOCAL_NFS_COLOR}
+		echo -e "\t${LOCAL_NFS}"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Remote NFS services running  -"
+		${REMOTE_NFS_COLOR}
+		echo -e "\t${REMOTE_NFS}\n"
+		${SETCOLOR_NORMAL}
+
+		echo -e "\n****************"
+		echo "* Samba Status *"
+		echo "****************"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Local Samba services running   -"
+		${LOCAL_SMB_COLOR}
+		echo -e "\t${LOCAL_NSR}"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Remote Samba services running  -"
+		${REMOTE_SMB_COLOR}
+		echo -e "\t${REMOTE_NSR}\n"
+		${SETCOLOR_NORMAL}
+
+		echo -e "\n***************************"
+		echo "* Legato Networker Status *"
+		echo "***************************"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Local Legato Networker services running   -"
+		${LOCAL_NSR_COLOR}
+		echo -e "\t${LOCAL_NSR}"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Remote Legato Networker services running  -"
+		${REMOTE_NSR_COLOR}
+		echo -e "\t${REMOTE_NSR}\n"
+		${SETCOLOR_NORMAL}
+
+		echo -e "\n***************************"
+		echo "*       VIP Status        *"
+		echo "***************************"
+		
+		echo -n "Local VIP running    -"
+		${LOCAL_VIP_COLOR}
+		echo -e "\t${LOCAL_VIP}"
+
+		${SETCOLOR_NORMAL}
+		echo -n "Remote VIP running   -"
+		${REMOTE_VIP_COLOR}
+		echo -e "\t${REMOTE_VIP}\n"
+		${SETCOLOR_NORMAL}
+	fi
+}
+
+# Start Function used to start NFS services
+###########################################################################
+START () {
+
+	#set -x
+	NODE=$1
+
+	# Determine if a node is already running cluster services
+	###########################################################################
+	STATUS
+	STOP_NODE=""
+
+	# Set STOP_NODE to the node running some or all of the cluster services
+	if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_VIP} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NFS} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_SMB} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NSR} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+
+		if [ ${REMOTE_ALL_MOUNTED} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		elif [ ${REMOTE_ALL_UMOUNTED} = NO ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ ${REMOTE_VIP} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ ${REMOTE_NFS} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ ${REMOTE_NSR} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ ${REMOTE_SMB} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+	fi
+
+	# If $STOP_NODE is set it means the cluster is already running
+	###########################################################################
+	if [ "${STOP_NODE}" != "" -a ${STOP_NODE} = ${THIS_NODE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: Some or all of the NFS cluster services are already running on ${STOP_NODE}, unable to start them again, ${DATE_TIME}" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+
+	# Start cluster services on $THIS_NODE
+	###########################################################################
+	if [ ${NODE} = ${THIS_NODE} ];then
+
+		# Confirm ${THIS_NODE} has been up for more than 3 minutes
+		###########################################################################
+		if [ `uptime | egrep -v 'day|hr.' | grep -c min` -eq 1 ];then
+
+			# Set MIN to the number of minutes ${THIS_NODE} has been up
+			MIN=`uptime | grep min | awk '{print $3}'`
+
+			# Confirm $MIN is set and set properly
+			if [ "${MIN}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The required variable \"MIN\" not set while using ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ `echo ${MIN} | grep -c  '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The required variable \"MIN\" not set properly using ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+
+			# Confirm $MIN is greater than $WAIT
+			if [ ${MIN} -le ${WAIT} ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: ${THIS_NODE} has been up less than ${WAIT_PLUSONE} minutes. Wait until ${THIS_NODE} has been up at least 4 minutes and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+		fi
+
+		# Confirm services not already running on $OTHER_NODE
+		###########################################################################
+		STATUS
+		if [ ${REMOTE_ALL_UMOUNTED} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: Not all cluster file systems are umounted on ${OTHER_NODE}, unable to start anything on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${REMOTE_VIP} = YES ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The VIP is still running on ${OTHER_NODE}, unable to start anything on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${REMOTE_NFS} = YES ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: NFS server processes are still running on ${OTHER_NODE}, unable to start anything on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${REMOTE_SMB} = YES ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: Samba server processes are still running on ${OTHER_NODE}, unable to start anything on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${REMOTE_NSR} = YES ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: NSR server processes are still running on ${OTHER_NODE}, unable to start anything on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		fi
+
+		if [ ${LOCAL_ALL_MOUNTED} = YES -a ${LOCAL_VIP} = YES -a ${LOCAL_NFS} = YES -a ${LOCAL_SMB} = YES -a ${LOCAL_NSR} = YES ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nNote: All services already running properly on ${THIS_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		fi
+
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\n***************************************************************"
+		echo "Starting NFS cluster services on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+		echo "***************************************************************"
+		echo ""
+
+		# Mount cluster file systems on $THIS_NODE
+		###########################################################################
+		for MNT in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $2}'`
+		do
+
+			# Set DEV to the device name used for $MNT
+			DEV=`grep -P "\s${MNT}\s" ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $1}'`
+
+			# Confirm $DEV is set
+			if [ "${DEV}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "Error: The required variable \"DEV\" not set for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ `echo ${DEV} | grep -c "^/dev/"` -eq 0 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "Error: The required variable \"DEV\" not set properly for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+
+			# Set MNT_OPTIONS to the mount options defined for $MNT
+			MNT_OPTIONS=`grep -w ${MNT} ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $4}'`
+
+			# Confirm $MNT_OPTIONS is set
+			if [ "${MNT_OPTIONS}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "Error: The required variable \"MNT_OPTIONS\" not set for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ `echo ${MNT_OPTIONS} | grep -c ','` -eq 0 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "Error: The required variable \"MNT_OPTIONS\" not set properly for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+
+			# Determine if $MNT is mounted on $THIS_NODE
+			###########################################################################
+			if [ `grep -Pc "\s${MNT}\s" /etc/mtab` -eq 0 ];then
+
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "Mounting ${DEV} on ${MNT} on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				mount -o ${MNT_OPTIONS} ${DEV} ${MNT}
+			else
+				echo "Note: ${MNT} already mounted on ${THIS_NODE}"
+			fi
+		done
+
+		# Start NFS services on $THIS_NODE
+		###########################################################################
+		if [ ${LOCAL_NFS} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStarting NFS on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/nfs start 2>/dev/null
+		else
+			echo "Note: NFS already running on ${THIS_NODE}" | tee -a ${LOG}
+		fi
+
+		# Start Samba services on $THIS_NODE
+		###########################################################################
+		if [ ${LOCAL_SMB} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStarting Samba on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/smb start 2>/dev/null
+		else
+			echo "Note: Samba already running on ${THIS_NODE}" | tee -a ${LOG}
+		fi
+
+		# Start Legato Networker services on $THIS_NODE
+		###########################################################################
+		if [ ${LOCAL_NSR} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStarting Legato Networker on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/networker start 2>/dev/null
+		else
+			echo "Note: Legato Networker already running on ${THIS_NODE}" | tee -a ${LOG}
+		fi
+
+		# Start VIP on $THIS_NODE
+		###########################################################################
+		if [ ${LOCAL_VIP} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStarting VIP on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/sbin/ifup ${CLUSTER_NIC}
+		else
+			echo "Note: VIP already running on ${THIS_NODE}" | tee -a ${LOG}
+		fi
+			
+
+		# Confirm everything started properly
+		###########################################################################
+		STATUS
+
+		if [ ${LOCAL_ALL_MOUNTED} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: Not all cluster file systems mounted on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit 
+		elif [ ${LOCAL_VIP} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The VIP did start on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${LOCAL_NFS} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The NFS services did not start on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${LOCAL_SMB} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The Samba services did not start on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		elif [ ${LOCAL_NSR} = NO ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The Legato Networker services did not start on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		else
+			echo -e "\nNote: All services started properly on ${THIS_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+		fi
+	else
+
+	# Start cluster services on $OTHER_NODE
+	###########################################################################
+
+		# Set UP_DOWN to the status of $OTHER_NODE
+		UP_DOWN	
+
+		if [ ${UP_DOWN} = UP ];then
+
+			# Set CMD to the command being used by ssh
+			CMD="uptime"
+
+			# Confirm ${OTHER_NODE} has been up for more than 3 minutes
+			###########################################################################
+			UPTIME_LINE=`timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | grep load`
+
+			# Confirm $UPTIME_LINE is set and set properly
+			###########################################################################
+                        if [ "${UPTIME_LINE}" = "" ];then
+                                DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+                                echo -e "\nError: The required variable \"UPTIME_LINE\" not set while using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+                                rm -f ${STAT_FILE}
+                                exit
+			fi
+
+			# Confirm ${OTHER_NODE} has been up for more than 3 minutes
+			###########################################################################
+			if [ `echo ${UPTIME_LINE} | egrep -v 'day|hr.' | grep -c min` -eq 1 ];then
+
+				# Set MIN to the number of minutes ${THIS_NODE} has been up
+				MIN=`echo ${UPTIME_LINE} | awk '{print $3}'`
+
+				# Confirm $MIN is set and set properly
+				if [ "${MIN}" = "" ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo -e "\nError: The required variable \"MIN\" not set while using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+					rm -f ${STAT_FILE}
+					exit
+				elif [ `echo ${MIN} | grep -c  '[^0-9]'` -eq 1 ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo -e "\nError: The required variable \"MIN\" not set properly using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+					rm -f ${STAT_FILE}
+					exit
+				fi
+	
+				# Confirm $MIN is greater than 3
+				if [ ${MIN} -le 3 ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo -e "\nError: ${OTHER_NODE} has been up less than 4 minutes. Wait until ${OTHER_NODE} has been up at least 4 minutes and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+					rm -f ${STAT_FILE}
+					exit
+				fi
+			fi
+
+			# Confirm services not already running $OTHER_NODE
+			###########################################################################
+			STATUS
+			if [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: Not all cluster file systems are umounted on ${THIS_NODE}, unable to start anything on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${LOCAL_VIP} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: VIP server processes are still running on ${THIS_NODE}, unable to start anything on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${LOCAL_NFS} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: NFS server processes are still running on ${THIS_NODE}, unable to start anything on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${LOCAL_SMB} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: Samba server processes are still running on ${THIS_NODE}, unable to start anything on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${LOCAL_NSR} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: NSR server processes are still running on ${THIS_NODE}, unable to start anything on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\n***************************************************************"
+			echo "Starting cluster services on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			echo "***************************************************************"
+			echo ""
+
+			# Mount cluster file systems on $OTHER_NODE
+			###########################################################################
+			for MNT in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $2}'`
+			do
+
+				# Set CMD to the command being used by ssh
+				CMD="grep ${MNT} /etc/mtab"
+
+				# Confirm that $MNT is not already mounted on $OTHER_NODE
+				###########################################################################
+				if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} |
+					grep -Pc "\s${MNT}\s"` -eq 0 ];then
+
+					# Set DEV to the device name used for $MNT
+					DEV=`grep -w ${MNT} ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $1}'`
+
+					# Confirm $DEV is set
+					###########################################################################
+					if [ "${DEV}" = "" ];then
+						DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+						echo -e "Error: The required variable \"DEV\" not set for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+						rm -f ${STAT_FILE}
+						exit
+					elif [ `echo ${DEV} | grep -c "^/dev/"` -eq 0 ];then
+						DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+						echo -e "Error: The required variable \"DEV\" not set properly for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+						rm -f ${STAT_FILE}
+						exit
+					fi
+
+					# Set MNT_OPTIONS to the mount options defined for $MNT
+					MNT_OPTIONS=`grep -w ${MNT} ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $4}'`
+
+					# Confirm $MNT_OPTIONS is set
+					###########################################################################
+					if [ "${MNT_OPTIONS}" = "" ];then
+						DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+						echo -e "Error: The required variable \"MNT_OPTIONS\" not set for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+						rm -f ${STAT_FILE}
+						exit
+					elif [ `echo ${MNT_OPTIONS} | grep -c ','` -eq 0 ];then
+						DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+						echo -e "Error: The required variable \"MNT_OPTIONS\" not set properly for file system \"${MNT}\", ${DATE_TIME}" | tee -a ${LOG}
+						rm -f ${STAT_FILE}
+						exit
+					fi
+
+					# Set CMD to the command being used by ssh
+					CMD="mount -o ${MNT_OPTIONS} ${DEV} ${MNT}"
+	
+					# Mount Cluster file system on $OTHER_NODE
+					###########################################################################
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo "Mounting ${DEV} on ${MNT} on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+					timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD}
+				else
+					echo "Note: ${MNT} already mounted on ${OTHER_NODE}"
+				fi
+			done
+
+			# Start NFS services on $OTHER_NODE
+			###########################################################################
+			if [ ${REMOTE_NFS} = NO ];then
+
+				# Set CMD to the command being used by ssh
+				CMD="/etc/init.d/nfs start"
+
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nStarting NFS on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+			else
+				echo "Note: NFS already running on ${OTHER_NODE}" | tee -a ${LOG}
+			fi
+
+			# Start Samba services on $OTHER_NODE
+			###########################################################################
+			if [ ${REMOTE_SMB} = NO ];then
+
+				# Set CMD to the command being used by ssh
+				CMD="/etc/init.d/smb start"
+
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nStarting Samba on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+			else
+				echo "Note: Samba already running on ${OTHER_NODE}" | tee -a ${LOG}
+			fi
+
+			# Start Legato Networker services on $OTHER_NODE
+			###########################################################################
+			if [ ${REMOTE_NSR} = NO ];then
+
+				# Set CMD to the command being used by ssh
+				CMD="/etc/init.d/networker start"
+
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nStarting Legato Networker on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+			else
+				echo "Note: Legato Networker already running on ${OTHER_NODE}" | tee -a ${LOG}
+			fi
+	
+			# Start VIP on $THIS_NODE
+			###########################################################################
+			if [ ${REMOTE_VIP} = NO ];then
+
+				# Set CMD to the command being used by ssh
+				CMD="/sbin/ifup ${CLUSTER_NIC}"
+
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nStarting VIP on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+			else
+				echo "Note: VIP already running on ${OTHER_NODE}" | tee -a ${LOG}
+			fi
+
+			# Confirm everything started properly
+			###########################################################################
+			STATUS
+	
+			if [ ${REMOTE_ALL_MOUNTED} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: Not all cluster file systems mounted on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${REMOTE_VIP} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The VIP did start on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${REMOTE_NFS} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The NFS services did not start on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${REMOTE_SMB} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The Samba services did not start on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ ${REMOTE_NSR} = NO ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The Legato Networker services did not start on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			else
+				echo -e "\nNote: All services started properly on ${OTHER_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+			fi
+		else
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: ${OTHER_NODE} is down, unable to start cluster services on ${OTHER_NODE}, ${DATE_TIME}\n" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		fi
+	fi
+}
+
+# STOP Function used to stop NFS services
+###########################################################################
+STOP () {
+
+	# Determine which node is running cluster services
+	###########################################################################
+	STATUS
+	STOP_NODE=""
+
+	# Set STOP_NODE to the node running some or all of the cluster services
+	###########################################################################
+	if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_VIP} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NFS} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_SMB} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NSR} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+
+		if [ "${REMOTE_ALL_MOUNTED}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		elif [ "${REMOTE_ALL_UMOUNTED}" = NO ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_VIP}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NFS}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_SMB}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NSR}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+	fi
+
+	# Stop cluster services
+	###########################################################################
+	if [ "${STOP_NODE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nNote: The NFS Cluster services are not running, nothing to stop, ${DATE_TIME}" | tee -a ${LOG}
+	else
+
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\n***************************************************************"
+		echo "Stopping NFS cluster services on ${STOP_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+		echo "***************************************************************"
+
+
+		###########################################################################
+		# Stop cluster services on $THIS_NODE
+		###########################################################################
+		if [ ${STOP_NODE} = ${THIS_NODE} ];then
+
+			# Umount all arlaplnfs NFS mounted filesytem on other half of cluster as needed
+			###########################################################################
+			if [ ${UP_DOWN} = UP ];then
+
+				# Set CMD to the command being used by ssh
+				CMD="cat /etc/mtab"
+
+				# Determine if there are any NFS mounted filesystems mounted on ${OTHER_NODE} supported by arlaplnfs
+				if [ `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | 
+						egrep -c "^arlaplnfs:|^vip-arlaplnfs:"` -ge 1 ];then
+
+					# Set CMD to the command being used by ssh
+					CMD="cat /etc/mtab"
+		
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo -e "\nUmounting NFS filesystems supported by ${THIS_NODE} on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+					for MNT in `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | 
+					egrep "^arlaplnfs:|^vip-arlaplnfs:" | awk '{print $2}'`
+					do
+						DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+						echo "Umounting ${MNT} on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+						timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} /bin/umount -l ${MNT}
+					done
+				fi
+	
+				# Confirm MNT is set, this is a check to confirm that the ssh command above really worked
+				if [ "${MNT}" = "" ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo -e "\nError: The required variable \"MNT\" not set from ${OTHER_NODE} unable to continue" | tee -a ${LOG}
+					echo -e "Note: This problem is likely caused by a problem using ssh to gather the list of NFS mounts from ${THIS_NODE} on ${OTHER_NODE}. Correct this problem and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+					exit
+				fi
+			fi
+	
+			# Stop VIP on $THIS_NODE
+			###########################################################################
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping VIP on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			ifdown ${CLUSTER_NIC}
+
+			# Stop NFS services on $THIS_NODE
+			###########################################################################
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping NFS on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/nfs stop 2>/dev/null
+
+			# Stop Samba services on $THIS_NODE
+			###########################################################################
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping Samba on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/smb stop 2>/dev/null
+
+			# Stop Legato Networker services on $THIS_NODE
+			###########################################################################
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping Legato Networker on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			/etc/init.d/networker stop 2>/dev/null
+			nsr_shutdown 2>/dev/null
+			
+
+			# Wait 5 seconds to allow Legato Networker to stop before umounting /nsr
+			sleep 5
+
+			# Umount any file system mounted with mount option "bind" being used
+			for BIND_FS in `grep -w bind /etc/mtab | awk '{print $2}'`
+			do
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "Umounting ${BIND_FS} on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				sync
+				umount -l ${BIND_FS}
+			done
+
+			# Umount all cluster file systems on $THIS_NODE
+			###########################################################################
+			echo ""
+			for MNT in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $2}'`
+			do
+	
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "Umounting ${MNT} on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				sync
+				umount ${MNT}
+			done
+
+			# Confirm all cluster services stopped properly
+			###########################################################################
+			STATUS
+			STOP_FAILED=NO
+			if [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+				STOP_FAILED=YES		
+			elif [ ${LOCAL_VIP} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${LOCAL_NFS} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${LOCAL_SMB} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${LOCAL_NSR} = YES ];then
+				STOP_FAILED=YES		
+			fi
+			if [ ${STOP_FAILED} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: Not all cluster services stopped properly on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			else
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nNote: All cluster services stopped properly on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			fi
+		else
+			###########################################################################
+			# Stop cluster services on $OTHER_NODE
+			###########################################################################
+
+			# Umount all arlaplnfs NFS mounted filesytem on this node
+			###########################################################################
+
+			if [ `egrep -c "^arlaplnfs:|^vip-arlaplnfs:" /etc/mtab` -ge 1 ];then
+	
+				echo -e "\nUmounting NFS filesystems supported by ${OTHER_NODE} on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				for MNT in `egrep "^arlaplnfs:|^vip-arlaplnfs:" /etc/mtab | awk '{print $2}'`
+				do
+	
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo "Umounting ${MNT} on ${THIS_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+					sync
+					umount -l ${MNT}
+				done
+			fi
+
+
+			# Stop VIP on $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="/sbin/ifdown ${CLUSTER_NIC}"
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping VIP on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD}
+
+			# Stop NFS services on $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="/etc/init.d/nfs stop"
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping NFS on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+
+
+			# Stop Samba services on $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="/etc/init.d/smb stop"
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping Samba on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+
+			# Wait 5 seconds to allow Legato Networker to stop before umounting /nsr
+			sleep 5
+
+
+			# Stop Legato Networker services on $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="/etc/init.d/networker stop"
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nStopping Legato Networker on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+
+			# Set CMD to the command being used by ssh
+			CMD="/usr/sbin/nsr_shutdown"
+
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>/dev/null
+
+			# Wait 5 seconds to allow Legato Networker to stop before umounting /nsr
+			sleep 5
+
+
+			# Umount any filesystems mounted with mount option "bind" being used
+			# Filesystems using bind are NFS mounted filesystems to $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="grep -w bind /etc/mtab"
+
+			for BIND_FS in `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | awk '{print $2}'`
+			do
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nUmounting ${BIND_FS} on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} /bin/sync
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} /bin/umount -l ${BIND_FS}
+			done
+
+
+			# Umount all cluster file systems on $OTHER_NODE
+			###########################################################################
+
+			# Set CMD to the command being used by ssh
+			CMD="cat ${CLUSTER_FSTAB}"
+
+			echo ""
+			for MNT in `timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | 
+			grep -v '^#' | grep . | awk '{print $2}'`
+			do
+	
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "Umounting ${MNT} on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} /bin/sync
+				timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} /bin/umount ${MNT}
+			done
+
+
+			# Confirm all cluster services stopped properly
+			###########################################################################
+			STATUS
+			STOP_FAILED=NO
+			if [ ${REMOTE_ALL_UMOUNTED} = NO ];then
+				STOP_FAILED=YES		
+			elif [ ${REMOTE_VIP} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${REMOTE_NFS} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${REMOTE_SMB} = YES ];then
+				STOP_FAILED=YES		
+			elif [ ${REMOTE_NSR} = YES ];then
+				STOP_FAILED=YES		
+			fi
+			if [ ${STOP_FAILED} = YES ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: Not all cluster services stopped properly on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			else
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nNote: All cluster services stopped properly on ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+			fi
+		fi
+	fi
+}
+
+
+# FAILOVER Function used to failover (stop/start) NFS services
+###########################################################################
+FAILOVER () {
+
+	# Determine which node is running cluster services
+	###########################################################################
+	STATUS
+	STOP_NODE=""
+	START_NODE=""
+
+	# Set STOP_NODE to the node running some or all of the cluster services
+	# Set START_NODE to the node to restart cluster services on
+	###########################################################################
+	if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+		STOP_NODE=${THIS_NODE}
+		START_NODE=${OTHER_NODE}
+	elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+		STOP_NODE=${THIS_NODE}
+		START_NODE=${OTHER_NODE}
+	fi
+
+	if [ ${LOCAL_VIP} = YES ];then
+		STOP_NODE=${THIS_NODE}
+		START_NODE=${OTHER_NODE}
+	fi
+
+	if [ ${LOCAL_NFS} = YES ];then
+		STOP_NODE=${THIS_NODE}
+		START_NODE=${OTHER_NODE}
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+
+		if [ ${REMOTE_ALL_MOUNTED} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+			START_NODE=${THIS_NODE}
+		elif [ ${REMOTE_ALL_UMOUNTED} = NO ];then
+			STOP_NODE=${OTHER_NODE}
+			START_NODE=${THIS_NODE}
+		fi
+	
+		if [ ${REMOTE_VIP} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+			START_NODE=${THIS_NODE}
+		fi
+	
+		if [ ${REMOTE_NFS} = YES ];then
+			STOP_NODE=${OTHER_NODE}
+			START_NODE=${THIS_NODE}
+		fi
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nNote: Cluster service not running, nothing to stop" | tee -a ${LOG}
+		echo "Unable to failover services, ${DATE_TIME}" | tee -a ${LOG}
+	else
+		# Failover cluster services
+		###########################################################################
+
+		# Confirm ${OTHER_NODE} has been up for more than 3 minutes as needed
+
+		# Set CMD to the command being used by ssh
+		CMD="uptime"
+
+		# Confirm ${OTHER_NODE} has been up for more than 3 minutes
+		UPTIME_LINE=`timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} | grep load`
+
+		# Confirm $UPTIME_LINE is set and set properly
+                if [ "${UPTIME_LINE}" = "" ];then
+                       DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+                       echo -e "\nError: The required variable \"UPTIME_LINE\" not set while using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+                       rm -f ${STAT_FILE}
+                       exit
+		fi
+
+		# Confirm ${OTHER_NODE} has been up for more than 3 minutes
+		if [ `echo ${UPTIME_LINE} | egrep -v 'day|hr.' | grep -c min` -eq 1 ];then
+
+			# Set MIN to the number of minutes ${THIS_NODE} has been up
+			MIN=`echo ${UPTIME_LINE} | awk '{print $3}'`
+
+			# Confirm $MIN is set and set properly
+			if [ "${MIN}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The required variable \"MIN\" not set while using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			elif [ `echo ${MIN} | grep -c  '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: The required variable \"MIN\" not set properly using ${OTHER_NODE}, ${DATE_TIME}" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+
+			# Confirm $MIN is greater than 3
+			if [ ${MIN} -le 3 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo -e "\nError: ${OTHER_NODE} has been up less than 4 minutes. Wait until ${OTHER_NODE} has been up at least 4 minutes and rerun ${PROG}, ${DATE_TIME}\n" | tee -a ${LOG}
+				rm -f ${STAT_FILE}
+				exit
+			fi
+		fi
+
+		STOP
+		if [ ${STOP_FAILED} = NO ];then 
+			START ${START_NODE}
+		else
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nUnable to failover cluster services, stop cluster services failed, ${DATE_TIME}" | tee -a ${LOG}
+		fi
+	fi
+}
+
+# The FSCK_FS Function is used to fsck all cluster file systems
+###########################################################################
+FSCK_FS () {
+
+	# Determine which node is running cluster services
+	###########################################################################
+	STATUS
+	STOP_NODE=""
+
+	# Set STOP_NODE to the node running some or all of the cluster services
+	###########################################################################
+	if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_VIP} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NFS} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NSR} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+
+		if [ "${REMOTE_ALL_MOUNTED}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		elif [ "${REMOTE_ALL_UMOUNTED}" = NO ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_VIP}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NFS}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NSR}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+	fi
+
+	# Only run fsck if all service are stopped on both nodes of the cluster
+	# Confirm nothing is running before starting fsck
+	if [ "${STOP_NODE}" != "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nError: Unable to run fsck because not all service are stopped on ${STOP_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+		rm -f ${STAT_FILE}
+		exit
+	fi
+
+	# FSCK all cluster file systems
+	###########################################################################
+	for PWRDEV in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $1}'`
+	do
+		echo -e "\nRunning \"e2fsck -y\" on \"${PWRDEV}\"" | tee -a ${LOG}
+		e2fsck -y ${PWRDEV} 
+	done
+}
+
+# The FSCK_STATUS Function is used to display mount statics on each shared NFS file system
+###########################################################################
+FSCK_STATUS () {
+
+	# Determine which node is running cluster services
+	###########################################################################
+	STATUS
+	STOP_NODE=""
+
+	# Set STOP_NODE to the node running some or all of the cluster services
+	###########################################################################
+	if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_VIP} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NFS} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+	if [ ${LOCAL_NSR} = YES ];then
+		STOP_NODE=${THIS_NODE}
+	fi
+
+	if [ "${STOP_NODE}" = "" ];then
+
+		if [ "${REMOTE_ALL_MOUNTED}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		elif [ "${REMOTE_ALL_UMOUNTED}" = NO ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_VIP}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NFS}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+		if [ "${REMOTE_NSR}" = YES ];then
+			STOP_NODE=${OTHER_NODE}
+		fi
+	fi
+
+	# Redefine STOP_NODE as needed
+	[ "${STOP_NODE}" = "" ] && STOP_NODE=${THIS_NODE}
+
+	# Check for mounted file systems
+	###########################################################################
+	for PWRDEV in `cat ${CLUSTER_FSTAB} | grep -v '^#' | grep . | awk '{print $1}'`
+	do
+		# Set MNT to the Mount Point used by $PWRDEV
+		MNT=`grep "^${PWRDEV}" ${CLUSTER_FSTAB} | awk '{print $2}'`
+
+		# Confirm $MNT is set
+		if [ "${MNT}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\nError: The required variable \"MNT\" not set. Suspect problem with ${CLUSTER_FSTAB} on ${THIS_NODE}, ${DATE_TIME}.\n" | tee -a ${LOG}
+			rm -f ${STAT_FILE}
+			exit
+		fi
+
+		echo -e "\n\n FSCK info for ${PWRDEV} ${MNT}"	
+		echo "***************************************************"
+		if [ ${STOP_NODE} = ${THIS_NODE} ];then
+			dumpe2fs -h ${PWRDEV} 2>&1 | grep -v dumpe2fs |
+				egrep "Last checked|Next check after|Mount count|Maximum mount count"
+		else
+
+			# Set CMD to the command being used by ssh
+			CMD="dumpe2fs -h ${PWRDEV}" 
+
+			# Confirm ssh is working by checking for the directory /etc
+			###########################################################################
+			timeout --signal=9 ${TIMEOUT}s ssh -q ic-${OTHER_NODE} ${CMD} 2>&1 | grep -v dumpe2fs |
+				egrep "Last checked|Next check after|Mount count|Maximum mount count"
+		fi
+	done
+}
+
+clear
+
+# Confirm $OTHER_NODE is up before starting
+###########################################################################
+if [ ${UP_DOWN} = DOWN ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nWarning: ${OTHER_NODE} is down, ${DATE_TIME}\n" | tee -a ${LOG}
+fi
+
+VALID=""
+until [ -n "${VALID}" ]
+do
+	echo ""
+	echo " *************************"
+	echo " *     Select Option     *"
+	echo " *************************"
+	echo ""
+	echo " 1> Start NFS Cluster on ${THIS_NODE}"
+	echo " 2> Start NFS Cluster on ${OTHER_NODE}"
+	echo " 3> Stop NFS Cluster"
+	echo " 4> Status NFS Cluster"
+	echo " 5> Failover NFS Cluster"
+	echo " 6> Check FSCK Status"
+	echo " 7> FSCK All File Systems"
+
+	OPTION=""
+	until [ -n "${OPTION}" ]
+	do
+		echo -n "Enter Option > "
+		read OPTION
+	done
+
+	case ${OPTION} in
+
+		1) # Start Cluster on ${THIS_NODE}
+		VALID=TRUE
+		START ${THIS_NODE}
+		;;
+	
+		2) # Start Cluster on ${OTHER_NODE}
+		VALID=TRUE
+
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\n\nWarning: It strongly recommended that you only start the NFS cluster services from the node that will be running/starting the NFS cluster services, ${DATE_TIME}\n" | tee -a ${LOG}
+		VALID=TRUE
+		ANSWER=""
+		echo ""
+		until [ -n "${ANSWER}" ]
+		do
+			echo -n "Allow starting NFS Cluster Services on ${OTHER_NODE} from ${THIS_NODE} Y/N > "
+			read ANSWER
+
+			case ${ANSWER} in
+
+				 "") # Do Nothing
+                        	;;
+
+                        	N|n|NO|no|No)  # No
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+				exit
+                        	;;
+
+                        	Y|y|YES|yes|Yes) # Yes
+                        	ANSWER=YES
+                        	;;
+
+                        	q|Q) # Exit Now
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+                        	exit
+                        	;;
+
+                        	*) # Invalid Answer
+                        	echo ""
+                        	echo " Invalid selection ${ANSWER}"
+                        	echo ""
+                        	ANSWER=""
+                        	sleep 1
+                        	;;
+			esac
+		done
+		START ${OTHER_NODE}
+		;;
+	
+		3) # Stop Cluster
+		VALID=TRUE
+		ANSWER=""
+		echo ""
+		until [ -n "${ANSWER}" ]
+		do
+			echo -n "Stop NFS Cluster Services Y/N > "
+			read ANSWER
+
+			case ${ANSWER} in
+
+				 "") # Do Nothing
+                        	;;
+
+                        	N|n|NO|no|No)  # No
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+				exit
+                        	;;
+
+                        	Y|y|YES|yes|Yes) # Yes
+                        	ANSWER=YES
+                        	;;
+
+                        	q|Q) # Exit Now
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+                        	exit
+                        	;;
+
+                        	*) # Invalid Answer
+                        	echo ""
+                        	echo " Invalid selection ${ANSWER}"
+                        	echo ""
+                        	ANSWER=""
+                        	sleep 1
+                        	;;
+			esac
+		done
+		STOP
+		;;
+	
+		4) # Status Cluster
+		VALID=TRUE
+		STATUS VERBOSE
+		;;
+	
+		5) # Failover Cluster
+		VALID=TRUE
+		ANSWER=""
+		echo ""
+		until [ -n "${ANSWER}" ]
+		do
+			echo -n "Failover NFS Cluster Services Y/N > "
+			read ANSWER
+
+			case ${ANSWER} in
+
+				 "") # Do Nothing
+                        	;;
+
+                        	N|n|NO|no|No)  # No
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+				exit
+                        	;;
+
+                        	Y|y|YES|yes|Yes) # Yes
+                        	ANSWER=YES
+                        	;;
+
+                        	q|Q|quit|QUIT|Quit) # Exit Now
+                        	ANSWER=NO
+				rm -f ${STAT_FILE}
+                        	exit
+                        	;;
+
+                        	*) # Invalid Answer
+                        	echo ""
+                        	echo " Invalid selection ${ANSWER}"
+                        	echo ""
+                        	ANSWER=""
+                        	sleep 1
+                        	;;
+			esac
+		done
+
+		# Determine which node is running cluster services
+		###########################################################################
+		STATUS
+		STOP_NODE=""
+	
+		# Determine if NFS cluster services are running on $THIS_NODE
+		###########################################################################
+		if [ ${LOCAL_ALL_MOUNTED} = YES ];then
+			STOP_NODE=${THIS_NODE}
+		elif [ ${LOCAL_ALL_UMOUNTED} = NO ];then
+			STOP_NODE=${THIS_NODE}
+		fi
+		if [ ${LOCAL_VIP} = YES ];then
+			STOP_NODE=${THIS_NODE}
+		fi
+		if [ ${LOCAL_NFS} = YES ];then
+			STOP_NODE=${THIS_NODE}
+		fi
+		if [ ${LOCAL_NSR} = YES ];then
+			STOP_NODE=${THIS_NODE}
+		fi
+	
+		if [ "${STOP_NODE}" = ${THIS_NODE} ];then
+
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo -e "\n\nWarning: It strongly recommended that you only start the NFS cluster services from the node that will be running/starting the NFS cluster services, ${DATE_TIME}\n" | tee -a ${LOG}
+
+			VALID=TRUE
+			ANSWER=""
+			echo ""
+			until [ -n "${ANSWER}" ]
+			do
+				echo -n "Allow starting NFS Cluster Services on ${OTHER_NODE} from ${THIS_NODE} Y/N > "
+				read ANSWER
+	
+				case ${ANSWER} in
+	
+				 	"") # Do Nothing
+                        		;;
+	
+                        		N|n|NO|no|No)  # No
+                        		ANSWER=NO
+					rm -f ${STAT_FILE}
+					exit
+                        		;;
+	
+                        		Y|y|YES|yes|Yes) # Yes
+                        		ANSWER=YES
+                        		;;
+	
+                        		q|Q) # Exit Now
+                        		ANSWER=NO
+					rm -f ${STAT_FILE}
+                        		exit
+                        		;;
+	
+                        		*) # Invalid Answer
+                        		echo ""
+                        		echo " Invalid selection ${ANSWER}"
+                        		echo ""
+                        		ANSWER=""
+                        		sleep 1
+                        		;;
+				esac
+			done
+		fi
+
+		FAILOVER
+		;;
+
+		6) # Check FSCK Status
+		VALID=TRUE
+		echo ""
+		FSCK_STATUS
+		;;
+
+		7) # FSCK All File Systems
+		VALID=TRUE
+		echo ""
+		FSCK_FS
+		;;
+	
+		q|Q) # Quit
+		rm -f ${STAT_FILE}
+        	exit
+        	;;
+	
+        	*) # Invalid selection
+           	echo " Invalid selection, ${OPTION}"
+           	OPTION=""
+           	sleep 1
+         	;;
+	esac
+done
+rm -f ${STAT_FILE}

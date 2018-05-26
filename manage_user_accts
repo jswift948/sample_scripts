@@ -1,0 +1,4233 @@
+#!/bin/bash
+# manage_user_accts
+# Purpose: This scripts job is provide a tool to add and remove user accounts from
+# the Unix/Linux NIS files, passwd, group, & netgroups. And to remove user accts 
+# from the sudoers file. And when creating a new user to also setup the Unix home
+# directory and disk quatos on that home directory as needed. And to set and
+# reset NIS users password.
+
+# Written By: Jon Swift 02/2014
+# 03/14, Added support for a pre formatted phone number from WSSO
+# Corrected bug in sudoers update section, 09/29/14
+# Added logic to prevent script from removing data from $TMP if something is still mounted, 02/10/15
+# Added logic to check for :x: in NIS group entry, 09/25/15
+# Added logic to support multiple SHELL's, 11/06/15
+# Added logic to support existing SHELL to different SHELL, 11/11/15
+# Updated to support to new LA file servers, 02/12/16
+# Added logic to support Disk Quotas for LA file server, 02/16
+# Corrected bug with removing users home directory
+# Corrected bugs, 06/28/16
+# Added support for disk quotas in WPB 04/17
+
+HOST=`uname -n`
+PROG=`basename $0`
+NIS_MASTER=pwrlmail
+VI=/usr/local/bin/vi
+NIS_DIR=/var/yp/etc
+WPB_GID=1000
+CPC_GID=1073
+PWRID=/stds/admin/bin/pwrid4
+SETUP_DISK_QUOTA=/stds/admin/bin/setup_ext_quotas
+LOG=/var/log/${PROG}.log
+TMP=/var/tmp/${PROG}
+SUDO_BACKUP=/var/log/sudo
+LOCK_FILE=/tmp/${PROG}_lock.${PID}
+#SUDOERS_FILE=/tmp/sudoers
+SUDOERS_FILE=/data/kickstart_6/CD_image_64/base/ROOT/etc/sudoers
+DEFAULT_PASS=Abcd1234
+PID=$$
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/ucb
+
+# Confirm this script is run on on $NIS_MASTER
+###########################################################################
+if [ ${HOST} != ${NIS_MASTER} ];then
+	echo -e "\nError: ${PROG} may only be run on ${NIS_MASTER}\n" | tee -a ${LOG}
+	exit
+fi
+
+# Confirm this script is run only as root
+###########################################################################
+if [ `whoami` != root ];then
+	echo -e "\nError: ${PROG} must be run as root\n" | tee -a ${LOG}
+	exit
+fi
+
+# Confirm this script is not already running
+###########################################################################
+if [ `ps -aef | grep manage_user_accts | egrep -v "${PID}|grep" | wc -l` -ge 1 ];then
+	echo -e "\nError: ${PROG} already running"
+	ps -aef | grep manage_user_accts | grep -v ${PID}
+	exit
+fi
+
+# The ASK_USER function is used to set USER_ID
+###########################################################################
+ASK_USER () {
+
+	# Pre Set PASS to 1
+	PASS=1
+
+	# New User Section
+	###################################################################
+	if [ ${NEW_USER} = YES ];then
+
+		# Loop until all data collected is confirmed correct
+		CONFIRMED=NO
+		until [ ${CONFIRMED} = YES ]
+		do
+
+			echo ""
+			USER_ID=""
+			until [ -n "${USER_ID}" ]
+			do
+				echo -n " Enter User Name > "
+				read USER_ID
+		
+				# Confirm USER_ID is not set to a null
+				if [ "${USER_ID}" = "" ];then
+					true
+		
+				elif [ "${USER_ID}" = "q" ];then
+					exit
+				fi
+
+				# Convert USER_ID to lower case
+				USER_ID=`echo ${USER_ID} | tr '[A-Z]' '[a-z]'`
+	
+				# Confirm $USER_ID not set to an existing User ID
+				if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -ge 1 ];then
+					echo ""
+					echo " Invalid selection, ${USER_ID}"
+					echo " ${USER_ID} already in use"
+					echo ""
+					USER_ID=""
+				fi
+			done
+
+			# Set CLOCK_ID for $USER_ID
+			echo ""
+			CLOCK_ID=""
+			until [ -n "${CLOCK_ID}" ]
+			do
+				echo -n " Enter Clock Number > "
+				read CLOCK_ID
+		
+				# Confirm CLOCK_ID is not set to a null
+				if [ "${CLOCK_ID}" = "q" ];then
+					exit
+				fi
+			done
+	
+			# Confrim ${CLOCK_ID} set in WSSO DB
+			if [ `${PWRID} -c ${CLOCK_ID} | grep -c "^clock=${CLOCK_ID}"` -eq 0 ];then
+				echo ""
+				echo "Warning: The Clock ID \"${CLOCK_ID}\" does not exist in the WSSO LDAP DB"
+				echo "Unable to confirm Windows User Name matches new Unix User Name, \"${USER_ID}\"."
+				echo ""
+			else
+	
+				# Confirm $USER_ID matches ntUserID in WSSO LDAP DB
+				if [ `${PWRID} -c ${CLOCK_ID} | grep -c "^ntUserID=${USER_ID}"` -eq 0 ];then
+					echo ""
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo "Error: The User ID \"${USER_ID}\" does not match the User ID" | tee -a ${LOG}
+					echo "found in the WSSO LDAP DB for the Clock ID \"${CLOCK_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				fi
+			fi
+	
+			# Set DISPLAY_NAME using the displayName found for ${CLOCK_ID in the WSSO LDAP DB
+			DISPLAY_NAME=""
+			for WORD in `${PWRID} -c ${CLOCK_ID} | grep "^displayName=" | 
+				awk -F= '{print $2}' | tr '[A-Z]' '[a-z]'`
+			do
+	
+				# Capitalize the 1st char of each $WORD
+				FIRST_CHAR=`echo ${WORD} | cut -c1 | tr '[a-z]' '[A-Z]'`
+				OTHER_CHARS=`echo ${WORD} | cut -c2-`
+					
+				# Build the variable DISPLAY_NAME 1 word at a time
+				if [ "${DISPLAY_NAME}" = "" ];then
+					DISPLAY_NAME="${FIRST_CHAR}${OTHER_CHARS}"
+				else
+					DISPLAY_NAME="${DISPLAY_NAME} ${FIRST_CHAR}${OTHER_CHARS}"
+				fi
+			done
+	
+			# Confirm $DISPLAY_NAME is set
+			if [ "${DISPLAY_NAME}" = "" ];then
+				echo ""
+				echo "Warning: The Display Name for the user \"${USER_ID}\" not found"
+				echo "in the WSSO LDAP DB using the Clock ID \"${CLOCK_ID}\"."
+				echo ""
+				echo "Enter full name for User, ${USER_ID}"
+
+				echo ""
+				LAST_NAME=""
+				until [ -n "${LAST_NAME}" ]
+				do
+					echo -n " Enter Last Name > "
+					read LAST_NAME
+	
+					# Confirm LAST_NAME set properly
+					if [ `echo ${LAST_NAME} | grep -c '[0-9]'` -eq 1 ];then
+						LAST_NAME=""
+						echo ""
+						echo " Invalid entry, ${LAST_NAME}"
+						echo " Last name must contain only letters"
+						echo ""
+					fi
+				done
+
+				# Set LAST_NAME to lower case letter
+				LAST_NAME=`echo ${LAST_NAME} | tr '[A-Z]' '[a-z]'`
+
+				echo ""
+				FIRST_NAME=""
+				until [ -n "${FIRST_NAME}" ]
+				do
+					echo -n " Enter First Name > "
+					read FIRST_NAME
+	
+					# Confirm FIRST_NAME set properly
+					if [ `echo ${FIRST_NAME} | grep -c '[0-9]'` -eq 1 ];then
+						FIRST_NAME=""
+						echo ""
+						echo " Invalid entry, ${FIRST_NAME}"
+						echo " First name must contain only letters"
+						echo ""
+					fi
+				done
+
+				# Set FIRST_NAME to lower case letter
+				FIRST_NAME=`echo ${FIRST_NAME} | tr '[A-Z]' '[a-z]'`
+
+				echo ""
+				MIDDLE_INITIAL=""
+				echo  " Enter Middle Initial, just hit enter if no middle initial"
+				until [ -n "${MIDDLE_INITIAL}" ]
+				do
+					echo -n " Enter Middle Initial > "
+					read MIDDLE_INITIAL
+	
+					# Confirm MIDDLE_INITIAL set properly
+					if [ "${MIDDLE_INITIAL}" = "" ];then
+						MIDDLE_INITIAL=SET
+					elif [ `echo ${MIDDLE_INITIAL} | grep -c '[0-9]'` -eq 1 -o `echo ${MIDDLE_INITIAL} | wc -c` -gt 2 ];then
+						MIDDLE_INITIAL=""
+						echo ""
+						echo " Invalid entry, ${MIDDLE_INITIAL}"
+						echo " Middle initial must contain a only single letter"
+						echo ""
+					fi
+				done
+
+				# Change MIDDLE_INITIAL to a null if set to SET
+				[ "${MIDDLE_INITIAL}" = SET ] && MIDDLE_INITIAL=""
+
+				# Set MIDDLE_INITIAL to lower case letter
+				MIDDLE_INITIAL=`echo ${MIDDLE_INITIAL} | tr '[A-Z]' '[a-z]'`
+
+				for WORD in ${LAST_NAME}, ${FIRST_NAME} ${MIDDLE_INITIAL}
+				do
+		
+					# Capitalize the 1st char of each $WORD
+					FIRST_CHAR=`echo ${WORD} | cut -c1 | tr '[a-z]' '[A-Z]'`
+					OTHER_CHARS=`echo ${WORD} | cut -c2-`
+						
+					# Build the variable DISPLAY_NAME 1 word at a time
+					if [ "${DISPLAY_NAME}" = "" ];then
+						DISPLAY_NAME="${FIRST_CHAR}${OTHER_CHARS}"
+					else
+						DISPLAY_NAME="${DISPLAY_NAME} ${FIRST_CHAR}${OTHER_CHARS}"
+					fi
+				done
+			fi
+	
+			# Set NUMBER using telephoneNumber found for $CLOCK_ID in the WSSO LDAP DB
+			NUMBER=`${PWRID} -c ${CLOCK_ID} | grep "^telephoneNumber=" | awk -F= '{print $2}' |
+				sed 's/(//g;s/)//g;s/-//g;s/ //g;s/^1//'`
+	
+			# Confirm $NUMBER is set properly
+			if [ "${NUMBER}" = "" -o `echo ${NUMBER} | grep -c '[^0-9]'` -eq 1 ] || 
+			[ "${NUMBER}" != "" -a `echo ${NUMBER} | wc -c` -ne 11 ];then
+				NUMBER=""
+				echo ""
+				echo "Warning: The Phone Number for the user \"${USER_ID}\" not found"
+				echo "in the WSSO LDAP DB using the Clock ID \"${CLOCK_ID}\"."
+				echo ""
+				echo " Enter 10 digit Phone Number, i.e.  8185861234"
+				until [ -n "${NUMBER}" ]
+				do
+					echo -n " Enter Phone Number > "
+					read NUMBER
+	
+					# Confirm NUMBER is not set to a null
+					if [ "${NUMBER}" = "" ];then
+						true
+			
+					elif [ "${NUMBER}" = "q" ];then
+						exit
+					fi
+					
+					if [ `echo ${NUMBER} | grep -c '[^0-9]'` -eq 1 ];then
+						NUMBER=""
+						echo ""
+						echo " Invalid entry, ${NUMBER}"
+						echo " Phone number must be only numbers"
+						echo ""
+					elif [ `echo ${NUMBER} | wc -c` -ne 11 ];then
+						NUMBER=""
+						echo ""
+						echo " Invalid entry, ${NUMBER}"
+						echo " Phone number must be a 10 digit number"
+						echo ""
+					fi
+				done
+			fi
+	
+			# Set PHONE_NUMBER to the properly format $NUMBER
+			# Example of proper format (818)586-1234
+			PHONE_NUMBER=""
+			NUM=1
+			for CHAR in `echo ${NUMBER} | sed 's/\(.\)/\1 /g'`
+			do
+	
+				if [ ${NUM} -eq 1 ];then
+					PHONE_NUMBER="(${CHAR}"
+				elif [ ${NUM} -eq 2 ];then
+					PHONE_NUMBER="${PHONE_NUMBER}${CHAR}"
+				elif [ ${NUM} -eq 3 ];then
+					PHONE_NUMBER="${PHONE_NUMBER}${CHAR})"
+				elif [ ${NUM} -gt 3 -a ${NUM} -lt 6 ];then
+					PHONE_NUMBER="${PHONE_NUMBER}${CHAR}"
+				elif [ ${NUM} -eq 6 ];then
+					PHONE_NUMBER="${PHONE_NUMBER}${CHAR}-"
+				elif [ ${NUM} -gt 6 ];then
+					PHONE_NUMBER="${PHONE_NUMBER}${CHAR}"
+				fi
+
+				# Increment NUM
+				let NUM=${NUM}+1
+			done
+
+			echo ""
+			echo " Confirm the following data is correct"
+			echo ""
+			echo " User Name = ${USER_ID}"
+			echo " Clock ID = ${CLOCK_ID}"
+			echo " Display Name = ${DISPLAY_NAME}"
+			echo " Phone Number = ${PHONE_NUMBER}"
+
+			# Comfirm operation
+        		ANSWER=""
+        		echo ""
+        		until [ -n "${ANSWER}" ]
+        		do
+
+				echo -n " Is this all correct Y/N > "
+				read ANSWER
+	
+				case ${ANSWER} in
+	
+					"") # Do Nothing
+                       			;;
+	
+                      			N|n|NO|no|No)  # No
+                       			CONFIRMED=NO
+                       			;;
+		
+                       			Y|y|YES|yes|Yes) # Yes
+                       			CONFIRMED=YES
+                       			;;
+		
+                       			q|Q) # Exit Now
+                       			CONFIRMED=NO
+                       			exit
+                       			;;
+		
+                       			*) # Invalid Answer
+                       			echo ""
+                       			echo " Invalid entry ${ANSWER}"
+                       			echo ""
+                       			sleep 1
+                       			;;
+               			esac
+			done
+		done
+	
+	# Existing User Section
+	###################################################################
+	else
+		echo ""
+		USER_ID=""
+		until [ -n "${USER_ID}" ]
+		do
+			echo -n " Enter User Name > "
+			read USER_ID
+	
+			# Confirm USER_ID is not set to a null
+			if [ "${USER_ID}" = "" ];then
+				true
+	
+			elif [ "${USER_ID}" = "q" ];then
+				exit
+			fi
+
+			# Confirm $USER_ID is set to an existing User ID
+			if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+
+		 		if [ "${FUNCTION}" = PASSWORD_RESET \
+				-o "${FUNCTION}" = LOCK_USER \
+		 		-o "${ADD_FUNCTION}" = ADD_TO_NIS_GROUP \
+		 		-o "${ADD_FUNCTION}" = ADD_TO_HOME \
+		 		-o "${ADD_FUNCTION}" = ADD_TO_AUTO_HOME \
+		 		-o "${ADD_FUNCTION}" = ADD_TO_ALL \
+				-o "${REMOVE_FUNCTION}" = REMOVE_FROM_NIS_PASS \
+				-o "${REMOVE_FUNCTION}" = REMOVE_FROM_ALL ];then
+
+					echo " Invalid entry, ${USER_ID}"
+					echo " ${USER_ID} does not exist"
+					echo ""
+					USER_ID=""
+					VALID_USERID=YES
+				else
+					echo ""
+					echo " Warning: ${USER_ID} does not exist in the NIS password file"
+					[ "$1" = CHANGE_SHELL ] && exit
+					VALID_USERID=NO
+				fi
+			else
+				VALID_USERID=YES
+			fi
+		done
+		
+		# Perform the following tasks if $VALID_USERID is set to YES
+		if [ ${VALID_USERID} = YES ];then
+
+			# Set USER_CHARS to the number of characters in $USER_ID
+			USER_CHARS=`echo ${USER_ID} | wc -c`
+	
+			# Confirm $USER_CHARS is set
+			if [ "${USER_CHARS}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"USER_CHARS\" not set using the User ID, \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+	
+			# Set USER_UID to the UID for $USER_ID
+			USER_UID=`grep "^${USER_ID}:" ${NIS_DIR}/passwd | awk -F: '{print $3}'`
+	
+			# Confirm $USER_UID is to a number 
+			if [ "${USER_UID}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"USER_UID\" not set using the User ID, \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${USER_UID} | grep -c '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"USER_UID, ${USER_UID}\" not set properly using the User ID, \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+	
+			# Confirm $USER_ID not set to a system User ID
+			if [ ${USER_UID} -le 100 -o ${USER_UID} = 65534 ];then	
+				echo ""
+				echo " Invalid selection, ${USER_ID}"
+				echo " ${USER_ID} is a required system ID"
+				echo ""
+				USER_ID=""
+			fi
+		fi
+	fi
+}
+
+# Confrim no file systems are mounted on $TMP
+###########################################################################
+CONFIRM_NO_MOUNTS () {
+	if [ `grep -c ${TMP} /etc/mtab` -ge 1 ];then
+		echo -e "\nError: There is an unexpected file system mounted on ${TMP}. Please umounted this file system before runninning this script again."
+		grep ${TMP} /etc/mtab
+		echo ""
+		exit
+	fi
+}
+
+# The UMOUNT function is used to umount ${TMP}/HOME_DIR when an error occurs
+###########################################################################
+UMOUNT () {
+	umount -f ${TMP}/HOME_DIR
+}
+
+# The DEFINE_MOST Function is used to define the $MOST variable
+# $MOST defines which filesystem has the most avialable disk space
+###########################################################################
+DEFINE_MOST () {
+
+	# Create $TMP/HOME_DIR as needed
+	[ ! -d ${TMP}/HOME_DIR ] && mkdir ${TMP}/HOME_DIR
+
+	# Clear the array HOME_FS
+	unset HOME_FS[*]
+
+	# Pre set LOOP to 0
+	LOOP=0
+
+	# Loop through each NFS file server setting NFS_SERVER
+	for NFS_SERVER in ${NFS_SERVERS}
+	do
+
+		# Set FS to each unquie file sysytem used for home directories on $NFS_SERVER
+		for FS in `ypcat -k ${AUTO_HOME} | grep ${NFS_SERVER}  | grep home | awk '{print $NF}' | awk -F: '{print $2}' |
+			sed 's%\&%%' | grep ${BASE_DIR} | sed "s%\(${BASE_DIR}[0-9]*\)/.*%\1%" | sort -u`
+		do
+			# Build the array HOME_FS, add the full path to each file system supporting Home Dirs
+			HOME_FS[${LOOP}]="${NFS_SERVER}:${FS}"
+
+			# Increment LOOP
+			let LOOP=${LOOP}+1
+		done
+	done
+
+	# Pre set LOOP to 0
+	LOOP=0
+
+	# Set trap to umount ${TMP}/HOME_DIR if someone hits Ctrl ^C
+	trap  "umount ${TMP}/HOME_DIR; exit 1" 1 2 3 6 15
+
+	# Mount each home directory file system and determine the available space
+	# then update the array entry to include the avilable disk space for that file system
+	while [ "${HOME_FS[${LOOP}]}" ]
+	do
+		# Mount ${HOME_FS[${LOOP}]} on ${TMP}/HOME_DIR
+		mount -t nfs ${HOME_FS[${LOOP}]} ${TMP}/HOME_DIR
+
+		# Confirm ${TMP}/HOME_DIR is mounted
+		if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 0 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The file system ${HOME_FS[${LOOP}]} not mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Set AVIAL_SPACE to the unused avialable disk space in ${TMP}/HOME_DIR
+		AVIAL_SPACE=`df -Pk ${TMP}/HOME_DIR | grep -v Filesystem | awk '{print $4}'`
+
+		# Confirm AVIAL_SPACE is set properly
+		if [ "${AVIAL_SPACE}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"AVIAL_SPACE\" not set using \"${HOME_FS[${LOOP}]}\", ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			UMOUNT
+			exit
+		elif [ `echo ${AVIAL_SPACE} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"AVIAL_SPACE, ${AVIAL_SPACE}\" not set properly using \"${HOME_FS[${LOOP}]}\", ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			UMOUNT
+			exit
+		fi
+
+		# Update HOME_FS[${LOOP}] entry
+		HOME_FS[${LOOP}]="${HOME_FS[${LOOP}]} ${AVIAL_SPACE}"
+
+		# Umount ${TMP}/HOME_DIR
+		umount ${TMP}/HOME_DIR
+
+		# Confirm ${TMP}/HOME_DIR is no longer mounted
+		if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The file system ${HOME_FS[${LOOP}]} still mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+			echo "Manually umount ${TMP}/HOME_DIR" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Confirm nothing is mount on /tmp/HOME_DIR
+		let LOOP=${LOOP}+1
+	done
+
+	# Pre set LOOP to 0
+        LOOP=0
+
+	# Set MOST to the FS that has the most avilable disk space
+	MOST=""
+	while [ "${HOME_FS[${LOOP}]}" ]
+	do
+
+		if [ "${MOST}" = "" ];then
+			MOST=${HOME_FS[${LOOP}]}
+		else
+		
+			# Set MOST to the FS that has the most avilable disk space
+			if [ `echo ${MOST} | awk '{print $2}'` -lt `echo ${HOME_FS[${LOOP}]} | awk '{print $2}'` ];then
+				MOST=`echo ${HOME_FS[${LOOP}]}`
+			fi
+		fi
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+	done
+
+	# Update MOST, remove avialable data info
+	MOST=`echo ${MOST} | awk '{print $1}'`
+
+	# Confirm MOST is still set
+	if [ "${MOST}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"MOST\" not set, ${DATE_TIME}"  | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${MOST} | grep -c ".*:/.*"` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"MOST\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "\"${MOST}\" selected to hold new home directory for \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+}
+
+# The ADD_TO_AUTOHOME Function is used to add user info to $AUTO_HOME
+###########################################################################
+ADD_TO_AUTOHOME () {
+
+	# Confirm $USER_ID is not already a in $AUTO_HOME
+	if [ `grep -Pc "^${USER_ID}\s" ${NIS_DIR}/${AUTO_HOME}` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The user ID \"${USER_ID}\" has already been added to ${NIS_DIR}/${AUTO_HOME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Backup NIS $AUTO_HOME file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Backing up \"${NIS_DIR}/${AUTO_HOME}\", ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/${AUTO_HOME} BACKUP
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr ${AUTO_HOME}* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Copying \"${NIS_DIR}/${BACKUP_FILE}\" to \"${TMP}\", ${DATE_TIME}" | tee -a ${LOG}
+	cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Define $MOST
+	DEFINE_MOST
+
+	# Set AUTO_HOME_ENTRY to the new auto.home auto mount entry
+	AUTO_HOME_ENTRY="${USER_ID}\t\t-intr,retry=3,proto=tcp,rsize=1048576,wsize=1048576,vers=3 ${MOST}/&"
+		
+	# Set AUTO_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	AUTO_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $AUTO_LINES is set properly
+	if [ "${AUTO_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${AUTO_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Add $AUTO_HOME_ENTRY to $TMP/$BACKUP_FILE
+	echo -e "Adding entry \"${AUTO_HOME_ENTRY}\" to \"${TMP}/${BACKUP_FILE}\"" | tee -a ${LOG}
+	echo -e "${AUTO_HOME_ENTRY}" >> ${TMP}/${BACKUP_FILE}
+		
+	# Set AUTO_LINES_PLUS to the number of lines in ${TMP}/${BACKUP_FILE}
+	AUTO_LINES_PLUS=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $AUTO_LINES_PLUS is set properly
+	if [ "${AUTO_LINES_PLUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES_PLUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${AUTO_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES_PLUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Increment AUTO_LINES by 1
+	let AUTO_LINES=${AUTO_LINES}+1
+
+	# Confirm $AUTO_LINES & $AUTO_LINES_PLUS are the same
+	if [ ${AUTO_LINES} -ne ${AUTO_LINES_PLUS} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The new ${AUTO_HOME} entry for ${USER_ID} was not added properly to ${TMP}/${BACKUP_FILE}, ${DATE_TIME}" | tee -a ${LOG}
+		echo "Unable to continue, NIS ${AUTO_HOME} file has not been updated" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy $TMP/$BACKUP_FILE to $NIS_DIR/$AUTO_HOME
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Copying \"${TMP}/${BACKUP_FILE}\" to \"${NIS_DIR}/${AUTO_HOME}\", ${DATE_TIME}" | tee -a ${LOG}
+	cp ${TMP}/${BACKUP_FILE} ${NIS_DIR}/${AUTO_HOME}
+		
+	# Confirm that ${NIS_DIR}/${AUTO_HOME} is the same as ${TMP}/${BACKUP_FILE}
+	if [ `diff ${NIS_DIR}/${AUTO_HOME} ${TMP}/${BACKUP_FILE} 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file \"${NIS_DIR}/${AUTO_HOME}\" is not the same as the original file \"${TMP}/${BACKUP_FILE}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually copy ${TMP}/${BACKUP_FILE} to ${NIS_DIR}/${AUTO_HOME}, then run \"make ${AUTO_HOME}\"" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Make and push out new NIS $AUTO_HOME file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS \"${AUTO_HOME}\" file, ${DATE_TIME}" | tee -a ${LOG}	
+	make ${AUTO_HOME} 2>&1 | tee -a ${LOG}
+}
+
+# The REMOVE_FROM_AUTO_HOME Function is used to remove the $USER_ID entry from $AUTO_HOME
+###########################################################################
+REMOVE_FROM_AUTO_HOME () {
+
+	# Confirm $USER_ID is not already a in $AUTO_HOME
+	if [ `grep -Pc "^${USER_ID}\s" ${NIS_DIR}/${AUTO_HOME}` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The user ID \"${USER_ID}\" has already been removed from ${NIS_DIR}/${AUTO_HOME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+	
+	# Backup NIS $AUTO_HOME file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Backing up \"${NIS_DIR}/${AUTO_HOME}\", ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/${AUTO_HOME} BACKUP
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr ${AUTO_HOME}* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Copying \"${NIS_DIR}/${BACKUP_FILE}\" to \"${TMP}\", ${DATE_TIME}" | tee -a ${LOG}
+	cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set AUTO_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	AUTO_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $AUTO_LINES is set properly
+	if [ "${AUTO_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${AUTO_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set AUTO_HOME_ENTRY to the new auto.home auto mount entry
+	AUTO_HOME_ENTRY=`grep -P "^${USER_ID}\s" ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $AUTO_HOME_ENTRY is set
+	if [ "${AUTO_HOME_ENTRY}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_HOME_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	
+	# Remove $AUTO_HOME_ENTRY from $TMP/$BACKUP_FILE
+	echo -e "Removing entry \"${AUTO_HOME_ENTRY}\" from \"${TMP}/${BACKUP_FILE}\"" | tee -a ${LOG}
+	grep -Pv "^${USER_ID}\s" ${TMP}/${BACKUP_FILE} > ${TMP}/${BACKUP_FILE}.1
+	
+	# Confirm ${TMP}/${BACKUP_FILE}.1 exists
+	if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set AUTO_LINES_MINUS to the number of lines in ${TMP}/${BACKUP_FILE}.1
+	AUTO_LINES_MINUS=`wc -l < ${TMP}/${BACKUP_FILE}.1`
+
+	# Confirm $AUTO_LINES_MINUS is set properly
+	if [ "${AUTO_LINES_MINUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES_MINUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${AUTO_LINES_MINUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"AUTO_LINES_MINUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Decrement AUTO_LINES by 1
+	let AUTO_LINES=${AUTO_LINES}-1
+
+	# Confirm $AUTO_LINES & $AUTO_LINES_MINUS are the same
+	if [ ${AUTO_LINES} -ne ${AUTO_LINES_MINUS} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The entry for ${USER_ID} in ${AUTO_HOME} not removed properly in ${TMP}/${BACKUP_FILE}.1, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy $TMP/$BACKUP_FILE to $NIS_DIR/$AUTO_HOME
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Copying \"${TMP}/${BACKUP_FILE}.1\" to \"${NIS_DIR}/${AUTO_HOME}\", ${DATE_TIME}" | tee -a ${LOG}
+	cp ${TMP}/${BACKUP_FILE}.1 ${NIS_DIR}/${AUTO_HOME}
+		
+	# Confirm that ${NIS_DIR}/${AUTO_HOME} is the same as ${TMP}/${BACKUP_FILE}.1
+	if [ `diff ${NIS_DIR}/${AUTO_HOME} ${TMP}/${BACKUP_FILE}.1 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file \"${NIS_DIR}/${AUTO_HOME}\" is not the same as the original file \"${TMP}/${BACKUP_FILE}.1\", ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually copy ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/${AUTO_HOME}, then run \"make ${AUTO_HOME}\"" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Make and push out new NIS $AUTO_HOME file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS \"${AUTO_HOME}\" file, ${DATE_TIME}" | tee -a ${LOG}	
+	make ${AUTO_HOME} 2>&1 | tee -a ${LOG}
+}
+
+# The UP_DOWN function is used determine if $NFS_SERVER is up
+###########################################################################
+UP_DOWN () {
+
+        # Ping $NFS_SERVER
+        if [ `ping -f -i .3 -w 1 ${NFS_SERVER} | grep -c '100% packet loss'` -eq 1 ];then
+                UP_DOWN=DOWN 
+	fi
+
+	# Do a second test to confirm $NFS_SERVER is up using rpcinfo
+        if [ `rpcinfo -p ${NFS_SERVER} 2>/dev/null | wc -l` -ge 1 ];then
+                UP_DOWN=UP
+        else
+                UP_DOWN=DOWN 
+        fi
+}
+
+# The KILL_SSH function is used to check for "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" 
+# processes that have been running for too long. If such a process is found this function kills it
+###########################################################################
+KILL_SSH () {
+	SLEEP_PERIOD=15
+
+#set -x
+# Check to make sure the LOCK_FILE is there, if it is the main program is still running
+# Which means this function should keep running in background
+while [ -f ${LOCK_FILE} ]
+do
+
+        # Set SSH_PID_1 to the first "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" PID
+        SSH_PID_1=`ps -aef | grep "${PID}" | grep "ssh -q" | grep "${NFS_SERVER} sudo ${SETUP_DISK_QUOTA} ${USER_ID}" |
+                grep -v grep | awk '{print $2}' | awk '{print $1}'`
+
+        # Check to make sure SSH_PID_1 is set
+        if [ "${SSH_PID_1}" = "" ];then
+                rm -f ${LOCK_FILE}
+                continue
+        fi
+
+        # Wait ${SLEEP_PERIOD} seconds
+        sleep ${SLEEP_PERIOD}
+
+        # Set SSH_PID_2 to the first "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" PID
+        SSH_PID_2=`ps -aef | grep "${PID}" | grep "ssh -q" | grep "${NFS_SERVER} sudo ${SETUP_DISK_QUOTA} ${USER_ID}" |
+                grep -v grep | awk '{print $2}' | awk '{print $1}'`
+
+        # Check to make sure SSH_PID_2 is set
+        if [ "${SSH_PID_2}" = "" ];then
+                rm -f ${LOCK_FILE}
+                continue
+        fi
+
+        # If after ${SLEEP_PERIOD} seconds SSH_PID_1 is equal to SSH_PID_2 double check it
+        if [ "${SSH_PID_1}" = "${SSH_PID_2}" ];then
+
+                # Wait ${SLEEP_PERIOD} seconds
+                sleep ${SLEEP_PERIOD}
+
+        	# Set SSH_PID_1 to the first "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" PID
+                SSH_PID_1=`ps -aef | grep "${PID}" | grep "ssh -q" | grep "${NFS_SERVER} sudo ${SETUP_DISK_QUOTA} ${USER_ID}" |
+                        grep -v grep | awk '{print $2}' | awk '{print $1}'`
+
+                # Wait ${SLEEP_PERIOD} seconds
+                sleep ${SLEEP_PERIOD}
+
+                # Check to make sure SSH_PID_1 is set
+                if [ "${SSH_PID_1}" = "" ];then
+                        rm -f ${LOCK_FILE}
+                        continue
+                fi
+
+        	# Set SSH_PID_2 to the first "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" PID
+                SSH_PID_2=`ps -aef | grep "${PID}" | grep "ssh -q" | grep "${NFS_SERVER} sudo ${SETUP_DISK_QUOTA} ${USER_ID}" |
+                        grep -v grep | awk '{print $2}' | awk '{print $1}'`
+
+                # Check to make sure SSH_PID_2 is set
+                if [ "${SSH_PID_2}" = "" ];then
+                        rm -f ${LOCK_FILE}
+                        continue
+                fi
+
+                # If after ${SLEEP_PERIOD} more seconds SSH_PID_1 is equal to SSH_PID_2
+                # Kill all the "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID" processes
+                if [ "${SSH_PID_1}" = "${SSH_PID_2}" ];then
+
+                        # Set SSH_PIDS to all th PIDS for "ssh -q $NFS_SERVER sudo $SETUP_DISK_QUOTA $USER_ID"
+                        SSH_PIDS=`ps -aef | grep "${PID}" | grep "ssh -q" |
+				grep "${NFS_SERVER} sudo ${SETUP_DISK_QUOTA} ${USER_ID}" | grep -v grep | awk '{print $2}'`
+
+                        # Check to make sure SSH_PIDS is set
+                        if [ "${SSH_PIDS}" = "" ];then
+                                rm -f ${LOCK_FILE}
+                                        continue
+                        fi
+
+                        kill -9 ${SSH_PIDS}
+                        rm -f ${LOCK_FILE}
+                fi
+        fi
+done
+}
+
+
+# The SET_UID Function is used to set NEW_UID
+###########################################################################
+SET_UID () {
+
+	# Set LAST_UID to the highest UID currently being used
+	LAST_UID=`ypcat passwd | awk -F: '{print $3}' | sort -n | tail -1`
+
+	# Confirm $LAST_UID is to a number 
+	if [ "${LAST_UID}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"LAST_UID\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${LAST_UID} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"LAST_UID, ${LAST_UID}\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set NEW_UID to ${LAST_UID} plus 1
+	let NEW_UID=${LAST_UID}+1
+
+	# Confirm $NEW_UID is to a number 
+	if [ "${NEW_UID}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"NEW_UID\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${NEW_UID} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"NEW_UID, ${NEW_UID}\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+}
+
+# The ADD_DISK_QUOTAS function is used to set setup disk quotas on $USER_ID home directory
+###########################################################################
+ADD_DISK_QUOTAS () {
+
+	# Set NFS_SERVER as needed
+	if [ "${NFS_SERVER}" = "" ];then
+		NFS_SERVER=`ypcat -k ${AUTO_HOME} | grep -P "^${USER_ID}\s" | awk '{print $3}' | awk -F: '{print $1}'`
+
+		if [ "${NFS_SERVER}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NFS_SERVER\" not set from ${AUTO_HOME} for ${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+	fi
+
+	# Confirm $NFS_SERVER is up
+	UP_DOWN
+	if [ ${UP_DOWN} = DOWN ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: ${NFS_SERVER} is down, unable to setup disk quotas for ${USER_ID}, ${DATE_TIME}"
+		echo ""
+		exit
+	fi
+
+	# Create LOCK file
+       	> ${LOCK_FILE}
+       	chmod 666 ${LOCK_FILE}
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo  -e "\nSetting up disk quotas for \"${USER_ID}\" on \"${NFS_SERVER}\", ${DATE_TIME}" | tee -a ${LOG}
+
+	# Start the function that checks for stuck ssh -q $NFS_SERVER
+	KILL_SSH &
+
+	# Setup Disk quotas for $USER_ID
+	ssh -q ${NFS_SERVER} ${SETUP_DISK_QUOTA} ${USER_ID}
+
+	# Remove $LOCK_FILE
+	rm -f ${LOCK_FILE}	
+}
+
+# The REMOVE_DISK_QUOTAS function is used to remove disk quotas on $USER_ID home directory
+###########################################################################
+REMOVE_DISK_QUOTAS () {
+
+	# Confirm $LOCATION is CPC
+	if [ ${LOCATION} = CPC ];then
+
+		# Set NFS_SERVER as needed
+		if [ "${NFS_SERVER}" = "" ];then
+			NFS_SERVER=`ypcat -k ${AUTO_HOME} | grep -P "^${USER_ID}\s" | awk '{print $3}' | awk -F: '{print $1}'`
+	
+			if [ "${NFS_SERVER}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"NFS_SERVER\" not set from ${AUTO_HOME} for ${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+		fi
+	
+		# Confirm $NFS_SERVER is up
+		UP_DOWN
+		if [ ${UP_DOWN} = DOWN ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: ${NFS_SERVER} is down, unable to setup disk quotas for ${USER_ID}, ${DATE_TIME}"
+			echo ""
+			exit
+		fi
+	
+		# Create LOCK file
+        	> ${LOCK_FILE}
+        	chmod 666 ${LOCK_FILE}
+	
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo  -e "\nRemoving disk quotas for \"${USER_ID}\" on \"${NFS_SERVER}\", ${DATE_TIME}" | tee -a ${LOG}
+	
+		# Start the function that checks for stuck ssh -q $NFS_SERVER
+		KILL_SSH &
+	
+		# Setup Disk quotas for $USER_ID
+		ssh -q ${NFS_SERVER} /usr/sbin/edquota -p quota0 ${USER_ID}
+	
+		# Remove $LOCK_FILE
+		rm -f ${LOCK_FILE}	
+	fi
+}
+
+# The ASK_LOCATION function is used to set LOCATION
+###########################################################################
+ASK_LOCATION () {
+	VALID=""
+	until [ -n "${VALID}" ]
+	do
+        	echo ""
+        	echo " *******************"
+        	echo " * Select Location *"
+        	echo " *******************"
+        	echo ""
+        	echo " 1> Canoga Park"
+        	echo " 2> WPB"
+        	echo " 3> WPB with License Support"
+		
+        	LOCATION=""
+        	until [ -n "${LOCATION}" ]
+        	do
+                	echo -n " Enter selection > "
+                	read LOCATION
+        	done
+	
+        	case ${LOCATION} in
+
+			1) # Canoga Park
+			VALID=TRUE
+			LOCATION=CPC
+			NEW_GID=${CPC_GID}
+			HOME_LOCATION=DeSoto
+			AUTO_HOME=auto.home
+			NFS_SERVERS=arlaplnfs
+			BASE_DIR=/export/home/home0.
+			;;
+
+			2) # WPB
+			VALID=TRUE
+			LOCATION=WPB
+			NEW_GID=${WPB_GID}
+			HOME_LOCATION=WPB
+			AUTO_HOME=auto.wpb_home	
+			NFS_SERVERS=arwpplnfs01
+			BASE_DIR=/home_./home
+			;;
+
+			3) # WPB with License Support
+			VALID=TRUE
+			LOCATION=WPB_LIC
+			NEW_GID=${WPB_GID}
+			HOME_LOCATION=WPB
+			AUTO_HOME=auto.wpb_home	
+			NFS_SERVERS=arwpplnfs01
+			BASE_DIR=/home_./home
+			;;
+	
+			q|Q) # Quit
+			exit
+			;;
+		
+			*) # Invalid selection
+			echo " Invalid selection, ${LOCATION}"
+        		LOCATION=""
+        		sleep 1
+        		;;
+		esac
+	done
+}
+
+# The ADD_TO_PASSWD Function is used to add the new user to the NIS password file
+###########################################################################
+ADD_TO_PASSWD () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+	
+
+	VALID=""
+	until [ -n "${VALID}" ]
+	do
+        	echo ""
+        	echo " ****************"
+        	echo " * Select Shell *"
+        	echo " ****************"
+        	echo ""
+        	echo " 1> /bin/csh"
+        	echo " 2> /bin/ksh"
+		echo " 3> /bin/bash"
+        	echo " 4> No Interactive login, /bin/false"
+		
+		SHELL_TYPE=""
+        	until [ -n "${SHELL_TYPE}" ]
+        	do
+                	echo -n " Enter selection > "
+                	read SHELL_TYPE
+        	done
+	
+        	case ${SHELL_TYPE} in
+
+			1) # /bin/csh
+			VALID=TRUE
+			SHELL_TYPE=/bin/csh
+			;;
+			
+			2) # /bin/ksh
+			VALID=TRUE
+			SHELL_TYPE=/bin/ksh
+			;;
+
+			3) # /bin/bash
+			VALID=TRUE
+			SHELL_TYPE=/bin/bash
+			;;
+
+			4) # /bin/false
+			VALID=TRUE
+			SHELL_TYPE=/bin/false
+			;;
+
+			q|Q) # Quit
+			exit
+			;;
+		
+			*) # Invalid selection
+			echo " Invalid selection, ${SHELL_TYPE}"
+        		SHELL_TYPE=""
+        		sleep 1
+        		;;
+		esac
+	done
+
+	# Build COMMENT_FIELD
+	if [ ${LOCATION} = CPC -o ${LOCATION} = WPB_LIC ];then
+		COMMENT_FIELD="\"AccountType=\"\"User - 064\"\", Name=\"\"${DISPLAY_NAME}\"\", CLOCK=${CLOCK_ID}, Home=${HOME_LOCATION}, Phone=${PHONE_NUMBER}\""
+	else
+		COMMENT_FIELD="\"AccountType=\"\"User - WPB Local Only\"\", Name=\"\"${DISPLAY_NAME}\"\", CLOCK=${CLOCK_ID}, Home=${HOME_LOCATION}, Phone=${PHONE_NUMBER}\""
+	fi
+
+	# Backup NIS password file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/passwd, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/passwd BACKUP 2>&1 | tee -a ${LOG}
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr passwd* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	# Build PASS_ENTRY, new password entry for $USER_ID
+	if [ ${SHELL_TYPE} != /bin/false ];then
+		PASS_ENTRY="${USER_ID}::${NEW_UID}:${NEW_GID}:${COMMENT_FIELD}:/home/${USER_ID}:${SHELL_TYPE}"
+	else
+		PASS_ENTRY="${USER_ID}:*LK*:${NEW_UID}:${NEW_GID}:${COMMENT_FIELD}:/home/${USER_ID}:/bin/false"
+	fi
+
+	# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+	cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that ${TMP}/${BACKUP_FILE} is the same as ${NIS_DIR}/passwd
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE} 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The backup file \"${TMP}/${BACKUP_FILE}\" is not the same as the original file \"${NIS_DIR}/passwd\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set PASS_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	PASS_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $PASS_LINES is set properly
+	if [ "${PASS_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Add $PASS_ENTRY to $TMP/$BACKUP_FILE
+	echo "Adding entry ${PASS_ENTRY} to ${TMP}/${BACKUP_FILE}" | tee -a ${LOG}
+	echo "${PASS_ENTRY}" >> ${TMP}/${BACKUP_FILE}
+		
+	# Set PASS_LINES_PLUS to the number of lines in ${TMP}/${BACKUP_FILE}
+	PASS_LINES_PLUS=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $PASS_LINES_PLUS is set properly
+	if [ "${PASS_LINES_PLUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_PLUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_PLUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Increment PASS_LINES by 1
+	let PASS_LINES=${PASS_LINES}+1
+
+	# Confirm $PASS_LINES & $PASS_LINES_PLUS are the same
+	if [ ${PASS_LINES} -ne ${PASS_LINES_PLUS} ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The new password entry for ${USER_ID} was not added properly to ${TMP}/${BACKUP_FILE}, ${DATE_TIME}" | tee -a ${LOG}
+		echo "Unable to continue, NIS password file has not been updated" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy $TMP/$BACKUP_FILE to $NIS_DIR/passwd
+	cp ${TMP}/${BACKUP_FILE} ${NIS_DIR}/passwd
+		
+	# Confirm that ${NIS_DIR}/passwd is the same as ${TMP}/${BACKUP_FILE}
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE} 2>&1 | wc -l` -ge 1 ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The file \"${NIS_DIR}/passwd\" is not the same as the original file \"${TMP}/${BACKUP_FILE}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually copy ${TMP}/${BACKUP_FILE} to ${NIS_DIR}/passwd, then run \"make passwd\"" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Update shadow file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Updating shadow file, ${DATE_TIME}" | tee -a ${LOG}
+	pwconv
+
+	# Make and push out new NIS password file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS password file, ${DATE_TIME}" | tee -a ${LOG}	
+	make passwd 2>&1 | tee -a ${LOG}
+
+	# Set password for new User as needed
+	if [ ${SHELL_TYPE} != /bin/false ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nSetting deafult password for ${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ${DEFAULT_PASS} | passwd --stdin ${USER_ID}
+		pwconv
+
+		# Make and push out new NIS password file
+		cd /var/yp
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Pushing out new NIS password file again, ${DATE_TIME}" | tee -a ${LOG}	
+		make passwd 2>&1 | tee -a ${LOG}
+	fi
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed adding new user, ${USER_ID}, to NIS passwd file ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+}
+
+# The ADD_TO_GROUP Function is used to add a User Name to a certain group
+###########################################################################
+ADD_TO_GROUP () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Set MAX_CHARS_LINE maxium number characters in a single group entry
+	MAX_CHARS_LINE=250
+
+	# Set GROUP_NAME to the Group name used to support the last entry for the GID $GROUP_GID
+        GROUP_NAME=`grep ":${GROUP_GID}:" ${NIS_DIR}/group | grep -v "^#" | head -1 | awk -F: '{print $1}'`
+
+	# Confirm $GROUP_NAME is set
+	if [ "${GROUP_NAME}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_NAME\" not set using group GID \"${GROUP_GID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set GROUP_NAME_USED to the Group name used to support the last entry for the GID $GROUP_GID
+	if [ `grep -c ":${GROUP_GID}:" ${NIS_DIR}/group | grep -v "^#" | wc -l` -eq 1 ];then
+		GROUP_NAME_USED=${GROUP_NAME}
+	else
+		GROUP_NAME_USED="${GROUP_NAME}_part`grep ":${GROUP_GID}:" ${NIS_DIR}/group | grep -v "^#" | wc -l`"
+	fi
+
+	# Confirm $GROUP_NAME_USED is set
+	if [ "${GROUP_NAME_USED}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_NAME_USED\" not set using group GID \"${GROUP_GID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set GROUP_CHARS_USED to the number of charaters in the last group line supporting $GROUP_GID
+	GROUP_CHARS_USED=`grep "^${GROUP_NAME_USED}:" ${NIS_DIR}/group | tail -1 | wc -c`
+
+	# Confirm $GROUP_CHARS_USED is set
+	if [ "${GROUP_CHARS_USED}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_CHARS_USED\" not set using group GID \"${GROUP_GID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set TOTAL_GROUP_CHARS to $USER_CHARS plus $GROUP_CHARS_USED
+	let TOTAL_GROUP_CHARS=${USER_CHARS}+${GROUP_CHARS_USED}
+
+	# Confirm $TOTAL_GROUP_CHARS is set
+	if [ "${TOTAL_GROUP_CHARS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"TOTAL_GROUP_CHARS\" not set using the variable \"GROUP_CHARS_USED, ${GROUP_CHARS_USED}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that by adding the user $USER_ID to the group $GROUP_NAME_USED the total numbers of characters in that line
+	# does not exceed $MAX_CHARS_LINE. If it does redefine GROUP_NAME_USED
+	if [ ${TOTAL_GROUP_CHARS} -gt ${MAX_CHARS_LINE} ];then
+
+		# Set NEW_GROUP_ENTRY
+		NEW_GROUP_ENTRY=YES
+
+		# Determine what _part is being used, redefine GROUP_NAME_USED as needed
+		if [ `echo ${GROUP_NAME_USED} | grep -c _part` -eq 0 ];then
+
+			# Reset GROUP_NAME_USED to a new name
+			GROUP_NAME_USED=${GROUP_NAME_USED}_part2
+		else
+			# Set PART_NUM to the digit at the end of _part, i.e. _part2
+			PART_NUM=`echo ${GROUP_NAME_USED} | awk -F_ '{print $2}' | sed 's/part//'`
+
+			# Confirm $PART_NUM is set properly
+			if [ "${PART_NUM}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"PART_NUM\" not set using the variable \"GROUP_NAME_USED, ${GROUP_NAME_USED}\", ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${PART_NUM} | wc -c` -gt 3 -o `echo ${PART_NUM} | grep -c '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"PART_NUM\" not set properly using the variable \"GROUP_NAME_USED, ${GROUP_NAME_USED}\", ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Incement PART_NUM
+			let PART_NUM=${PART_NUM}+1
+
+			# Confirm $PART_NUM is set properly
+			if [ "${PART_NUM}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"PART_NUM\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${PART_NUM} | wc -c` -gt 3 -o `echo ${PART_NUM} | grep -c '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"PART_NUM\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Reset GROUP_NAME_USED to a new name
+			GROUP_NAME_USED=${GROUP_NAME}_part${PART_NUM}
+		fi
+	else
+
+		# Set NEW_GROUP_ENTRY
+		NEW_GROUP_ENTRY=NO
+	fi
+
+	# Backup NIS group file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/group BACKUP
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr group* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	if [ ${NEW_GROUP_ENTRY} = YES ];then
+
+		# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+		cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+		# Confirm ${TMP}/${BACKUP_FILE} exists
+		if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+		
+		# Set GROUP_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+		GROUP_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+	
+		# Confirm $GROUP_LINES is set properly
+		if [ "${GROUP_LINES}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${GROUP_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Build new Group entry
+		GROUP_ENTRY="${GROUP_NAME_USED}::${GROUP_GID}:${USER_ID}"
+
+		# Add $GROUP_ENTRY to $TMP/$BACKUP_FILE	
+		echo ${GROUP_ENTRY} >> ${TMP}/${BACKUP_FILE}
+
+		# Confirm ${TMP}/${BACKUP_FILE} exists
+		if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+		
+		# Set GROUP_LINES_PLUS to the number of lines in ${TMP}/${BACKUP_FILE}
+		GROUP_LINES_PLUS=`wc -l < ${TMP}/${BACKUP_FILE}`
+	
+		# Confirm $GROUP_LINES_PLUS is set properly
+		if [ "${GROUP_LINES_PLUS}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES_PLUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${GROUP_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES_PLUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Increment GROUP_LINES by 1
+		let GROUP_LINES=${GROUP_LINES}+1
+
+		# Confirm $GROUP_LINES & $GROUP_LINES_PLUS are the same
+		if [ ${GROUP_LINES} -ne ${GROUP_LINES_PLUS} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The new group entry for ${USER_ID} was not added properly to ${TMP}/${BACKUP_FILE}, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+			
+		# Sort $TMP/$BACKUP_FILE based on GID, write output to ${TMP}/${BACKUP_FILE}.1
+		cat ${TMP}/${BACKUP_FILE} | sort -t: -k3 -n > ${TMP}/${BACKUP_FILE}.1
+
+		# Confirm ${TMP}/${BACKUP_FILE}.1 exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+		if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -ne `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+	else
+
+		# Set OLD_GROUP_ENTRY to the existing enty for $GROUP_NAME_USED
+		OLD_GROUP_ENTRY=`grep "^${GROUP_NAME_USED}:" ${NIS_DIR}/group`
+
+		# Confirm $OLD_GROUP_ENTRY is set properly
+		if [ "${OLD_GROUP_ENTRY}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"OLD_GROUP_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Build new Group entry
+		GROUP_ENTRY="${OLD_GROUP_ENTRY},${USER_ID}"
+
+		# Copy $NIS_DIR/$BACKUP_FILE, minus the $OLD_GROUP_ENTRY line
+		grep -v "^${OLD_GROUP_ENTRY}" ${NIS_DIR}/${BACKUP_FILE} > ${TMP}/${BACKUP_FILE}
+	
+		# Confirm ${TMP}/${BACKUP_FILE} exists
+		if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Add $GROUP_ENTRY to $TMP/$BACKUP_FILE	
+		echo ${GROUP_ENTRY} >> ${TMP}/${BACKUP_FILE}
+
+		# Confirm ${TMP}/${BACKUP_FILE} exists and was created properly
+		if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+
+		elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -ne `wc -l < ${NIS_DIR}/${BACKUP_FILE}` ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+			
+		# Sort $TMP/$BACKUP_FILE based on GID, write output to ${TMP}/${BACKUP_FILE}.1
+		cat ${TMP}/${BACKUP_FILE} | sort -t: -k3 -n > ${TMP}/${BACKUP_FILE}.1
+
+		# Confirm ${TMP}/${BACKUP_FILE}.1 exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+		if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -ne `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+	fi
+
+	# Copy ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Installing new ${NIS_DIR}/group file, ${DATE_TIME}" | tee -a ${LOG}
+	cp ${TMP}/${BACKUP_FILE}.1 ${NIS_DIR}/group
+
+	# Confirm ${NIS_DIR}/group exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	if [ ! -s ${NIS_DIR}/group ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The Copy of ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group failed" | tee -a ${LOG}
+		echo "Installing backup group file, ${NIS_DIR}/${BACKUP_FILE} as ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		cp ${NIS_DIR}/${BACKUP_FILE} ${NIS_DIR}/group
+	elif [ `wc -l < ${NIS_DIR}/group` -ne `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The Copy of ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group failed" | tee -a ${LOG}
+		echo "Installing backup group file, ${NIS_DIR}/${BACKUP_FILE} as ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		cp ${NIS_DIR}/${BACKUP_FILE} ${NIS_DIR}/group
+	fi
+
+	# Update NIS group
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS group file, ${DATE_TIME}" | tee -a ${LOG}	
+	make group 2>&1 | tee -a ${LOG}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed adding new user, ${USER_ID} to NIS group file, ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+}
+
+# The SELECT_GROUP Function is used select the required group name
+###########################################################################
+SELECT_GROUP () {
+
+	echo ""
+	GROUP_NAME=""
+	until [ -n "${GROUP_NAME}" ]
+	do
+		echo -n " Enter Group Name > "
+		read GROUP_NAME
+
+		# Confirm GROUP_NAME is not set to a null
+		if [ "${GROUP_NAME}" = "" ];then
+			true
+		elif [ `grep -c "^${GROUP_NAME}:" ${NIS_DIR}/group` -eq 0 ];then
+			echo ""
+			echo " Invalid entry, ${GROUP_NAME}"
+			echo " The group name, \"${GROUP_NAME}\" does not exist"
+			echo ""
+			GROUP_NAME=""
+		fi
+	done
+
+	# Set GROUP_GID based on $GROUP_NAME
+	GROUP_GID=`grep "^${GROUP_NAME}:" ${NIS_DIR}/group | awk -F: '{print $3}'`
+
+	# Confirm $GROUP_GID is set
+	if [ "${GROUP_GID}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_GID\" not set using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${GROUP_GID} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_GID, ${GROUP_GID}\" not set properly using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+}
+
+# The SELECT_NETGROUP Function is used select the required netgroup name
+###########################################################################
+SELECT_NETGROUP () {
+
+	echo ""
+	NETGROUP_NAME=""
+	until [ -n "${NETGROUP_NAME}" ]
+	do
+		echo -n " Enter Netgroup Name > "
+		read NETGROUP_NAME
+
+		# Confirm NETGROUP_NAME is not set to a null
+		if [ "${NETGROUP_NAME}" = "" ];then
+			true
+		elif [ `grep -c "^${NETGROUP_NAME} " ${NIS_DIR}/netgroup` -eq 0 ];then
+			echo ""
+			echo " Invalid entry, ${NETGROUP_NAME}"
+			echo " The netgroup name, \"${NETGROUP_NAME}\" does not exist"
+			echo ""
+			NETGROUP_NAME=""
+		fi
+	done
+}
+
+
+# The SET_SHELL_TYPE Function is used to define the variable SHELL_TYPE
+###########################################################################
+SET_SHELL_TYPE () {
+
+	SHELL_TYPE=`ypcat passwd | grep "^${USER_ID}:" | awk -F: '{print $NF}'`
+
+	# Confirm $SHELL_TYPE is set
+	if [ "${SHELL_TYPE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"${SHELL_TYPE}\" not set for \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+}
+
+# The ADD_HOME_DIR Function is used to create the user home directory
+###########################################################################
+ADD_HOME_DIR () {
+
+	# Confirm nothing is mounted on ${TMP}/HOME_DIR
+	if [ `grep -c "${TMP}/HOME_DIR" /etc/mtab` -eq 1 ];then
+		umount -l ${TMP}/HOME_DIR
+	fi
+
+	# Confirm $USER_ID is not already a in $AUTO_HOME
+	if [ `grep -Pc "^${USER_ID}\s" ${NIS_DIR}/${AUTO_HOME}` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The user ID \"${USER_ID}\" has already been added to ${NIS_DIR}/${AUTO_HOME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Create ${TMP}/HOME_DIR
+	mkdir ${TMP}/HOME_DIR
+
+	# Clear the array HOME_FS
+	unset HOME_FS[*]
+
+	# Pre set LOOP to 0
+	LOOP=0
+	# Loop through each NFS file server setting NFS_SERVER
+	for NFS_SERVER in ${NFS_SERVERS}
+	do
+
+		# Set FS to each unquie file sysytem used for home directories on $NFS_SERVER
+		for FS in `ypcat -k ${AUTO_HOME} | grep ${NFS_SERVER} | grep home | awk '{print $NF}' | awk -F: '{print $2}' |
+			sed 's%\&%%' | grep ${BASE_DIR} | sed "s%\(${BASE_DIR}[0-9]*\)/.*%\1%" | sort -u`
+		do
+			# Build the array HOME_FS, add the full path to each file system supporting Home Dirs
+			HOME_FS[${LOOP}]="${NFS_SERVER}:${FS}"
+
+			# Increment LOOP
+			let LOOP=${LOOP}+1
+		done
+	done
+
+	# Pre set LOOP to 0
+	LOOP=0
+
+	# DEFINE $MOST
+	DEFINE_MOST
+
+	# Mount $MOST on $TMP/HOME_DIR
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo  -e "\nMounting \"${MOST}\" on \"${TMP}/HOME_DIR\", ${DATE_TIME}" | tee -a ${LOG}
+	mount ${MOST} ${TMP}/HOME_DIR
+
+	# Confirm $MOST is mounted on /tmp/HOME_DIR
+	if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file system ${MOST} not mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that ${TMP}/HOME_DIR/${USER_ID} does not already exist
+	if [ -d ${TMP}/HOME_DIR/${USER_ID} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file home directory \"${TMP}/HOME_DIR/${USER_ID}\" for \"${USER_ID}\" already exists, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		UMOUNT
+		exit
+	fi
+
+	# Create new HD
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Creating home directory \"${TMP}/HOME_DIR/${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+	mkdir ${TMP}/HOME_DIR/${USER_ID}
+
+	# Confirm ${TMP}/HOME_DIR/${USER_ID} was created
+	if [ ! -d ${TMP}/HOME_DIR/${USER_ID} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The new home directory ${TMP}/HOME_DIR/${USER_ID}, was not created properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		UMOUNT
+		exit
+	fi
+
+	# Confirm that /stds/login/dot_files is available
+	ls /stds/login/dot_files 1> /dev/null 2>&1
+	if [ ! -d /stds/login/dot_files ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required NFS directory /stds/login/dot_files not avialable, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		UMOUNT
+		exit
+	fi
+
+	# Add required files to ${TMP}/HOME_DIR/${USER_ID}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Adding required dot files to \"${TMP}/HOME_DIR/${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+
+	# Installed required files
+	if [ ${SHELL_TYPE} = /bin/csh ];then
+		cp /stds/login/dot_files/.source_cshrc ${TMP}/HOME_DIR/${USER_ID}/.cshrc
+		cp /stds/login/dot_files/.cshrc_user ${TMP}/HOME_DIR/${USER_ID}
+		cp /stds/login/dot_files/.login ${TMP}/HOME_DIR/${USER_ID}
+		cp /stds/login/dot_files/.aliases_cshrc ${TMP}/HOME_DIR/${USER_ID}/.aliases
+	elif [ ${SHELL_TYPE} = /bin/ksh ];then
+		cp /stds/login/dot_files/.source_kshrc ${TMP}/HOME_DIR/${USER_ID}/.kshrc
+		cp /stds/login/dot_files/.kshrc_user ${TMP}/HOME_DIR/${USER_ID}
+		cp /stds/login/dot_files/.aliases_kshrc ${TMP}/HOME_DIR/${USER_ID}/.aliases
+	elif [ ${SHELL_TYPE} = /bin/bash ];then
+		cp /stds/login/dot_files/.source_bash_profile ${TMP}/HOME_DIR/${USER_ID}/.bash_profile
+		cp /stds/login/dot_files/.bash_user ${TMP}/HOME_DIR/${USER_ID}
+		cp /stds/login/dot_files/.aliases_bash ${TMP}/HOME_DIR/${USER_ID}/
+	fi
+	cp /stds/login/dot_files/.shosts ${TMP}/HOME_DIR/${USER_ID}
+		
+	# Setup ownership and group on ${TMP}/HOME_DIR/${USER_ID}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Setting required owner, group and permissions on ${TMP}/HOME_DIR/${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+	chown -R ${USER_ID}:${NEW_GID} ${TMP}/HOME_DIR/${USER_ID}
+	chmod 600 ${TMP}/HOME_DIR/${USER_ID}/.shosts
+
+	# Umount ${TMP}/HOME_DIR
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "Umounting \"${TMP}/HOME_DIR\", ${DATE_TIME}\n" | tee -a ${LOG}
+	umount ${TMP}/HOME_DIR
+
+	# Confirm ${TMP}/HOME_DIR is no longer mounted
+	if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file system ${MOST} still mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually umount ${TMP}/HOME_DIR" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Setup $AUTO_HOME entry
+	ADD_TO_AUTOHOME
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed creating home directory for the user \"${USER_ID}\", and setting up NIS \"${AUTO_HOME}\" file, ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+}
+
+# The REMOVE_FROM_PASSWD Function is used to remove users from the NIS password file
+###########################################################################
+REMOVE_FROM_PASSWD () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Backup NIS password file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/passwd, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/passwd BACKUP 2>&1 | tee -a ${LOG}
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr passwd* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+	cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that ${TMP}/${BACKUP_FILE} is the same as ${NIS_DIR}/passwd
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE} 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The backup file \"${TMP}/${BACKUP_FILE}\" is not the same as the original file \"${NIS_DIR}/passwd\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set PASS_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	PASS_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $PASS_LINES is set properly
+	if [ "${PASS_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Remove $USER_ID from $TMP/$BACKUP_FILE
+	echo "Removing ${USER_ID} from ${TMP}/${BACKUP_FILE}" | tee -a ${LOG}
+	grep -v "^${USER_ID}:" ${TMP}/${BACKUP_FILE} > ${TMP}/${BACKUP_FILE}.1
+
+	# Confirm ${TMP}/${BACKUP_FILE}.1 exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+	if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -le `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set PASS_LINES_MINUS to the number of lines in ${TMP}/${BACKUP_FILE}
+	PASS_LINES_MINUS=`wc -l < ${TMP}/${BACKUP_FILE}.1`
+
+	# Confirm $PASS_LINES_MINUS is set properly
+	if [ "${PASS_LINES_MINUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_MINUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_MINUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Decrement PASS_LINES by 1
+	let PASS_LINES=${PASS_LINES}-1
+
+	# Confirm $PASS_LINES & $PASS_LINES_MINUS are the same
+	if [ ${PASS_LINES} -ne ${PASS_LINES_MINUS} ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The password entry for ${USER_ID} was not removed properly from ${TMP}/${BACKUP_FILE}, ${DATE_TIME}" | tee -a ${LOG}
+		echo "Unable to continue, NIS password file has not been updated" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy $TMP/$BACKUP_FILE to $NIS_DIR/passwd
+	cp ${TMP}/${BACKUP_FILE}.1 ${NIS_DIR}/passwd
+		
+	# Confirm that ${NIS_DIR}/passwd is the same as ${TMP}/${BACKUP_FILE}
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE}.1 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file \"${NIS_DIR}/passwd\" is not the same as the original file \"${TMP}/${BACKUP_FILE}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually copy ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/passwd, then run \"make passwd\"" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Update shadow file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Updating shadow file, ${DATE_TIME}" | tee -a ${LOG}
+	pwconv
+
+	# Make and push out new NIS password file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS password file, ${DATE_TIME}" | tee -a ${LOG}	
+	make passwd 2>&1 | tee -a ${LOG}
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed removing user, ${USER_ID}, from NIS password file ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+}
+
+# The LOCK_USER Function is used to lock/disable user account in the NIS password file
+# Change SHELL to /bin/false and encrypted password to *LK*
+###########################################################################
+LOCK_USER () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Backup NIS password file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/passwd, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/passwd BACKUP 2>&1 | tee -a ${LOG}
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr passwd* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+	cd /
+
+	# Copy $NIS_DIR/$BACKUP_FILE to $TMP
+	cp ${NIS_DIR}/${BACKUP_FILE} ${TMP}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that ${TMP}/${BACKUP_FILE} is the same as ${NIS_DIR}/passwd
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE} 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The backup file \"${TMP}/${BACKUP_FILE}\" is not the same as the original file \"${NIS_DIR}/passwd\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set PASS_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	PASS_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $PASS_LINES is set properly
+	if [ "${PASS_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set PASS_ENTRY to the NIS password entry for $USER_ID
+	PASS_ENTRY=`grep "^${USER_ID}:" ${TMP}/${BACKUP_FILE}`
+
+	# Confirm $PASS_ENTRY is set
+	if [ "${PASS_ENTRY}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_ENTRY} | grep -c "^${USER_ID}:."` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_ENTRY\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Change PASS_ENTRY, change password field to *LK* and SHELL to /bin/false
+	PASS_ENTRY=`echo ${PASS_ENTRY} | sed "s[\(${USER_ID}\):.:\(.*\):/bin/.*[\1:*LK*:\2:/bin/false["`
+
+	# Confirm $PASS_ENTRY is set
+	if [ "${PASS_ENTRY}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_ENTRY} | grep "^${USER_ID}:\*LK\*:" | grep -c /bin/false` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_ENTRY\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Remove $USER_ID from $TMP/$BACKUP_FILE
+	echo "Removing ${USER_ID} from ${TMP}/${BACKUP_FILE}" | tee -a ${LOG}
+	grep -v "^${USER_ID}:" ${TMP}/${BACKUP_FILE} > ${TMP}/${BACKUP_FILE}.1
+
+	# Confirm ${TMP}/${BACKUP_FILE}.1 exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+	if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -le `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set PASS_LINES_MINUS to the number of lines in ${TMP}/${BACKUP_FILE}.1
+	PASS_LINES_MINUS=`wc -l < ${TMP}/${BACKUP_FILE}.1`
+
+	# Confirm $PASS_LINES_MINUS is set properly
+	if [ "${PASS_LINES_MINUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_MINUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_MINUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Decrement PASS_LINES by 1
+	let PASS_LINES=${PASS_LINES}-1
+
+	# Confirm $PASS_LINES & $PASS_LINES_MINUS are the same
+	if [ ${PASS_LINES} -ne ${PASS_LINES_MINUS} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The password entry for ${USER_ID} was not removed properly from ${TMP}/${BACKUP_FILE}.1, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Update shadow file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Updating shadow file, ${DATE_TIME}" | tee -a ${LOG}
+	pwconv
+		
+	# Set PASS_LINES to the number of lines in ${TMP}/${BACKUP_FILE}.1
+	PASS_LINES=`wc -l < ${TMP}/${BACKUP_FILE}.1`
+
+	# Confirm $PASS_LINES is set properly
+	if [ "${PASS_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Add $PASS_ENTRY to $TMP/$BACKUP_FILE
+	echo "Adding entry ${PASS_ENTRY} to ${TMP}/${BACKUP_FILE}.1" | tee -a ${LOG}
+	echo "${PASS_ENTRY}" >> ${TMP}/${BACKUP_FILE}.1
+
+	# Set PASS_LINES_PLUS to the number of lines in ${TMP}/${BACKUP_FILE}.1
+	PASS_LINES_PLUS=`wc -l < ${TMP}/${BACKUP_FILE}.1`
+
+	# Confirm $PASS_LINES_PLUS is set properly
+	if [ "${PASS_LINES_PLUS}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_PLUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${PASS_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"PASS_LINES_PLUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Increment PASS_LINES by 1
+	let PASS_LINES=${PASS_LINES}+1
+
+	# Confirm $PASS_LINES & $PASS_LINES_PLUS are the same
+	if [ ${PASS_LINES} -ne ${PASS_LINES_PLUS} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The disabled password entry for ${USER_ID} was not added properly to ${TMP}/${BACKUP_FILE}.1, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy $TMP/$BACKUP_FILE to $NIS_DIR/passwd
+	cp ${TMP}/${BACKUP_FILE}.1 ${NIS_DIR}/passwd
+		
+	# Confirm that ${NIS_DIR}/passwd is the same as ${TMP}/${BACKUP_FILE}.1
+	if [ `diff ${NIS_DIR}/passwd ${TMP}/${BACKUP_FILE}.1 2>&1 | wc -l` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file \"${NIS_DIR}/passwd\" is not the same as the original file \"${TMP}/${BACKUP_FILE}.1\", ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually copy ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/passwd, then run \"make passwd\"" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Update shadow file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Updating shadow file, ${DATE_TIME}" | tee -a ${LOG}
+	pwconv
+
+	# Make and push out new NIS password file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS password file, ${DATE_TIME}" | tee -a ${LOG}	
+	make passwd 2>&1 | tee -a ${LOG}
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed adding new user, ${USER_ID}, to NIS passwd file ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+}
+
+# The REMOVE_FROM_GROUP Function is used to remove a User Name to a certain group
+###########################################################################
+REMOVE_FROM_GROUP () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Confirm ${USER_ID} is using $GROUP_NAME
+	if [ `grep ":${GROUP_GID}:" ${NIS_DIR}/group | grep -v "^#" | grep -w ${USER_ID} | wc -l` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "" | tee -a ${LOG}
+		echo "Warning: The user ${USER_ID} not part of the NIS group ${GROUP_NAME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+	else
+
+
+	# Set GROUP_NAME_USED to the Group name used to support entry for $USER_ID
+        GROUP_NAME_USED=`grep ":${GROUP_GID}:" ${NIS_DIR}/group | grep -v "^#" | grep -w ${USER_ID} | head -1 | awk -F: '{print $1}'`
+
+	# Confirm $GROUP_NAME is set
+	if [ "${GROUP_NAME_USED}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_NAME_USED\" not set using group GID \"${GROUP_GID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Backup NIS group file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/group BACKUP
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr group* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm there is not an "x" bettwen the group name and the GID
+	if [ `grep -ic "^${GROUP_NAME_USED}:x:" ${NIS_DIR}/group` -ge 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The group entry for ${GROUP_NAME_USED} in ${NIS_DIR}/group contains an "x" between the Group name and the GID, i.e. GNAME:x:GID. Manually remove the x and restart $0" | tee -a ${LOG} 
+		echo ""
+		exit
+	fi
+
+	# Set OLD_GROUP_ENTRY to the existing enty for $GROUP_NAME_USED
+	OLD_GROUP_ENTRY=""
+	OLD_GROUP_ENTRY=`grep "^${GROUP_NAME_USED}:" ${NIS_DIR}/group | grep ${USER_ID}`
+
+	# Confirm $OLD_GROUP_ENTRY is set properly
+	if [ "${OLD_GROUP_ENTRY}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"OLD_GROUP_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${OLD_GROUP_ENTRY} | wc -l` -ge 2 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"OLD_GROUP_ENTRY\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Build new Group entry
+	if [ `grep -c "^${GROUP_NAME_USED}::${GROUP_GID}:${USER_ID}$" ${NIS_DIR}/group` -eq 1 ];then
+
+		if [ `echo ${GROUP_NAME_USED} | grep -c _part` -eq 1 ];then
+			REMOVE_GROUP_ENTRY=YES
+		else
+			REMOVE_GROUP_ENTRY=NO
+			GROUP_ENTRY="${GROUP_NAME}::${GROUP_GID}:"
+		fi
+	elif [ `grep -c "^${GROUP_NAME_USED}::${GROUP_GID}:${USER_ID}," ${NIS_DIR}/group` -eq 1 ];then
+			REMOVE_GROUP_ENTRY=NO
+			GROUP_ENTRY=`echo ${OLD_GROUP_ENTRY} | sed "s/:${USER_ID},/:/"`
+	elif [ `grep "^${GROUP_NAME_USED}::${GROUP_GID}" ${NIS_DIR}/group | grep -c ",${USER_ID},"` -eq 1 ];then
+			REMOVE_GROUP_ENTRY=NO
+			GROUP_ENTRY=`echo ${OLD_GROUP_ENTRY} | sed "s/,${USER_ID},/,/"`
+	elif [ `grep "^${GROUP_NAME_USED}::${GROUP_GID}" ${NIS_DIR}/group | grep -c ",${USER_ID}$"` -eq 1 ];then
+			REMOVE_GROUP_ENTRY=NO
+			GROUP_ENTRY=`echo ${OLD_GROUP_ENTRY} | sed "s/,${USER_ID}//"`
+	fi
+
+	# Copy $NIS_DIR/$BACKUP_FILE, minus the $OLD_GROUP_ENTRY line to $TMP/$BACKUP_FILE
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Removing ${USER_ID} from group ${GROUP_NAME}, ${DATE_TIME}" | tee -a ${LOG}
+	grep -v "^${OLD_GROUP_ENTRY}" ${NIS_DIR}/group > ${TMP}/${BACKUP_FILE}
+	
+	# Confirm ${TMP}/${BACKUP_FILE} exists
+	if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+		
+	# Set GROUP_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+	GROUP_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+	
+	# Confirm $GROUP_LINES is set properly
+	if [ "${GROUP_LINES}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${GROUP_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"GROUP_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Add $GROUP_ENTRY minus $USER_ID as needed
+	if [  ${REMOVE_GROUP_ENTRY} = NO ];then
+
+		# Add $GROUP_ENTRY to $TMP/$BACKUP_FILE	
+		echo ${GROUP_ENTRY} >> ${TMP}/${BACKUP_FILE}
+
+		# Confirm ${TMP}/${BACKUP_FILE} exists
+		if [ ! -s ${TMP}/${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+		
+		# Set GROUP_LINES_PLUS to the number of lines in ${TMP}/${BACKUP_FILE}
+		GROUP_LINES_PLUS=`wc -l < ${TMP}/${BACKUP_FILE}`
+	
+		# Confirm $GROUP_LINES_PLUS is set properly
+		if [ "${GROUP_LINES_PLUS}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES_PLUS\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${GROUP_LINES_PLUS} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"GROUP_LINES_PLUS\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Increment GROUP_LINES by 1
+		let GROUP_LINES=${GROUP_LINES}+1
+
+		# Confirm $GROUP_LINES & $GROUP_LINES_PLUS are the same
+		if [ ${GROUP_LINES} -ne ${GROUP_LINES_PLUS} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo "Error: The new group entry for ${USER_ID} was not added properly to ${TMP}/${BACKUP_FILE}, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+	fi
+			
+	# Sort $TMP/$BACKUP_FILE based on GID, write output to ${TMP}/${BACKUP_FILE}.1
+	cat ${TMP}/${BACKUP_FILE} | sort -t: -k3 -n > ${TMP}/${BACKUP_FILE}.1
+			
+	# Confirm ${TMP}/${BACKUP_FILE}.1 exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+	if [ ! -s ${TMP}/${BACKUP_FILE}.1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `wc -l < ${TMP}/${BACKUP_FILE}` -ne `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"${TMP}/${BACKUP_FILE}.1\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Copy ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Installing new ${NIS_DIR}/group file, ${DATE_TIME}" | tee -a ${LOG}
+	cp ${TMP}/${BACKUP_FILE}.1 ${NIS_DIR}/group
+
+	# Confirm ${NIS_DIR}/group exist, and has the same number of lines as ${TMP}/${BACKUP_FILE}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	if [ ! -s ${NIS_DIR}/group ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The Copy of ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group failed" | tee -a ${LOG}
+		echo "Installing backup group file, ${NIS_DIR}/${BACKUP_FILE} as ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		cp ${NIS_DIR}/${BACKUP_FILE} ${NIS_DIR}/group
+		exit
+	elif [ `wc -l < ${NIS_DIR}/group` -ne `wc -l < ${TMP}/${BACKUP_FILE}.1` ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The Copy of ${TMP}/${BACKUP_FILE}.1 to ${NIS_DIR}/group failed" | tee -a ${LOG}
+		echo "Installing backup group file, ${NIS_DIR}/${BACKUP_FILE} as ${NIS_DIR}/group, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		cp ${NIS_DIR}/${BACKUP_FILE} ${NIS_DIR}/group
+		exit
+	fi
+
+	# Update NIS group
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS group file, ${DATE_TIME}" | tee -a ${LOG}	
+	make group 2>&1 | tee -a ${LOG}
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed removing user, ${USER_ID} from NIS group ${GROUP_NAME}, ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+
+	fi	# End of tesing for if $USER_ID is part of $GROUP_NAME
+}
+
+# The REMOVE_FROM_NETGROUP Function is used to remove a User Name to a certain netgroup
+###########################################################################
+REMOVE_FROM_NETGROUP () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Add all users assigned to $NETGROUP_NAME to the array NETGROUP_USERS
+	unset NETGROUP_USERS[*]
+
+	LOOP=0
+	FOUND_NETGROUP_USER=NO
+	for NETGROUP_USER in `sed -n "/^${NETGROUP_NAME} /,/^#\|^$/"p ${NIS_DIR}/netgroup | 
+		egrep -v "^${NETGROUP_NAME} |^#" | awk '{print $1}' | sed 's/(-,//;s/)//' | awk -F, '{print $1}'`
+	do
+
+		# Add ${NETGROUP_USER} to NETGROUP_USERS
+		NETGROUP_USERS[${LOOP}]="${NETGROUP_USER}"
+
+		# Set FOUND_NETGROUP_USER to YES
+		[ ${NETGROUP_USER} = ${USER_ID} ] && FOUND_NETGROUP_USER=YES
+
+                # Increment LOOP
+                let LOOP=${LOOP}+1
+	done
+
+	# Confirm ${USER_ID} is using $NETGROUP_NAME
+	if [  ${FOUND_NETGROUP_USER} = NO ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "" | tee -a ${LOG}
+		echo "Warning: The user ${USER_ID} not part of the NIS netgroup ${NETGROUP_NAME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+	else
+		# Backup NIS password file
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "" | tee -a ${LOG}
+		echo "Backing up ${NIS_DIR}/netgroup, ${DATE_TIME}" | tee -a ${LOG}
+		${VI} ${NIS_DIR}/netgroup BACKUP 2>&1 | tee -a ${LOG}
+
+		# Set BACKUP_FILE
+		cd ${NIS_DIR}
+		BACKUP_FILE=`ls -tr netgroup* | tail -1`
+
+		# Confirm $BACKUP_FILE is set properly
+		if [ "${BACKUP_FILE}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ ! -f ${BACKUP_FILE} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+		cd /
+
+		# Set NETGROUP_LINES to the number of lines in ${TMP}/${BACKUP_FILE}
+		NETGROUP_LINES=`wc -l < ${NIS_DIR}/${BACKUP_FILE}`
+
+		# Confirm $NETGROUP_LINES is set properly
+		if [ "${NETGROUP_LINES}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${NETGROUP_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Set NETGROUP_ENTRY_LINES to the number of lines used for $NETGROUP_NAME
+		let NETGROUP_ENTRY_LINES=${LOOP}-1
+	
+		# Confirm $NETGROUP_ENTRY_LINES is set properly
+		if [ "${NETGROUP_ENTRY_LINES}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_ENTRY_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${NETGROUP_ENTRY_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_ENTRY_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# SET FIRST_LINE to the line number containing ${NETGROUP_NAME}
+		FIRST_LINE=`grep -n "^${NETGROUP_NAME} " ${NIS_DIR}/netgroup | awk -F: '{print $1}'`
+
+		# Confirm $FIRST_LINE is set
+		if [ "${FIRST_LINE}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"FIRST_LINE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${FIRST_LINE} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"FIRST_LINE\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Set NEXT_LINE to the caculate last line used by a user entry for $NETGROUP_NAME
+		let NEXT_LINE=${FIRST_LINE}+${LOOP}+1
+
+		# Confirm $NEXT_LINE is set
+		if [ "${NEXT_LINE}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NEXT_LINE\" not set, take 2, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${NEXT_LINE} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NEXT_LINE\" not set properly, take 2, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Decrement FIRST_LINE by 1
+		let FIRST_LINE=${FIRST_LINE}-1
+
+		# Confirm $FIRST_LINE is set
+		if [ "${FIRST_LINE}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"FIRST_LINE\" not set, take 2, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${FIRST_LINE} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"FIRST_LINE\" not set properly, take 2, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Build new netgroup file 1 section at a time in $TMP
+		# The first section is the lines in the file before the netgroup $NETGROUP_NAME
+		sed -n "1","${FIRST_LINE}"p ${NIS_DIR}/netgroup > ${TMP}/${BACKUP_FILE}
+
+		# The next section is re-adding the $NETGROUP_NAME minus $USER_ID, but only if there
+		# other users assigned to the netgroup. Otherwise skip re-adding this $NETGROUP_NAME
+		if [ ${LOOP} -gt 1 ];then
+
+			LOOP=0
+			FOUND_USER_ID=NO
+			echo "${NETGROUP_NAME} \\"  >> ${TMP}/${BACKUP_FILE}
+			while [ "${NETGROUP_USERS[${LOOP}]}" ]
+			do
+	
+				# Check for than skip over the line if it is $USER_ID
+				if [ ${USER_ID} = ${NETGROUP_USERS[${LOOP}]} ];then
+	
+					# Increment LOOP
+					let LOOP=${LOOP}+1
+	
+					# Set FOUND_USER_ID flag to YES
+					FOUND_USER_ID=YES
+	
+					# Skip $USER_ID line
+					continue
+				fi
+	
+				if [ ${LOOP} -eq `expr ${NETGROUP_ENTRY_LINES} - 1` -a ${FOUND_USER_ID} = NO ];then
+					echo "(-,${NETGROUP_USERS[${LOOP}]},therock)" >> ${TMP}/${BACKUP_FILE}
+					break
+				elif [ ${LOOP} -eq ${NETGROUP_ENTRY_LINES} ];then
+					echo "(-,${NETGROUP_USERS[${LOOP}]},therock)" >> ${TMP}/${BACKUP_FILE}
+				else
+					echo "(-,${NETGROUP_USERS[${LOOP}]},therock) \\" >> ${TMP}/${BACKUP_FILE}
+				fi
+	
+				# Increment LOOP
+				let LOOP=${LOOP}+1
+			done
+	
+			# Confirm the last line added does not end in a \
+			if [ `tail -1 ${TMP}/${BACKUP_FILE} | grep -c '\\\'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The last line added to ${TMP}/${BACKUP_FILE} contains a trailing \\." | tee -a ${LOG}
+				echo "The last line should not contain a trailing \\, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+		fi
+
+		# Add the rest of the lines to $TMP/$BACKUP_FILE
+		sed -n "${NEXT_LINE},$"p ${NIS_DIR}/netgroup >> ${TMP}/${BACKUP_FILE}
+
+		# Set NETGROUP_BACKUP_LINES to the number of lines in $TMP/$BACKUP_FILE
+		NETGROUP_BACKUP_LINES=`wc -l < ${TMP}/${BACKUP_FILE}`
+
+		# Confirm $NETGROUP_BACKUP_LINES is set
+		if [ "${NETGROUP_BACKUP_LINES}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_BACKUP_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${NETGROUP_BACKUP_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"NETGROUP_BACKUP_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Confirm $NETGROUP_LINES minus 1 is equal to $NETGROUP_BACKUP_LINES
+		if [ `expr ${NETGROUP_LINES} - 1` -ne ${NETGROUP_BACKUP_LINES} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The temporary netgroup file \"${TMP}/${BACKUP_FILE}\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Copy ${TMP}/${BACKUP_FILE} to $NIS_DIR/netgroup
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Installing new NIS netgroup file, ${DATE_TIME}" | tee -a ${LOG}
+		cp ${TMP}/${BACKUP_FILE} ${NIS_DIR}/netgroup
+
+		# Confirm ${NIS_DIR}/netgroup exist and is the same as ${TMP}/${BACKUP_FILE}
+		if [ ! -s ${NIS_DIR}/netgroup ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The new netgroup file \"${NIS_DIR}/netgroup\" was not installed properly from \"${TMP}/${BACKUP_FILE}\", ${DATE_TIME}" | tee -a ${LOG}
+			echo "Install netgroup file manualy, \"cp ${TMP}/${BACKUP_FILE} ${NIS_DIR}/netgroup\", then push out new netgroup file" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		cd /var/yp
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Pushing out new NIS netgroup file, ${DATE_TIME}" | tee -a ${LOG}	
+		make netgroup
+		cd /
+
+		# Report completion
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Completed removing ${USER_ID} from the netgroup ${NETGROUP_NAME}, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+	fi
+}
+
+# The REMOVE_FROM_SUDOERS Function is used to remove a User from $SUDOERS_FILE
+###########################################################################
+REMOVE_FROM_SUDOERS () {
+
+	# Create $SUDO_BACKUP as needed
+	if [ ! -d ${SUDO_BACKUP} ];then 
+		mkdir ${SUDO_BACKUP}
+	fi
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Confirm $USER_ID is used in ${SUDOERS_FILE}
+	if [ `grep -wc ${USER_ID} ${SUDOERS_FILE}` -eq 0 ];then
+		echo ""
+		echo "Warning: The User ID \"${USER_ID}\" does not exist in the sudoers file"
+		echo ""
+	else
+
+		# Set BACKUP_FILE name
+		BACKUP_FILE=sudoers
+
+		SUDO_DATE_TIME=`date '+%m%d%y%H%M'`
+		if [ ! -f ${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME} ];then
+			echo "Creating permanent backup up of sudoers file, ${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME}"
+			SUDO_BACKUP_FLAG=YES
+			cp ${SUDOERS_FILE} ${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME}
+		fi
+	
+		# Confirm $BACKUP_FILE exists
+		if [ ! -s ${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `diff ${SUDOERS_FILE} ${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME} 2>&1 | wc -l` -ge 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${SUDO_BACKUP}/${BACKUP_FILE}.${SUDO_DATE_TIME}\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Pre Set LOOP to 1
+		LOOP=1
+	
+		# Create temporary Backup of Sudoers file
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "" | tee -a ${LOG}
+		echo "Creating temporary backing up of sudoers file, to ${TMP}/${BACKUP_FILE}.${LOOP}, ${DATE_TIME}" | tee -a ${LOG}
+		cp ${SUDOERS_FILE} ${TMP}/${BACKUP_FILE}.${LOOP}
+	
+		# Confirm $BACKUP_FILE exists
+		if [ ! -s ${TMP}/${BACKUP_FILE}.${LOOP} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.${LOOP}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `diff ${SUDOERS_FILE} ${TMP}/${BACKUP_FILE}.${LOOP} 2>&1 | wc -l` -ge 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required file \"${TMP}/${BACKUP_FILE}.${LOOP}\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Set SUDOERS_LINES to the number of lines in $SUDOERS_FILE
+		SUDOERS_LINES=`wc -l < ${SUDOERS_FILE}`
+
+		# Confirm $SUDOERS_LINES is set properly
+		if [ "${SUDOERS_LINES}" = "" ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"SUDOERS_LINES\" not set, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		elif [ `echo ${SUDOERS_LINES} | grep -c '[^0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The required variable \"SUDOERS_LINES\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Remove the $USER_ID from the 1st line containing it in ${BACKUP_FILE}.${LOOP}
+		# adding the updates to the new file ${TMP}/${BACKUP_FILE}.${LOOP} plus 1. 
+		# Repeat as many times as need to remove $USER_ID from every line.
+		while [ `grep -wc ${USER_ID} ${TMP}/${BACKUP_FILE}.${LOOP}` -ge 1 ]
+		do
+
+			# Pre Set UPDATE_LINE to null
+			UPDATE_LINE=""
+
+			# Set SUDO_LINE_NUM to the first line number in ${TMP}/${BACKUP_FILE}.${LOOP}
+			# that contains ${USER_ID}
+			SUDO_LINE_NUM=`grep -wn ${USER_ID} ${TMP}/${BACKUP_FILE}.${LOOP} | awk -F: '{print $1}' | head -1`
+
+			# Confirm $SUDO_LINE_NUM is set
+			if [ "${SUDO_LINE_NUM}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"SUDO_LINE_NUM\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${SUDO_LINE_NUM} | grep -c '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"SUDO_LINE_NUM\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Set NEXT_LINE to ${SUDO_LINE_NUM} plus 1
+			let NEXT_LINE=${SUDO_LINE_NUM}+1
+
+			# Confirm $NEXT_LINE is set
+			if [ "${NEXT_LINE}" = "" ];then
+				echo ""
+				echo "Error: The required variable \"NEXT_LINE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${NEXT_LINE} | grep -c '[^0-9]'` -eq 1 ];then
+				echo ""
+				echo "Error: The required variable \"NEXT_LINE\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Set BEFORE_LINE to ${SUDO_LINE_NUM} minus 1
+			let BEFORE_LINE=${SUDO_LINE_NUM}-1
+	
+			# Confirm $BEFORE_LINE is set
+			if [ "${BEFORE_LINE}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"BEFORE_LINE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			elif [ `echo ${BEFORE_LINE} | grep -c '[^0-9]'` -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"BEFORE_LINE\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Set SUDO_ENTRY to contents of line ${SUDO_LINE_NUM}
+			SUDO_ENTRY=`grep -w ${USER_ID} ${TMP}/${BACKUP_FILE}.${LOOP} | head -1`
+
+			# Confirm $SUDO_ENTRY is set
+			if [ "${SUDO_ENTRY}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"SUDO_ENTRY\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Set OLD_LOOP to $LOOP
+			OLD_LOOP=${LOOP}
+
+			# Increment $LOOP
+			let LOOP=${LOOP}+1
+
+			# Build new sudoers file 1 section at a time in $TMP
+			# The first section is the lines in the file before the sudo entry for $USER_ID
+			sed -n "1","${BEFORE_LINE}"p ${TMP}/${BACKUP_FILE}.${OLD_LOOP} > ${TMP}/${BACKUP_FILE}.${LOOP}
+
+			# Confirm ${TMP}/${BACKUP_FILE}.${LOOP} exists
+			if [ ! -s ${TMP}/${BACKUP_FILE}.${LOOP} ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required file \"${TMP}/${BACKUP_FILE}.${LOOP}\" not created properly, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Deterime if $USER_ID is the only user ID used by $SUDO_ENTRY
+			# Set UPDATE_LINE based on findings
+			if [ `echo ${SUDO_ENTRY} | grep -ci User_Alias` -ge 1 ];then
+
+				if [ `echo ${SUDO_ENTRY} | cut -d= -f2- | wc -w` -gt 1 ];then
+					UPDATE_LINE=YES
+				else
+					UPDATE_LINE=NO
+				fi
+				
+			elif [ `echo ${SUDO_ENTRY} | awk '{print $1}'` = ${USER_ID} ];then
+				UPDATE_LINE=NO
+			fi
+
+			# Confirm $UPDATE_LINE is set
+			if [ "${UPDATE_LINE}" = "" ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"UPDATE_LINE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Readd the updated Sudo entry without $USER_ID to the new file ${TMP}/${BACKUP_FILE}.${LOOP}
+			# Note $LOOP has changed making this a new file name
+			if [ ${UPDATE_LINE} = NO ];then
+				echo '#' >> ${TMP}/${BACKUP_FILE}.${LOOP}
+
+			elif [ `echo ${SUDO_ENTRY} | grep -ci User_Alias` -eq 1 ];then
+
+				echo ${SUDO_ENTRY} | sed "s[,\s${USER_ID}\$[[;s[,\s${USER_ID}\s\$[[;s[${USER_ID},[[;s[,${USER_ID}\$[[;s[,${USER_ID}\s\$[[" | sed 's[User_Alias [User_Alias  [' >> ${TMP}/${BACKUP_FILE}.${LOOP}
+			elif [ `echo ${SUDO_ENTRY} | grep -P "^${USER_ID}\s" | awk '{print $1,$2}' | grep -v ',' | 
+					grep -c '\(root\)'` -eq 1 ];then
+
+				echo '#' >> ${TMP}/${BACKUP_FILE}.${LOOP}
+			else
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo ""
+				echo "Error: The required variable \"SUDO_ENTRY\" not set properly LOOP ${LOOP}, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+				exit
+			fi
+
+			# Add all the lines from $NEXT_LINE to the end of 
+			# ${TMP}/${BACKUP_FILE}.${OLD_LOOP} to ${TMP}/${BACKUP_FILE}.${LOOP}
+			sed -n "${NEXT_LINE}","$"p ${TMP}/${BACKUP_FILE}.${OLD_LOOP} >> ${TMP}/${BACKUP_FILE}.${LOOP}
+		done
+
+		# Confirm ${TMP}/${BACKUP_FILE}.${LOOP} has the same number of lines as $SUDOERS_LINES
+		if [ ${SUDOERS_LINES} -ne `wc -l < ${TMP}/${BACKUP_FILE}.${LOOP}` ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: the new sudoers file \"${TMP}/${BACKUP_FILE}.${LOOP}\" was not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Overwrite $SUDOERS_FILE with ${TMP}/${BACKUP_FILE}.${LOOP}
+		cp ${TMP}/${BACKUP_FILE}.${LOOP} ${SUDOERS_FILE}
+
+		# Confirm $SUDOERS_FILE was created properly
+		if [ `diff ${TMP}/${BACKUP_FILE}.${LOOP} ${SUDOERS_FILE} 2>&1 | wc -l` -ge 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The primary sudoers file ${SUDOERS_FILE} was not created properly, ${DATE_TIME}" | tee -a ${LOG}
+			echo "Manually copy ${TMP}/${BACKUP_FILE}.${LOOP} to ${SUDOERS_FILE}"
+			echo "After doing copy, the sudoers file will have succesfully had the" 
+			echo "user ${USER_ID} removed."
+			exit
+		fi
+
+		# Report completion
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Completed removing the user ${USER_ID} the sudoers file, ${DATE_TIME}" | tee -a ${LOG}
+	fi 
+}
+
+# The REMOVE_HOME_DIR Function is used to remove the physical home directory and update the auto.home NIS automount files
+###########################################################################
+REMOVE_HOME_DIR () {
+
+	# Confirm nothing is mounted on ${TMP}/HOME_DIR
+	if [ `grep -c "${TMP}/HOME_DIR" /etc/mtab` -eq 1 ];then
+		umount -l ${TMP}/HOME_DIR
+	fi
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Create ${TMP}/HOME_DIR
+	mkdir ${TMP}/HOME_DIR
+
+	# Set trap to umount ${TMP}/HOME_DIR if someone hits Ctrl ^C
+	trap  "umount ${TMP}/HOME_DIR; exit 1" 1 2 3 6 15
+
+	# Set HOME_NFS_DIR to the NFS server and file system used to support the home directory for $USER_ID
+	HOME_NFS_DIR=""
+	HOME_NFS_DIR=`ypcat -k ${AUTO_HOME} | grep "^${USER_ID}" | awk '{print $3}' | sed "s[\&[${USER_ID}[" | sed "s[/${USER_ID}[["`
+
+	# Confirm HOME_NFS_DIR is still set
+	if [ "${HOME_NFS_DIR}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"HOME_NFS_DIR\" not set, ${DATE_TIME}"  | tee -a ${LOG}
+		echo "This will happen if ${USER_ID} is not in the NIS map ${AUTO_HOME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${HOME_NFS_DIR} | grep -c ".*:/.*"` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"HOME_NFS_DIR\" not set properly, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Comfirm operation
+       	ANSWER=""
+	echo ""
+	echo " Confirm Removal of the home directory for the user ${USER_ID}"
+
+	echo ""
+       	until [ -n "${ANSWER}" ]
+       	do
+
+		echo -n " Remove home directory for user ${USER_ID} Y/N > "
+		read ANSWER
+
+		case ${ANSWER} in
+
+			"") # Do Nothing
+                     	;;
+
+                   	N|n|NO|no|No)  # No
+                    	CONFIRMED=NO
+                     	;;
+
+                     	Y|y|YES|yes|Yes) # Yes
+                     	CONFIRMED=YES
+                      	;;
+	
+                      	q|Q) # Exit Now
+                      	CONFIRMED=NO
+                      	exit
+                      	;;
+
+                     	*) # Invalid Answer
+			ANSWER=""
+                     	echo ""
+                      	echo " Invalid entry ${ANSWER}"
+                      	echo ""
+                      	sleep 1
+                      	;;
+              	esac
+	done
+
+	# If removal is confirm, remove home directory
+	if [ ${CONFIRMED} = YES ];then
+
+		# Mount $HOME_NFS_DIR on $TMP/HOME_DIR
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "\nMounting \"${HOME_NFS_DIR}\" on \"${TMP}/HOME_DIR\", ${DATE_TIME}" | tee -a ${LOG}
+		mount ${HOME_NFS_DIR} ${TMP}/HOME_DIR
+	
+		# Confirm $MOST is mounted on /tmp/HOME_DIR
+		if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 0 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The file system ${MOST} not mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+	
+		# Confirm that ${TMP}/HOME_DIR/${USER_ID} does exist
+		if [ ! -d ${TMP}/HOME_DIR/${USER_ID} ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The home directory \"${TMP}/HOME_DIR/${USER_ID}\" for \"${USER_ID}\" is not mounted propelry, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Comfirm operation
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Removing home directory \"${TMP}/HOME_DIR/${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+       		ANSWER=""
+		echo ""
+		echo " Confirm Removal of ${TMP}/HOME_DIR/${USER_ID}"
+	
+		echo ""
+       		until [ -n "${ANSWER}" ]
+       		do
+	
+			echo -n " Remove \"${TMP}/HOME_DIR/${USER_ID}\" Y/N > "
+			read ANSWER
+	
+			case ${ANSWER} in
+	
+				"") # Do Nothing
+                     		;;
+	
+                   		N|n|NO|no|No)  # No
+				exit
+                     		;;
+	
+                     		Y|y|YES|yes|Yes) # Yes
+				true
+                      		;;
+		
+                      		q|Q) # Exit Now
+                      		exit
+                      		;;
+	
+                     		*) # Invalid Answer
+                     		echo ""
+                      		echo " Invalid entry ${ANSWER}"
+                      		echo ""
+                      		sleep 1
+                      		;;
+              		esac
+		done
+		rm -r ${TMP}/HOME_DIR/${USER_ID}
+	
+		# Confirm ${TMP}/HOME_DIR/${USER_ID} was removed
+		if [ -d ${TMP}/HOME_DIR/${USER_ID} ];then
+			echo ""
+			echo "Error: The home directory ${TMP}/HOME_DIR/${USER_ID}, was not removed, ${DATE_TIME}" | tee -a ${LOG}
+			echo ""
+			exit
+		else
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo "The Home directory \"${TMP}/HOME_DIR/${USER_ID}\" was removed, ${DATE_TIME}" | tee -a ${LOG}
+		fi
+	
+		# Umount ${TMP}/HOME_DIR
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo -e "Umounting \"${TMP}/HOME_DIR\", ${DATE_TIME}\n" | tee -a ${LOG}
+		umount ${TMP}/HOME_DIR
+	
+		# Confirm ${TMP}/HOME_DIR is no longer mounted
+		if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			echo ""
+			echo "Error: The file system ${HOME_NFS_DIR} still mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+			echo "Manually umount ${TMP}/HOME_DIR" | tee -a ${LOG}
+			echo ""
+			exit
+		fi
+
+		# Remove $USER_ID entry from $AUTO_HOME
+		REMOVE_FROM_AUTO_HOME
+	
+		# Report completion
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Completed removing home directory for the user \"${USER_ID}\", and removing it from the NIS \"${AUTO_HOME}\" file, ${DATE_TIME}" | tee -a ${LOG}
+		cd /
+	fi
+}
+
+# The AUDIT_FILES Function is used to determine if there are user ID in files
+# that are not in the NIS password file
+###########################################################################
+AUDIT_FILES () {
+
+	# Create/Recreated $TMP
+	if [ ! -d ${TMP} ];then 
+		mkdir ${TMP}
+	else
+		CONFIRM_NO_MOUNTS
+		rm -r ${TMP}
+		mkdir ${TMP}
+	fi
+
+	# Automount files section
+	echo ""
+	echo "Checking auto home files"
+	echo ""
+	for USER_ID in `grep -v '^#' ${NIS_DIR}/auto.home | awk '{print $1}'`
+	do
+
+		# Confirm $USER_ID is in the NIS passwd file
+		if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+			echo "Warning: The UserID, \"${USER_ID}\" is in ${NIS_DIR}/auto.home but not ${NIS_DIR}/passwd"
+		fi
+	done
+	for USER_ID in `grep -v '^#' ${NIS_DIR}/auto.wpb_home | awk '{print $1}'`
+	do
+
+		# Confirm $USER_ID is in the NIS passwd file
+		if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+			echo "Warning: The UserID, \"${USER_ID}\" is in ${NIS_DIR}/auto.wpb_home but not ${NIS_DIR}/passwd"
+		fi
+	done
+
+	# Group file section
+	echo ""
+	echo "Checking group file"
+	echo ""
+	for USER_ID in `cut -d: -f4- ${NIS_DIR}/group | grep . | sed 's/,/ /g' | sort -u`
+	do
+		# Confirm $USER_ID is in the NIS passwd file
+		if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+			echo "Warning: The UserID, \"${USER_ID}\" is in ${NIS_DIR}/group but not ${NIS_DIR}/passwd"
+		fi
+	done
+
+	# Netgroup file section
+	echo ""
+	echo "Checking netgroup file"
+	echo ""
+	> ${TMP}/users
+	for USER_ID in `ypcat -k netgroup | egrep -v 'THEROCK|PCPWR|host' | grep therock | 
+		sed 's/(-//g;s/,therock)//g;s/,//g' | cut -d" " -f2- | sed 's/-//g;s/(//g'| sort -u`
+	do
+		echo ${USER_ID} >> ${TMP}/users
+	done
+	for USER_ID in `sort -u ${TMP}/users`
+	do
+		# Confirm $USER_ID is in the NIS passwd file
+		if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+			echo "Warning: The UserID, \"${USER_ID}\" is in ${NIS_DIR}/netgroup but not ${NIS_DIR}/passwd"
+		fi
+	done
+
+	# Sudoers file section
+	echo ""
+	echo "Checking sudoers file"
+	echo ""
+	> ${TMP}/sudo_users
+	for USER_ID in `grep User_Alias ${SUDOERS_FILE} | cut -d" " -f5- | sed 's/,/ /g' | sort -u`
+	do
+		echo ${USER_ID} >> ${TMP}/sudo_users
+	done
+	for USER_ID in `grep '(root)' ${SUDOERS_FILE} | grep '^[a-z]' | awk '{print $1}' | sort -u`
+	do
+		echo ${USER_ID} >> ${TMP}/sudo_users
+	done
+	for USER_ID in `sort -u ${TMP}/sudo_users`
+	do
+		# Confirm $USER_ID is in the NIS passwd file
+		if [ `grep -c "^${USER_ID}:" ${NIS_DIR}/passwd` -eq 0 ];then
+			echo "Warning: The UserID, \"${USER_ID}\" is in ${SUDOERS_FILE} but not ${NIS_DIR}/passwd"
+		fi
+	done
+	
+}
+
+CONFIRM_NO_MOUNTS
+clear
+echo ""
+echo "  **********************************"
+echo "  *  Unix User Admistration Tool   *"
+echo "  *  Written By: Jon Swift         *"
+echo "  *  ${PROG} Ver. 1.10   *"
+echo "  **********************************"
+echo ""
+
+
+# Determine what Function to perform
+###########################################################################
+VALID=""
+until [ -n "${VALID}" ]
+do
+        echo ""
+        echo " *******************"
+        echo " * Select Function *"
+        echo " *******************"
+        echo ""
+        echo " 1> Add User"
+        echo " 2> Remove User"
+	echo " 3> Lock User"
+        echo " 4> Reset User password"
+        echo " 5> Change User login Shell"
+        echo " 7> Audit files for removed users"
+	
+        FUNCTION=""
+        until [ -n "${FUNCTION}" ]
+        do
+                echo -n " Enter selection > "
+                read FUNCTION
+        done
+
+        case ${FUNCTION} in
+
+		1) # Add new User
+		VALID=TRUE
+		FUNCTION=ADD_USER
+		;;
+	
+		2) # Remove User
+		VALID=TRUE
+		FUNCTION=REMOVE_USER
+		;;
+
+		3) # Lock User
+		VALID=TRUE
+		FUNCTION=LOCK_USER
+		;;
+
+		4) # Password Reset
+		VALID=TRUE
+		FUNCTION=PASSWORD_RESET
+		;;
+
+		5) # Change User login Shell
+		VALID=TRUE
+		FUNCTION=CHANGE_SHELL
+		;;
+	 	
+		7) # Audit files
+		VALID=TRUE
+		FUNCTION=AUDIT_FILES
+		;;
+	
+		q|Q) # Quit
+		exit
+		;;
+	
+		*) # Invalid selection
+		echo " Invalid selection, ${FUNCTION}"
+        	FUNCTION=""
+        	sleep 1
+        	;;
+	esac
+done
+
+# Perform requested Function
+###########################################################################
+if [ ${FUNCTION} = ADD_USER ];then
+
+	# Determine what Add Function to perform
+	VALID=""
+	until [ -n "${VALID}" ]
+	do
+        	echo ""
+        	echo " ****************************"
+        	echo " * Select Add User Function *"
+        	echo " ****************************"
+        	echo ""
+        	echo " 1> Add New User to NIS Password file"
+        	echo " 2> Add Home directory for Existing User & auto home entry"
+        	echo " 3> Add Disk Quota to Existing User home directory"
+        	echo " 4> All the Above"
+        	echo " 5> Add Existing User to NIS Group file"
+        	echo " 6> Add Existing User to auto home (Does not create Home Directory)"
+	
+
+        	ADD_FUNCTION=""
+        	until [ -n "${ADD_FUNCTION}" ]
+        	do
+                	echo -n " Enter selection > "
+                	read ADD_FUNCTION
+        	done
+	
+        	case ${ADD_FUNCTION} in
+
+			1) # Add User to NIS Password
+			VALID=TRUE
+			ADD_FUNCTION=ADD_NIS_USER
+			NEW_USER=YES	
+			ASK_USER
+			ASK_LOCATION
+			SET_UID
+			ADD_TO_PASSWD
+			;;
+
+			2) # Add User Home directory
+			VALID=TRUE
+			ADD_FUNCTION=ADD_TO_HOME
+			NEW_USER=NO	
+			ASK_USER
+			ASK_LOCATION
+			SET_SHELL_TYPE
+			ADD_HOME_DIR
+			ADD_DISK_QUOTAS
+			;;
+
+			3) # Update User Disk Quota (LA Only)
+			VALID=TRUE
+			ADD_FUNCTION=ADD_DISK_QUOTA
+			NEW_USER=NO	
+			ASK_USER
+			ASK_LOCATION
+			ADD_DISK_QUOTAS
+			;;
+
+			4) # All of the above
+			VALID=TRUE
+			ADD_FUNCTION=ADD_TO_ALL
+			NEW_USER=YES	
+			ASK_USER
+			ASK_LOCATION
+			SET_UID
+			ADD_TO_PASSWD
+			[ ${SHELL_TYPE} != /bin/false ] && ADD_HOME_DIR
+			[ ${SHELL_TYPE} != /bin/false ] && ADD_DISK_QUOTAS
+			;;
+
+			5) # Add User to NIS Group
+			VALID=TRUE
+			ADD_FUNCTION=ADD_TO_NIS_GROUP
+			NEW_USER=NO	
+			ASK_USER
+			SELECT_GROUP
+			ADD_TO_GROUP
+			;;
+
+			6) # Add User Auto Home
+			VALID=TRUE
+			ADD_FUNCTION=ADD_TO_AUTO_HOME
+			NEW_USER=NO
+			ASK_USER
+			ASK_LOCATION
+			ADD_TO_AUTOHOME
+			;;
+
+			q|Q) # Quit
+			exit
+			;;
+	
+			*) # Invalid selection
+			echo " Invalid selection, ${ADD_FUNCTION}"
+        		ADD_FUNCTION=""
+        		sleep 1
+        		;;
+		esac
+	done
+
+elif [ ${FUNCTION} = REMOVE_USER ];then
+
+	# Determine what Remove Function to perform
+	VALID=""
+	until [ -n "${VALID}" ]
+	do
+        	echo ""
+        	echo " *******************************"
+        	echo " * Select Remove User Function *"
+        	echo " *******************************"
+        	echo ""
+        	echo "  1> Remove User from the NIS Password file"
+        	echo "  2> Remove User from all NIS Groups"
+        	echo "  3> Remove User from all NIS Netgroups"
+        	echo "  4> Remove User from the sudoers file"
+        	echo "  5> All of the Above"
+        	echo "  6> Remove User Home Directory & from NIS auto home"
+        	echo "  7> All of the Above"
+        	echo "  8> Remove User from an NIS Group"
+        	echo "  9> Remove User from an NIS Netgroup"
+		echo " 10> Remove user from NIS auto home"
+	
+        	REMOVE_FUNCTION=""
+        	until [ -n "${REMOVE_FUNCTION}" ]
+        	do
+                	echo -n " Enter selection > "
+                	read REMOVE_FUNCTION
+        	done
+	
+        	case ${REMOVE_FUNCTION} in
+
+			1) # Remove User from the NIS Password
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_NIS_PASS
+			NEW_USER=NO	
+			ASK_USER
+			REMOVE_FROM_PASSWD
+			;;
+
+			2) # Remove User from all NIS Groups
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_ALL_NIS_GROUPS
+			NEW_USER=NO	
+			ASK_USER
+			GROUP_LOOP=1
+
+			# Loop through every group that $USER_ID is a member of
+			for GROUP_NAME in `egrep ":${USER_ID}$|:${USER_ID},|,${USER_ID}$|,${USER_ID}," ${NIS_DIR}/group | 
+				awk -F: '{print $1}' | sed 's/\(.*\)_part[0-9]*/\1/'`
+			do
+				# Set GROUP_GID based on $GROUP_NAME
+				GROUP_GID=`grep "^${GROUP_NAME}:" ${NIS_DIR}/group | awk -F: '{print $3}'`
+
+				# Confirm $GROUP_GID is set
+				if [ "${GROUP_GID}" = "" ];then
+					echo ""
+					echo "Error: The required variable \"GROUP_GID\" not set using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				elif [ `echo ${GROUP_GID} | grep -c '[^0-9]'` -eq 1 ];then
+					echo ""
+						echo "Error: The required variable \"GROUP_GID, ${GROUP_GID}\" not set properly using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				fi
+
+				REMOVE_FROM_GROUP
+				let GROUP_LOOP=${GROUP_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any group
+			if [ ${GROUP_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS group, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+			;;
+
+			3) # Remove User from all NIS Netgroups
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_ALL_NIS_NETGROUPS
+			NEW_USER=NO	
+			ASK_USER
+
+			NET_LOOP=1
+			# Loop through every netgroup that $USER_ID is a member of
+			for NETGROUP_NAME in `ypcat -k netgroup | grep "\(-,${USER_ID},therock\)" | awk '{print $1}'`
+			do
+				REMOVE_FROM_NETGROUP
+				let NET_LOOP=${NET_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any netgroup
+			if [ ${NET_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS netgroup, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+			;;
+
+			4) # Remove User from the sudoers file
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_SUDOERS
+			NEW_USER=NO	
+			ASK_USER
+			REMOVE_FROM_SUDOERS
+			;;
+
+			5) # All of the above
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_ALL
+			NEW_USER=NO	
+			ASK_USER
+			REMOVE_FROM_PASSWD
+			GROUP_LOOP=1
+
+			# Loop through every group that $USER_ID is a member of
+			for GROUP_NAME in `egrep ":${USER_ID}$|:${USER_ID},|,${USER_ID}$|,${USER_ID}," ${NIS_DIR}/group | 
+				awk -F: '{print $1}' | sed 's/\(.*\)_part[0-9]*/\1/'`
+			do
+				# Set GROUP_GID based on $GROUP_NAME
+				GROUP_GID=`grep "^${GROUP_NAME}:" ${NIS_DIR}/group | awk -F: '{print $3}'`
+
+				# Confirm $GROUP_GID is set
+				if [ "${GROUP_GID}" = "" ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo ""
+					echo "Error: The required variable \"GROUP_GID\" not set using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				elif [ `echo ${GROUP_GID} | grep -c '[^0-9]'` -eq 1 ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo ""
+						echo "Error: The required variable \"GROUP_GID, ${GROUP_GID}\" not set properly using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				fi
+
+				REMOVE_FROM_GROUP
+				let GROUP_LOOP=${GROUP_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any group
+			if [ ${GROUP_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS group, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+
+			NET_LOOP=1
+			# Loop through every netgroup that $USER_ID is a member of
+			for NETGROUP_NAME in `ypcat -k netgroup | grep "\(-,${USER_ID},therock\)" | awk '{print $1}'`
+			do
+				REMOVE_FROM_NETGROUP
+				let NET_LOOP=${NET_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any netgroup
+			if [ ${NET_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS netgroup, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+			REMOVE_FROM_SUDOERS
+			;;
+
+			6) # Remove User Home Directory
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_HOME_DIR
+			NEW_USER=NO	
+			ASK_USER
+			ASK_LOCATION
+			REMOVE_DISK_QUOTAS
+			REMOVE_HOME_DIR
+			;;
+
+			7) # All of the above
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_ALL
+			NEW_USER=NO	
+			ASK_USER
+			REMOVE_FROM_PASSWD
+			GROUP_LOOP=1
+
+			# Loop through every group that $USER_ID is a member of
+			for GROUP_NAME in `egrep ":${USER_ID}$|:${USER_ID},|,${USER_ID}$|,${USER_ID}," ${NIS_DIR}/group | 
+				awk -F: '{print $1}' | sed 's/\(.*\)_part[0-9]*/\1/'`
+			do
+				# Set GROUP_GID based on $GROUP_NAME
+				GROUP_GID=`grep "^${GROUP_NAME}:" ${NIS_DIR}/group | awk -F: '{print $3}'`
+
+				# Confirm $GROUP_GID is set
+				if [ "${GROUP_GID}" = "" ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo ""
+					echo "Error: The required variable \"GROUP_GID\" not set using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				elif [ `echo ${GROUP_GID} | grep -c '[^0-9]'` -eq 1 ];then
+					DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+					echo ""
+						echo "Error: The required variable \"GROUP_GID, ${GROUP_GID}\" not set properly using group \"${GROUP_NAME}\", ${DATE_TIME}" | tee -a ${LOG}
+					echo ""
+					exit
+				fi
+
+				REMOVE_FROM_GROUP
+				let GROUP_LOOP=${GROUP_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any group
+			if [ ${GROUP_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS group, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+
+			NET_LOOP=1
+			# Loop through every netgroup that $USER_ID is a member of
+			for NETGROUP_NAME in `ypcat -k netgroup | grep "\(-,${USER_ID},therock\)" | awk '{print $1}'`
+			do
+				REMOVE_FROM_NETGROUP
+				let NET_LOOP=${NET_LOOP}+1
+			done
+
+			# Display warning message if $USER_ID not part of any netgroup
+			if [ ${NET_LOOP} -eq 1 ];then
+				DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+				echo "" | tee -a ${LOG}
+				echo "Warning: The user ${USER_ID} not part of any NIS netgroup, ${DATE_TIME}" | tee -a ${LOG}
+				echo ""
+			fi
+			REMOVE_FROM_SUDOERS
+			ASK_LOCATION
+			REMOVE_DISK_QUOTAS
+			REMOVE_HOME_DIR
+			;;
+
+			8) # Remove User from a NIS Group
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_A_NIS_GROUP
+			NEW_USER=NO	
+			ASK_USER
+			SELECT_GROUP
+			REMOVE_FROM_GROUP
+			;;
+
+			9) # Remove User from a NIS Netgroup
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_FROM_A_NIS_NETGROUP
+			NEW_USER=NO	
+			ASK_USER
+			SELECT_NETGROUP
+			REMOVE_FROM_NETGROUP
+			;;
+
+			10) # Remove User NIS Auto Home
+			VALID=TRUE
+			REMOVE_FUNCTION=REMOVE_AUTO_HOME
+			NEW_USER=NO	
+			ASK_USER
+			ASK_LOCATION
+			REMOVE_FROM_AUTO_HOME
+			;;
+	
+			q|Q) # Quit
+			exit
+			;;
+	
+			*) # Invalid selection
+			echo " Invalid selection, ${REMOVE_FUNCTION}"
+        		REMOVE_FUNCTION=""
+        		sleep 1
+        		;;
+		esac
+	done
+
+elif [ ${FUNCTION} = LOCK_USER ];then
+
+	REMOVE_FUNCTION=LOCK_ACCOUNT
+	NEW_USER=NO
+	ASK_USER
+	LOCK_USER
+
+elif [ ${FUNCTION} = PASSWORD_RESET ];then
+
+	NEW_USER=NO	
+	ASK_USER
+	echo ""
+	passwd ${USER_ID}
+	echo ""
+	cd /var/yp
+	make passwd
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed updating the password for user ${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+	cd /
+
+elif [ ${FUNCTION} = CHANGE_SHELL ];then
+
+	CONFIRM_NO_MOUNTS
+	NEW_USER=NO
+	ASK_USER CHANGE_SHELL
+	ASK_LOCATION
+
+	# Determine_current Shell
+	CURRENT_SHELL=""
+	CURRENT_SHELL=`grep "^${USER_ID}:" ${NIS_DIR}/passwd | awk -F: '{print $NF}'`
+
+	# Confirm $CURRENT_SHELL is set and set properly
+	if [ "${CURRENT_SHELL}" = "" ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"CURRENT_SHELL\" not set using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${CURRENT_SHELL} | egrep -c "/bin/csh|/bin/ksh|/bin/bash|/bin/false"` -eq 0 ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"CURRENT_SHELL\" not set properly using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Select New Shell
+	VALID=""
+	until [ -n "${VALID}" ]
+	do
+        	echo ""
+        	echo " ********************"
+        	echo " * Select New Shell *"
+        	echo " ********************"
+        	echo ""
+        	echo " 1> /bin/csh"
+        	echo " 2> /bin/ksh"
+		echo " 3> /bin/bash"
+        	echo " 4> No Interactive login, /bin/false"
+		
+		SHELL_TYPE=""
+        	until [ -n "${SHELL_TYPE}" ]
+        	do
+                	echo -n " Enter selection > "
+                	read SHELL_TYPE
+        	done
+	
+        	case ${SHELL_TYPE} in
+
+			1) # /bin/csh
+			VALID=TRUE
+			SHELL_TYPE=/bin/csh
+			;;
+			
+			2) # /bin/ksh
+			VALID=TRUE
+			SHELL_TYPE=/bin/ksh
+			;;
+
+			3) # /bin/bash
+			VALID=TRUE
+			SHELL_TYPE=/bin/bash
+			;;
+
+			4) # /bin/false
+			VALID=TRUE
+			SHELL_TYPE=/bin/false
+			;;
+
+			q|Q) # Quit
+			exit
+			;;
+		
+			*) # Invalid selection
+			echo " Invalid selection, ${SHELL_TYPE}"
+        		SHELL_TYPE=""
+        		sleep 1
+        		;;
+		esac
+
+		# Confirm $SHELL_TYPE and $CURRENT_SHELL are different
+		if [ ${SHELL_TYPE} = ${CURRENT_SHELL} ];then
+			echo -e "\n Invalid selection, ${SHELL_TYPE}"
+			echo -e " The Current Shell for ${USER_ID} is already ${CURRENT_SHELL}\n"
+        		VALID=""
+		fi
+	done
+
+	# Backup NIS password file
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "" | tee -a ${LOG}
+	echo "Backing up ${NIS_DIR}/passwd, ${DATE_TIME}" | tee -a ${LOG}
+	${VI} ${NIS_DIR}/passwd BACKUP 2>&1 | tee -a ${LOG}
+
+	# Set BACKUP_FILE
+	cd ${NIS_DIR}
+	BACKUP_FILE=`ls -tr passwd* | tail -1`
+
+	# Confirm $BACKUP_FILE is set properly
+	if [ "${BACKUP_FILE}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required variable \"BACKUP_FILE\" not set, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ ! -f ${BACKUP_FILE} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The required file \"BACKUP_FILE, ${BACKUP_FILE}\" does not exist, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Change $CURRENT_SHELL to $SHELL_TYPE for $USER_ID
+	usermod -s ${SHELL_TYPE} ${USER_ID}
+
+	# Set CURRENT_SHELL to the Shell used for $USER_ID in $NIS_DIR/passwd
+	CURRENT_SHELL=""
+	CURRENT_SHELL=`grep "^${USER_ID}:" ${NIS_DIR}/passwd | awk -F: '{print $NF}'`
+
+	# Confirm $CURRENT_SHELL is set and set properly
+	if [ "${CURRENT_SHELL}" = "" ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"CURRENT_SHELL\" not set using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		cp ${BACKUP_FILE} ${NIS_DIR}/passwd
+		echo ""
+		exit
+	elif [ `echo ${CURRENT_SHELL} | egrep -c "/bin/csh|/bin/ksh|/bin/bash|/bin/false"` -eq 0 ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"CURRENT_SHELL\" not set properly using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		cp ${BACKUP_FILE} ${NIS_DIR}/passwd
+		echo ""
+		exit
+	fi
+
+	# Confirm $SHELL_TYPE and $CURRENT_SHELL are the same
+	if [ ${SHELL_TYPE} != ${CURRENT_SHELL} ];then
+		echo ""
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The new shell assigned to ${USER_ID} in the file ${NIS_DIR}/passwd is wrong. It is \"${CURRENT_SHELL}\" and should be \"${SHELL_TYPE}\". Not updating ${NIS_DIR}/passwd, and copying ${BACKUP_FILE} to ${NIS_DIR}/passwd, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		cp ${BACKUP_FILE} ${NIS_DIR}/passwd
+		exit
+	fi
+
+	# Set HOME_NFS_DIR to the real server and file system supporting the home directory for $USER_ID
+	HOME_NFS_DIR=""
+	HOME_NFS_DIR=`ypcat -k ${AUTO_HOME} | grep "^${USER_ID}" | awk '{print $3}' | sed "s[\&[${USER_ID}[" | sed "s[/${USER_ID}[["`
+
+	# Confirm $HOME_NFS_DIR is set and set properly
+	if [ "${HOME_NFS_DIR}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"HOME_NFS_DIR\" not set using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${HOME_NFS_DIR} | egrep -c '...:/export/home|:/home_.'/home` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"HOME_NFS_DIR\" not set properly using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Set GROUP_NAME to the primary group for $USER_ID
+	GROUP_NAME=""
+	GROUP_NAME=`id -g ${USER_ID}`
+
+
+	# Confirm $GROUP_NAME is set to a number
+	if [ "${GROUP_NAME}" = "" ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"GROUP_NAME\" not set using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	elif [ `echo ${GROUP_NAME} | grep -c '[0-9]'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Error: The required variable \"GROUP_NAME\" not set properly using User ID \"${USER_ID}\", ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Create $TMP/HOME_DIR as needed
+	[ ! -d ${TMP}/HOME_DIR ] && mkdir ${TMP}/HOME_DIR
+
+	# Mount File System supporting home directory of $USER_ID on $TMP/HOME_DIR
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "\nMounting \"${HOME_NFS_DIR}\" on \"${TMP}/HOME_DIR\", ${DATE_TIME}" | tee -a ${LOG}
+	mount ${HOME_NFS_DIR} ${TMP}/HOME_DIR
+
+	# Set trap to umount ${TMP}/HOME_DIR if someone hits Ctrl ^C
+	trap  "umount ${TMP}/HOME_DIR; exit 1" 1 2 3 6 15
+
+	# Confirm $HOME_NFS_DIR is mounted on /tmp/HOME_DIR
+	if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file system ${TMP}/HOME_DIR not mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Confirm that ${TMP}/HOME_DIR/${USER_ID} does not already exist
+	if [ ! -d ${TMP}/HOME_DIR/${USER_ID} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file home directory \"${TMP}/HOME_DIR/${USER_ID}\" for \"${USER_ID}\" does not exists, ${DATE_TIME}" | tee -a ${LOG}
+		echo "You must first create the home directory for ${USER_ID}" | tee -a ${LOG}
+		echo ""
+		UMOUNT
+		exit
+	fi
+
+	# Installed required files
+	if [ ${SHELL_TYPE} = /bin/csh ];then
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.cshrc ] && cp /stds/login/dot_files/.source_cshrc ${TMP}/HOME_DIR/${USER_ID}/.cshrc
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.cshrc_user ] && cp /stds/login/dot_files/.cshrc_user ${TMP}/HOME_DIR/${USER_ID}
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.login ] && cp /stds/login/dot_files/.login ${TMP}/HOME_DIR/${USER_ID}
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.aliases ] && cp /stds/login/dot_files/.aliases_cshrc ${TMP}/HOME_DIR/${USER_ID}/.aliases
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.cshrc 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.cshrc_user 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.login 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.aliases 2>/dev/null
+	elif [ ${SHELL_TYPE} = /bin/ksh ];then
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.kshrc ] && cp /stds/login/dot_files/.source_kshrc ${TMP}/HOME_DIR/${USER_ID}/.kshrc
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.kshrc_user ] && cp /stds/login/dot_files/.kshrc_user ${TMP}/HOME_DIR/${USER_ID}
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.aliases ] && cp /stds/login/dot_files/.aliases_kshrc ${TMP}/HOME_DIR/${USER_ID}/.aliases
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.kshrc 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.kshrc_user 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.aliases_kshrc 2>/dev/null
+	elif [ ${SHELL_TYPE} = /bin/bash ];then
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.bash_profile ] && cp /stds/login/dot_files/.source_bash_profile ${TMP}/HOME_DIR/${USER_ID}/.bash_profile
+		[ ! -f /stds/login/dot_files/.bash_user ] && cp /stds/login/dot_files/.bash_user ${TMP}/HOME_DIR/${USER_ID}
+		[ ! -f ${TMP}/HOME_DIR/${USER_ID}/.aliases_bash ] && cp /stds/login/dot_files/.aliases_bash ${TMP}/HOME_DIR/${USER_ID}/
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.bash_profile 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.bash_user 2>/dev/null
+		chown ${USER_ID}:${GROUP_NAME} ${TMP}/HOME_DIR/${USER_ID}/.aliases_bash 2>/dev/null
+	fi
+
+	# Umount ${TMP}/HOME_DIR
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo -e "Umounting \"${TMP}/HOME_DIR\", ${DATE_TIME}\n" | tee -a ${LOG}
+	umount ${TMP}/HOME_DIR
+
+	# Confirm ${TMP}/HOME_DIR is no longer mounted
+	if [ `grep -c " ${TMP}/HOME_DIR " /etc/mtab` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo ""
+		echo "Error: The file system ${HOME_NFS_DIR} still mounted on ${TMP}/HOME_DIR, ${DATE_TIME}" | tee -a ${LOG}
+		echo "Manually umount ${TMP}/HOME_DIR" | tee -a ${LOG}
+		echo ""
+		exit
+	fi
+
+	# Make and push out new NIS password file
+	cd /var/yp
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Pushing out new NIS password file, ${DATE_TIME}" | tee -a ${LOG}	
+	make passwd 2>&1 | tee -a ${LOG}
+
+	# Report completion
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo ""
+	echo "Completed updating the SHELL for user ${USER_ID}, ${DATE_TIME}" | tee -a ${LOG}
+
+elif [ ${FUNCTION} = AUDIT_FILES ];then
+
+	AUDIT_FILES
+fi
