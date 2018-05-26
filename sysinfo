@@ -1,0 +1,374 @@
+#!/bin/bash
+# sysinfo
+# Purpose: This scripts job is to report multiple system details
+
+# Written By: Jon Swift 07/27/11
+# Updated 11/02/12, Added support for setting MODEL to VM
+# Updated 02/20/14, Added logic to collect disk partitioning and fstab info
+# Updated 04/06/16, Added logic to support Dell Blade centers to correctly collect Service tag
+# Updated 11/30/16, Added support for memory, CPU sockets, CPU core count, CPU type
+
+HOST=`uname -n`
+PROG=`basename $0`
+LOG=/tmp/${PROG}.log
+OS=`uname -s`
+DATE=`date '+%m%d%y'`
+REPORT=/data/sysinfo/report.${DATE}
+DISK_REPORTS=/data/sysinfo/disk_info
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/ucb:/usr/platform/sun4u/sbin:/opt/dell/srvadmin/sbin:/opt/dell/srvadmin/bin
+> ${LOG}
+
+# Determine if this script is being run interactively
+###########################################################################
+tty -s
+if [ $? != 0 ];then
+        INTERACTIVE=NO
+else
+        INTERACTIVE=YES
+fi
+
+# Confirm the script is run as root
+###########################################################################
+if [ `whoami` != root ];then
+
+	MESSAGE="Error: ${PROG} must be run as root"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	exit
+fi
+
+# Set OS_VERSION
+###########################################################################
+if [ ${OS} = SunOS ];then
+	OS_VERSION=`head -1 /etc/release | awk '{print $1,$2}'`
+
+elif [ ${OS} = Linux ];then
+
+	if [ -f /etc/redhat-release ];then
+		if [ `grep -c CentOS /etc/redhat-release` -eq 1 ];then
+			OS_VERSION=`awk '{print $1,$2,$3}' /etc/redhat-release`
+		else
+			if [ `egrep -c "release 4|release 3" /etc/redhat-release` -eq 1 ];then
+				# RHEL 3 & 4
+				OS_VERSION=`awk '{print $1,$2,$6,$7,$9,$10}' /etc/redhat-release |
+					sed 's/)//'`
+			else
+				# RHEL 5 & 6
+				OS_VERSION=`awk '{print $1,$2,$6,$7}' /etc/redhat-release`
+			fi
+		fi
+
+	elif [ -f /etc/SuSE-release ];then
+		VERSION=`grep "^VERSION" /etc/SuSE-release | awk '{print $NF}'`
+		PATCHLEVEL=`grep "^PATCHLEVEL" /etc/SuSE-release | awk '{print $NF}'`
+		OS_VERSION="SuSE ${VERSION} SP${PATCHLEVEL}"
+	else
+		MESSAGE="Error: Unable to determine the Linux descripton on ${HOST}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}"
+		else
+			echo ${MESSAGE} >> ${LOG}
+		fi
+		exit
+	fi
+
+elif [ ${OS} = AIX ];then
+        OS_VERSION="AIX `uname  -a | awk '{print $4"."$3}'`"
+
+else
+	MESSAGE="Error: ${PROG} not supported on ${OS}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm OS_VERSION is set
+###########################################################################
+if [ "${OS_VERSION}" = "" ];then
+	MESSAGE="Error: The required variable \"OS_VERSION\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	OS_VERSION=Unavailable
+fi
+
+
+# Set Kernel version
+###########################################################################
+if [ ${OS} = SunOS ];then
+	KERNEL=`uname -a | awk '{print $4}'`
+elif [ ${OS} = AIX ];then
+        KERNEL=`oslevel -s`
+else
+	# Linux
+	KERNEL=`uname -r`
+fi
+
+# Confirm KERNEL is set
+###########################################################################
+if [ "${KERNEL}" = "" ];then
+	MESSAGE="Error: The required variable \"KERNEL\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	KERNEL=Unavailable
+fi
+
+
+# Set Model
+###########################################################################
+if [ ${OS} = SunOS ];then
+	MODEL=`prtdiag | grep "System Configuration:" | awk '{print $5,$6,$7,$8}'`
+elif [ ${OS} = AIX ];then
+	MODEL=`uname -M`
+else
+	# Linux
+	 if [ `lsmod | egrep -c 'vmware|vmci'` -ge 1 ];then
+		MODEL=VM
+	else
+		if [ -x /sbin/hpasmcli ];then
+			# HP
+			MODEL=`hpasmcli -s "show server" | grep "^System" | awk '{print $3,$4,$5}'`
+		elif [ -x /usr/bin/omreport -o -x /opt/dell/srvadmin/bin/omreport ];then
+			# Dell
+			MODEL=`omreport chassis info | grep "^Chassis Model" | awk '{print $4,$5}'`
+		fi
+	fi
+fi
+
+# Confirm MODEL is set
+###########################################################################
+if [ "${MODEL}" = "" ];then
+	MESSAGE="Error: The required variable \"MODEL\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	MODEL=Unavailable
+fi
+
+# Set IP
+###########################################################################
+if [ ${OS} = SunOS -o ${OS} = AIX ];then
+	IP=`nslookup ${HOST} | grep Address: | tail -1 | awk '{print $2}'`
+else
+	# Linux
+	IP=`host ${HOST} | grep  address | awk '{print $NF}'`
+fi
+
+# Confirm IP is set
+###########################################################################
+if [ "${IP}" = "" ];then
+	MESSAGE="Error: The required variable \"IP\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	IP=Unavailable
+fi
+
+# Set SERIAL
+###########################################################################
+if [ ${OS} = SunOS -o ${OS} = AIX ];then
+
+	SERIAL=Unavailable
+else
+	# Linux
+	if [ -x /sbin/hpasmcli ];then
+		# HP
+		SERIAL=`hpasmcli -s "show server" | grep "^Serial No." | awk '{print $4}'`
+	elif [ -x /usr/bin/omreport -o -x /opt/dell/srvadmin/bin/omreport ];then
+		# Dell
+		if [ `omreport chassis info | grep -c "^Server Module Service Tag"` -eq 1 ];then
+			SERIAL=`omreport chassis info | grep "^Server Module Service Tag" | awk '{print $6}'`
+		else
+			SERIAL=`omreport chassis info | grep "^Chassis Service Tag" | awk '{print $5}'`
+		fi
+	fi
+fi
+
+# Confirm SERIAL is set
+###########################################################################
+if [ "${SERIAL}" = "" ];then
+	MESSAGE="Error: The required variable \"SERIAL\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	SERIAL=Unavailable
+fi
+
+# Set DISK to the device name for the boot disk
+###########################################################################
+rm -rf /tmp/${PROG}
+[ ! -d /tmp/${PROG} ] && mkdir /tmp/${PROG}
+if [ ${OS} = SunOS ];then
+	
+	# Determine if VxVM is being used
+	if [ `grep -w ufs /etc/mnttab | grep -c "^/dev/vx/dsk"` -ge 1 ];then
+
+		DISK=`vxprint -vht rootvol | grep '^sd' | awk '{print $8}' | awk '{print $1}'`
+		VXVM=YES
+	else
+		DISK=`grep -w ufs /etc/mnttab | awk '{print $1}' | awk -F/ '{print $4}' |
+			sed 's/s[0-9]//' | sort -u`
+		VXVM=NO
+	fi
+
+	prtvtoc ${DISK} > /tmp/${PROG}/disk_part
+	swap -s > /tmp/${PROG}/swap
+	df -kl > /tmp/${PROG}/df
+	cp /etc/vfstab /tmp/${PROG}
+	[ ${VXVM} = YES ] && vxprint -hft > /tmp/${PROG}/vxprint
+	cd /tmp/${PROG}
+	tar -cf /tmp/sysinfo.tar.${HOST} .
+
+elif [ ${OS} = Linux ];then
+	if [ `df -k / | grep -v Filesystem | grep -c cciss` -eq 1 ];then
+		DISK=`df -k / | grep -v Filesystem | awk '{print $1}' | sed 's{p[0-9]{{'`
+		LVM=NO
+	elif [ `df -k / | grep -v Filesystem | grep -c /dev/mapper/rootvg` -eq 1 ];then
+		DISK=`df -k /boot | grep -v Filesystem | awk '{print $1}' | sed 's{p[0-9]{{'`
+		LVM=YES
+	else
+		DISK=`df -k / | grep -v Filesystem | awk '{print $1}' | sed 's{\(sd[a-z]\)[0-9]{\1{'`
+		LVM=NO
+	fi
+
+	fdisk -l ${DISK} > /tmp/${PROG}/disk_part
+	swapon -s > /tmp/${PROG}/swapon
+	df -kl > /tmp/${PROG}/df
+	cp /etc/fstab /tmp/${PROG}
+	if [ ${LVM} = YES ];then
+		pvdisplay > /tmp/${PROG}/pvdisplay
+		vgdisplay > /tmp/${PROG}/vgdisplay
+		lvdisplay  > /tmp/${PROG}/lvdisplay
+	fi
+	tar -C /tmp/${PROG} -cf /tmp/sysinfo.tar.${HOST} .
+fi
+
+# Set MEMORY to the total memory installed
+###########################################################################
+if [ ${OS} = Linux ];then
+	MEMORY="`grep "^MemTotal:" /proc/meminfo | awk '{print $2}'`KB"
+elif [ ${OS} = SunOS ];then
+	MEMORY=`prtdiag | grep "Memory size:" | awk '{print $3}'`
+fi
+
+# Confirm MEMORY is set
+###########################################################################
+if [ "${MEMORY}" = "" ];then
+	MESSAGE="Error: The required variable \"MEMORY\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	MEMORY=Unavailable
+fi
+
+# Set CPU_CORES to the total CPU cores installed
+###########################################################################
+if [ ${OS} = Linux ];then
+	CPU_CORES=`grep -c processor /proc/cpuinfo`
+elif [ ${OS} = SunOS ];then
+	CPU_CORES=`prtdiag | grep -c UltraSPARC`
+fi
+
+# Confirm CPU_CORES is set
+###########################################################################
+if [ "${CPU_CORES}" = "" ];then
+	MESSAGE="Error: The required variable \"CPU_CORES\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	CPU_CORES=Unavailable
+fi
+
+# Set CPU_SOCKETS to the total CPU sockets installed
+###########################################################################
+if [ ${OS} = Linux ];then
+	if [ "${MODEL}" = VM ];then
+		CPU_SOCKETS=1
+	else
+		CPU_SOCKETS=`omreport chassis processors | grep -c Index`	
+	fi
+elif [ ${OS} = SunOS ];then
+	CPU_SOCKETS=${CPU_CORES}
+fi
+
+# Confirm CPU_SOCKETS is set
+###########################################################################
+if [ "${CPU_SOCKETS}" = "" ];then
+	MESSAGE="Error: The required variable \"CPU_SOCKETS\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	CPU_SOCKETS=Unavailable
+fi
+
+# Set CPU_TYPE to the type of CPU chip installed
+###########################################################################
+if [ ${OS} = Linux ];then
+	if [ "${MODEL}" = VM ];then
+		CPU_TYPE=Virtual
+	elif [ `grep vendor_id /proc/cpuinfo | head -1 | grep -ic Intel` -eq 1 ];then
+		CPU_TYPE=Intel
+	else
+		CPU_TYPE=AMD
+	fi
+elif [ ${OS} = SunOS ];then
+	CPU_TYPE=Sparc
+fi
+
+# Confirm CPU_TYPE is set
+###########################################################################
+if [ "${CPU_TYPE}" = "" ];then
+	MESSAGE="Error: The required variable \"CPU_TYPE\" not set on ${HOST}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}"
+	else
+		echo ${MESSAGE} >> ${LOG}
+	fi
+	CPU_TYPE=Unavailable
+fi
+
+# Display output to interactive users
+###########################################################################
+if [ ${INTERACTIVE} = YES ];then 
+	echo OS_VERSION = ${OS_VERSION}
+	echo KERNEL = ${KERNEL}
+	echo MODEL = ${MODEL}
+	echo IP = ${IP}
+	echo SERIAL = ${SERIAL}
+	echo Total Memory = ${MEMORY}
+	echo Total CPU Sockets = ${CPU_SOCKETS}
+	echo Total CPU Cores = ${CPU_CORES}
+	echo CPU Type = ${CPU_TYPE}
+fi
+
+# Generate $REPORT
+###########################################################################
+#echo "Host Name = ${HOST}, OS Version = ${OS_VERSION}, Kernel = ${KERNEL}, Model = ${MODEL}, IP = ${IP}, Service Tag = ${SERIAL}" >> ${REPORT}
+echo "Host Name=${HOST},OS Version=${OS_VERSION},Kernel=${KERNEL},Model=${MODEL},IP=${IP},Service Tag=${SERIAL},Total Memory=${MEMORY},Total CPU Sockets=${CPU_SOCKETS},Total CPU Cores=${CPU_CORES},CPU Type=${CPU_TYPE}" >> ${REPORT}
+
+# Copy /tmp/sysinfo.tar.${DATE} to $DISK_REPORTS
+###########################################################################
+cp /tmp/sysinfo.tar.${HOST} ${DISK_REPORTS}

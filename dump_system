@@ -1,0 +1,1142 @@
+#!/bin/bash
+# dump_system
+# The purpose of this script is to dump/ufsdump the file systems listed for this system
+# in the config file /stds/admin/data/dump_schedule.conf. And write the output of the dump
+# to /data/dump/hostname/File-System-Name.Host.Date. This script will also create a log file
+# containing info on everything this script does written to /data/dump/hostname/dump_system.log
+
+# Written By: Jon Swift 04/07
+# Updated 09/20/07, reduced the number of backup copies saved from 4 to 3. Also added variable SAVED_COPIES
+#	to control the number of backup copies saved
+# Updated 02/15/08, Corrected problem with "Write Failed" Issues in Solaris 9, Jon Swift
+# Updated 02/18/08, Added support for Solaris 10, Jon Swift
+# Updated 12/09, Added support for AIX 5.3, Doriane Salem
+# Updated 02/10, Corrected bug in logic defining SNAP_FS, and changed logic for Solaris 
+#	to first try creating snapshot, and if that fails then attempt ufsdump using 
+#	block device/no shanpshot.
+# Updated 07/13, BACKUP_TEAM_EMAIL_LIST to use new rocket.com email addresses
+# Updated 07/13, Added option field "Saved Copies", read in from $CONFIG_FILE
+# Updated 01/14, Corrected problem with ERROR_MESSAGE logging
+# Updated 09/14, Updated logic to support EL7
+
+HOST=`uname -n`
+PROG=dump_system
+OS=`uname -s`
+DATE=`date '+%m%d%y'`
+CONFIG_FILE=/stds/admin/data/dump_schedule.conf
+TODAY=`date '+%a'`
+BACKUP_TEAM_EMAIL_LIST=Jon.Swift@rocket.com,Doriane.Salem@rocket.com,Stephen.Marten@rocket.com
+#BACKUP_TEAM_EMAIL_LIST=jsswift
+DUMP_DIR=/data/dump
+DUMP_DIR_HOST=${DUMP_DIR}/${HOST}
+YEAR=`date '+%Y'`
+LOG=${DUMP_DIR_HOST}/dump_system.${YEAR}.log
+IFS_ORIG=${IFS}
+NTP_STOPED=NO
+MATCH=NO
+PID=$$
+BLOCK_SIZE=512
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/ucb
+
+# Set each STANDARD_XXXX variables to a possible file system to be backedup/dumped
+# Be carefull not to remove space, tab "[ ,	 ]" on each side of the entries
+STANDARD_ROOT="[ ,	]/[ ,	]"
+STANDARD_VAR="[ ,	]/var[ ,	]"
+STANDARD_LOCAL="[ ,	]/local[ ,	]"
+
+# Set STANDARD_FILE_SYSTEMS to the list of possible file systems to be backedup/dumped
+STANDARD_FILE_SYSTEMS="${STANDARD_ROOT}|${STANDARD_VAR}|${STANDARD_LOCAL}"
+
+# Confirm this script is run on either Solaris or Linux
+######################################################
+if [ ${OS} = SunOS ];then
+	RELEASE=`uname -r | awk -F. '{print $2}'`
+	MAIL=/bin/mailx
+	MTAB=/etc/mnttab
+	WHOAMI=/usr/ucb/whoami
+	DUMP=ufsdump
+	NSLOOKUP=/usr/sbin/nslookup
+	LOCAL_LOG=/var/adm/${PROG}.${YEAR}.log
+
+elif [ ${OS} = Linux ];then
+	MAIL=/bin/mail
+	MTAB=/etc/mtab
+	WHOAMI=/usr/bin/whoami
+	DUMP=dump
+	NSLOOKUP="/usr/bin/nslookup -silent"
+	LOCAL_LOG=/var/log/${PROG}.${YEAR}.log
+
+elif [ ${OS} = AIX ];then
+	MAIL=/usr/bin/mail
+	MTAB=/tmp/mtab
+	/usr/sbin/mount > ${MTAB}
+	WHOAMI=/usr/bin/whoami
+	DUMP=backup
+	NSLOOKUP=/usr/bin/nslookup
+	LOCAL_LOG=/var/adm/${PROG}.${YEAR}.log
+else
+	echo ""
+	echo "Error: ${PROG} not supported on ${OS}"
+	exit
+fi
+
+# Confirm this script is run as root
+######################################################
+if [ `${WHOAMI}` != root ];then
+	echo ""
+	echo "Error: ${PROG} must be run as root"
+	exit
+fi
+
+# Determine if this script is being run interactively
+######################################################
+tty -s
+if [ $? != 0 ];then
+	INTERACTIVE=NO
+else
+	INTERACTIVE=YES
+fi
+
+# Confirm that the CONFIG_FILE exists
+######################################################
+if [ ! -f ${CONFIG_FILE} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: The configuration file ${CONFIG_FILE} does not exist, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+
+	# Send email then exit
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Set HOST to external name if $HOST is on a private network
+######################################################
+if [ `grep "[ ,	]${HOST}[ ,	]" /etc/hosts | grep -c '192\.168\.'` -eq 1 ];then
+	
+	# Confirm there is an public IP
+	PUBLIC_IP=""
+	PUBLIC_IP=`ifconfig -a | grep inet | grep '172\.19\.' | awk '{print $2}' |
+		awk -F: '{print $2}'`
+	if [ "${PUBLIC_IP}" != "" ];then
+
+		# Set PUB_HOST to the hostname of the public IP
+		PUB_HOST=""
+		PUB_HOST=`${NSLOOKUP} ${PUBLIC_IP} | grep -i name | awk '{print $NF}' | 
+			sed 's/com\./com/' | awk -F. '{print $1}'`
+
+		# Confirm $PUB_HOST is set
+		if [ "${PUB_HOST}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The hostname ${HOST} is associated with a private network, and there is no public hostname, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+		
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+		
+			# Send email then exit
+			echo ${ERROR_MESSAGE} |
+			${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+			exit
+		else
+			# Set HOST to $PUB_HOST
+			HOST=${PUB_HOST}
+		fi
+
+		# Reset DUMP_DIR_HOST and LOG
+		DUMP_DIR_HOST=${DUMP_DIR}/${HOST}
+		LOG=${DUMP_DIR_HOST}/dump_system.${YEAR}.log
+	else
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The hostname ${HOST} is associated with a private network, and there is no public hostname, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+	
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+	
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	fi
+fi
+
+# Confirm that ${HOST} is listed in the CONFIG_FILE
+######################################################
+if [ `grep -c "^${HOST}[ ,	]" ${CONFIG_FILE}` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: ${HOST} is not listed in the configuration file ${CONFIG_FILE}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+
+	# Send email then exit
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Confirm ${DUMP_DIR} exists
+######################################################
+ls ${DUMP_DIR} > /dev/null 2>&1
+if [ ! -d ${DUMP_DIR} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: The required automount point ${DUMP_DIR} does not exist, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+
+	# Send email then exit
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Confirm ${DUMP_DIR_HOST} exists, create it as needed
+######################################################
+if [ ! -d ${DUMP_DIR_HOST} ];then 
+
+	# Create ${DUMP_DIR_HOST}
+	mkdir ${DUMP_DIR_HOST}
+	chown root:root ${DUMP_DIR_HOST}
+
+	# Confirm ${DUMP_DIR_HOST} was created
+	if [ ! -d ${DUMP_DIR_HOST} ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required directory ${DUMP_DIR_HOST} does not exist, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+	
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+	
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	fi
+fi
+
+# Confirm $DUMP is not already/still running
+######################################################
+if [ `ps -aef | egrep "[ |	]${DUMP}[ |	]" | egrep -v "${PID}|grep" | wc -l` -ge 1 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: ${DUMP} aleady running on ${HOST}, No new ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	echo "${ERROR_MESSAGE}" >> ${LOG}
+	echo "${ERROR_MESSAGE}" >> ${LOCAL_LOG}
+
+	# Send email then exit
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Set IFS to end of line
+IFS='
+'
+
+# Set FILE_SYSTEMS to the list of file systems defined for this system for today in the config file
+######################################################
+for DAY_FS in `grep "^${HOST}[ ,	]" ${CONFIG_FILE} | awk '{print $2,$4}'`
+do
+
+	# Reset IFS to original value
+	IFS=${IFS_ORIG}
+
+	# Set/Reset the following to a null
+	DAYS=""
+	FILE_SYSTEMS=""
+	
+	# Set DAYS and FILE_SYSTEMS
+	set ${DAY_FS}
+	DAYS=$1
+	FILE_SYSTEMS=$2
+
+	# Confirm ${DAYS} is set
+	######################################################
+	if [ "${DAYS}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: Setting the variable \"DAYS\" on ${HOST}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	fi
+
+	# Confirm ${FILE_SYSTEMS} is set
+	######################################################
+	if [ "${FILE_SYSTEMS}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: Setting the variable \"DAYS\" on ${HOST}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	fi
+
+	# Confirm that $DAYS is set to or includes ${TODAY}
+	######################################################
+
+	# Check for a single day
+	######################################################
+	if [ `echo ${DAYS} | egrep -ic 'ALL|Mon|Tue|Wed|Thu|Fri|Sat|Sun'` -eq 1 \
+		-a `echo ${DAYS} | egrep -c ','` -ne 1 -a `echo ${DAYS} |
+			egrep -c '-'` -ne 1 ];then
+
+		# Set ORIG_DAYS to the premodified $DAYS
+		ORIG_DAYS=${DAYS}	
+
+		# Convert Possible DAYS entrys to standard format
+        	case ${DAYS} in
+
+			all|ALL|All)
+
+				# Set MATCH to YES
+				MATCH=YES
+
+				# exit the loop
+				break
+			;;
+               		Mon|mon|MON|Monday|MONDAY)
+                       	DAYS=Mon
+                       	;;
+               		Tue|tue|TUE|Tuesday|TUESDAY)
+                       	DAYS=Tue
+                       	;;
+          		Wed|wed|WED|Wednesday|WEDNESDAY)
+                        DAYS=Wed
+                        ;;
+                	Thu|thu|THU|Thursday|THURSDAY)
+                      	DAYS=Thu
+                        ;;
+                	Fri|fri|FRI|Friday|FRIDAY)
+                        DAYS=Fri
+                        ;;
+            		Sat|sat|SAT|Saturday|SATURDAY)
+                        DAYS=Sat
+                        ;;
+            		Sun|sun|SUN|Sunday|SUNDAY)
+                        DAYS=Sun
+                        ;;
+         	esac
+
+		# If $DAYS matches $TODAY, exit the loop
+		######################################################
+		if [ ${DAYS} = ${TODAY} ];then
+
+			# Set MATCH to YES
+			MATCH=YES
+
+			# exit the loop
+			break
+		fi
+
+	# Determine if $DAYS is listed as a range "-" Mon-Fri, and not a list Mon,Tue,Wed
+	######################################################
+	elif [ `echo ${DAYS} | egrep -c '-'` -eq 1 -a `echo ${DAYS} | egrep -c ','` -ne 1 ];then
+
+		# Mon,Tue,Wed,Thu,Fri,Sat,Sun
+		# Convert Mon-Fri to Mon,Tue,Wed,Thu,Fri
+
+	 	# Set FIRST_DAY and LAST_DAY
+		FIRST_DAY=`echo ${DAYS} | awk -F- '{print $1}'`
+		LAST_DAY=`echo ${DAYS} | awk -F- '{print $2}'`
+
+		# Set ORIG_DAYS to the premodified $DAYS
+		ORIG_DAYS=${DAYS}	
+
+		# Convert Possible FIRST_DAY entrys to standard format
+         	case ${FIRST_DAY} in
+
+                	Mon|mon|MON|Monday|MONDAY)
+                        FIRST_DAY=Mon
+                        ;;
+                 	Tue|tue|TUE|Tuesday|TUESDAY)
+                        FIRST_DAY=Tue
+                        ;;
+           		Wed|wed|WED|Wednesday|WEDNESDAY)
+                        FIRST_DAY=Wed
+                        ;;
+                 	Thu|thu|THU|Thursday|THURSDAY)
+                       	FIRST_DAY=Thu
+                        ;;
+                 	Fri|fri|FRI|Friday|FRIDAY)
+                        FIRST_DAY=Fri
+                        ;;
+            		Sat|sat|SAT|Saturday|SATURDAY)
+                        FIRST_DAY=Sat
+                        ;;
+            		Sun|sun|SUN|Sunday|SUNDAY)
+                        FIRST_DAY=Sun
+                        ;;
+         	esac
+
+		# Convert Possible LAST_DAY entrys to standard format
+         	case ${LAST_DAY} in
+
+                 	Mon|mon|MON|Monday|MONDAY)
+                        LAST_DAY=Mon
+                        ;;
+                 	Tue|tue|TUE|Tuesday|TUESDAY)
+                        LAST_DAY=Tue
+                        ;;
+           		Wed|wed|WED|Wednesday|WEDNESDAY)
+                        LAST_DAY=Wed
+                        ;;
+                 	Thu|thu|THU|Thursday|THURSDAY)
+                       	LAST_DAY=Thu
+                        ;;
+                 	Fri|fri|FRI|Friday|FRIDAY)
+                        LAST_DAY=Fri
+                        ;;
+            		Sat|sat|SAT|Saturday|SATURDAY)
+                        LAST_DAY=Sat
+                        ;;
+            		Sun|sun|SUN|Sunday|SUNDAY)
+                        LAST_DAY=Sun
+                        ;;
+         	esac
+
+ 		# Start to rebuild DAYS
+		DAYS=${FIRST_DAY}
+
+		while [ ${FIRST_DAY} != ${LAST_DAY} ]
+		do
+         		case ${FIRST_DAY} in
+
+                 		Mon|mon|MON|Monday|MONDAY)
+                         	FIRST_DAY=Tue
+                         	;;
+                 		Tue|tue|TUE|Tuesday|TUESDAY)
+                         	FIRST_DAY=Wed
+                         	;;
+           			Wed|wed|WED|Wednesday|WEDNESDAY)
+                         	FIRST_DAY=Thu
+                         	;;
+                 		Thu|thu|THU|Thursday|THURSDAY)
+                       		FIRST_DAY=Fri
+                         	;;
+                 		Fri|fri|FRI|Friday|FRIDAY)
+                         	FIRST_DAY=Sat
+                         	;;
+            			Sat|sat|SAT|Saturday|SATURDAY)
+                         	FIRST_DAY=Sun
+                         	;;
+         		esac
+
+         		# Rebuild DAYS
+         		DAYS="${DAYS},${FIRST_DAY}"
+ 		done
+
+		# If one of the days listed in $DAYS matches $TODAY, exit this loop
+		if [ `echo ${DAYS} | egrep -c ${TODAY}` -eq 1 ];then
+
+			# Set MATCH to YES
+			MATCH=YES
+
+			# exit the loop
+			break
+		fi
+
+	# Determine if $DAYS is a list Mon,Tue,Wed and not a range Mon-Fri
+	######################################################
+	elif [ `echo ${DAYS} | egrep -c '-'` -eq 0 -a `echo ${DAYS} | egrep -c ','` -eq 1 ];then
+
+		# Set ORIG_DAYS to the premodified $DAYS
+		ORIG_DAYS=${DAYS}	
+
+		# Go through each day listed confirming that one of them is today
+		for DAY in `echo ${DAYS} | sed 's/,/ /g'`
+		do
+
+			# Convert Possible DAY entrys to standard format
+         		case ${DAY} in
+
+                 		Mon|mon|MON|Monday|MONDAY)
+                         	DAY=Mon
+                         	;;
+                 		Tue|tue|TUE|Tuesday|TUESDAY)
+                         	DAY=Tue
+                         	;;
+           			Wed|wed|WED|Wednesday|WEDNESDAY)
+                         	DAY=Wed
+                         	;;
+                 		Thu|thu|THU|Thursday|THURSDAY)
+                       		DAY=Thu
+                         	;;
+                 		Fri|fri|FRI|Friday|FRIDAY)
+                         	DAY=Fri
+                         	;;
+            			Sat|sat|SAT|Saturday|SATURDAY)
+                         	DAY=Sat
+                         	;;
+            			Sun|sun|SUN|Sunday|SUNDAY)
+                         	DAY=Sun
+                         	;;
+         		esac
+
+			# Check if $DAY is the same as ${TODAY}
+			if [ ${DAY} = ${TODAY} ];then
+				MATCH=YES
+				break
+			else
+				MATCH=NO
+			fi
+		done
+
+	else
+
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The variable \"DAYS\" not set properly, unable to manage backup job for ${FILE_SYSTEMS} today ${TODAY} on ${HOST}, ${DATE_TIME}"
+	
+		# Display error message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+		# Log Error message
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send Email
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	fi
+done
+	
+# Confirm that MATCH is not set to NO
+######################################################
+if [ ${MATCH} = NO ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: The variable \"DAYS\" not set properly, unable to manage backup job for ${FILE_SYSTEMS} today ${TODAY} on ${HOST}, ${DATE_TIME}"
+
+	# Display error message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Log Error message
+	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+	# Send Email
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Set SAVED_COPIES using the last field in the config file
+######################################################
+SAVED_COPIES=`grep "^${HOST}[ ,	]" ${CONFIG_FILE} | egrep "${ORIG_DAYS}" | awk '{print $5}'`
+
+# Confirm $SAVED_COPIES is set properly
+######################################################
+if [ "${SAVED_COPIES}" = "" -o `echo ${SAVED_COPIES} | grep -c '[^0-9]'` -eq 1 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: The variable \"SAVED_COPIES\" not set properly, unable to manage backup job for ${FILE_SYSTEMS} today ${TODAY} on ${HOST}, ${DATE_TIME}"
+	
+	# Display error message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Log Error message
+	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+	# Send Email
+	echo ${ERROR_MESSAGE} |
+	${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	exit
+fi
+
+# Backup the file systems listed in $FILE_SYSTEMS
+######################################################
+for FS_NAME in `echo ${FILE_SYSTEMS} | sed 's/,/ /g'`
+do
+
+	# Set/Reset the following to a null
+	OLD=""
+	DEV_NAME=""
+
+	# Confirm ${FS_NAME} is set and exists
+	######################################################
+	if [ "${FS_NAME}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: Setting the variable \"FS_NAME\" on ${HOST}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+
+	# Confirm that FS_NAME is a file system
+	######################################################
+	elif [ `egrep -c "[ ,	]${FS_NAME}[ ,	]" ${MTAB}` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The file system name ${FS_NAME} is not a file system on ${HOST}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+	else
+		# Convert ${FS_NAME} into a name that can be used for a file name
+		if [ ${FS_NAME} = '/' ];then
+			FS_NAME_LABEL=root
+		else
+			FS_NAME_LABEL=`echo ${FS_NAME} | sed 's%/%%g'`
+		fi
+	fi
+
+	# Set DEV_NAME to the device name used for ${FS_NAME}
+	######################################################
+	DEV_NAME=`egrep "[ ,	]${FS_NAME}[ ,	]" ${MTAB} | awk '{print $1}' | grep /dev`
+
+	# Confirm ${DEV_NAME} is set and exists
+	######################################################
+	if [ "${DEV_NAME}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: Setting the variable \"DEV_NAME\" on ${HOST}, No ${DUMP} performed today of ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+
+	elif [ ! -b "${DEV_NAME}" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The variable \"DEV_NAME\" is ${DEV_NAME} but it does not exist on ${HOST}, No ${DUMP} performed today on ${HOST}, ${DATE_TIME}"
+
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Send email then exit
+		echo ${ERROR_MESSAGE} |
+		${MAIL} -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		exit
+
+	# Change /dev/dsk to /dev/rdsk for SunOS systems
+	######################################################
+	elif [ ${OS} = SunOS ];then
+		DEV_NAME=`echo ${DEV_NAME} | sed 's%/dev/dsk%/dev/rdsk%;s%/dev/md/dsk%/dev/md/rdsk%'`
+	fi
+
+	# Remove the dump file if it was created today
+	######################################################
+	if [ -f ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} ];then
+
+		# Create message to display/log
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Removing ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} that was created earlier today, ${DATE_TIME}"
+
+		# Report old dump file is being removed
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+
+		# Remove old dump file
+		OLD="more old"
+		rm ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} 2>&1 >> ${LOG}
+	fi
+
+	# Set HEAD_NUM to SAVED_COPIES -1
+	HEAD_NUM=`expr ${SAVED_COPIES} - 1`
+	
+	# Remove the oldest dump file(s), leaving ${SAVED_COPIES}
+	######################################################
+	if [ `ls ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.* 2>/dev/null | wc -l | awk '{print $1}'` -ge ${SAVED_COPIES} ];then
+
+		if [ ${HEAD_NUM} -eq 0 ];then
+
+			# Set OLD_DUMPFILE to all the ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST} files
+			OLD_DUMPFILE=`ls -lat ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.* | 
+				awk '{print $NF}'`
+	
+			# Create message to display/log
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Removing ${OLD_DUMPFILE}, ${DATE_TIME}"
+
+			# Report old dump file is being removed
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo "" >> ${LOG}
+			echo "${MESSAGE}" >> ${LOG}
+
+			# Remove all old dump files
+			rm ${OLD_DUMPFILE} 2>&1 >> ${LOG}
+		else
+			# Set NEWEST_FILES to the file names of the file to be kept, 
+			# everything else should be removed
+			NEWEST_FILES=`ls -lat ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.* | 
+				head -${HEAD_NUM} | awk '{print $NF}'`
+
+			# Remove the dump $FS_NAME_LABEL(s) not listed in $NEWEST_FILES
+			for OLD_DUMPFILE in `ls ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.* | 
+				egrep -v "${NEWEST_FILES}"`
+			do
+				# Confirm ${OLD_DUMPFILE} exists
+				if [ -f ${OLD_DUMPFILE} ];then
+		
+					# Create message to display/log
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					MESSAGE="Removing ${OLD_DUMPFILE}, ${DATE_TIME}"
+		
+					# Report old dump file is being removed
+					[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+					echo "" >> ${LOG}
+					echo "${MESSAGE}" >> ${LOG}
+		
+					# Remove old dump file
+					rm ${OLD_DUMPFILE} 2>&1 >> ${LOG}
+				fi
+			done
+		fi
+	else
+
+		# Create message to display/log
+		[ "${OLD}" = "" ] && OLD=old
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="No ${OLD} ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST} dump files to remove, ${DATE_TIME}"
+	
+		# Report old dump file is being removed
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+	fi
+
+	# Determine if this is a SunOS system
+	######################################################
+	if [ ${OS} = SunOS ];then
+
+		# SunOS Section
+		#######################
+
+		# Confirm that ${DUMP_DIR_HOST} is not 100% full
+		######################################################
+		if [ `df -k ${DUMP_DIR_HOST} | grep ${DUMP_DIR} | awk '{print $5}' | sed 's/%//'` -eq 100 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The file system ${DUMP_DIR_HOST} is 100% full, unable to backup any ${HOST} file systems, ${DATE_TIME}"
+	
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+	
+			# Send email then exit
+			echo ${ERROR_MESSAGE} |
+			${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	
+			exit
+		fi
+
+		# Determine how many local standard OS file systems exist
+		# If this system has only one local standard OS file system do not use fssnap
+		#################################################################################
+		if [ `grep 'ufs' ${MTAB} | egrep "${STANDARD_FILE_SYSTEMS}" | wc -l | awk '{print $1}'` -eq 1 ];then
+
+			# A Single Partitions to Backup
+			######################################################
+
+			# Dump ${DEV_NAME} to ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE}, 
+			# No snapshot used
+			######################################################
+
+			# Create the start dump message
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Starting ${DUMP} of ${FS_NAME} on ${HOST}, ${DATE_TIME}"
+
+			# Report dump is starting
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+
+			# ufsdump ${DEV_NAME}
+			${DUMP} 0fb ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} ${BLOCK_SIZE} ${DEV_NAME} 1>> ${LOG} 2>&1
+
+			# Report dump status
+			######################################################
+			if [ $? -eq 0 ];then
+
+				# Create the dump succesful message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed succesfully, ${DATE_TIME}"
+
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+			else
+
+				# Create the dump unsuccesful message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed unsuccessfully, ${DATE_TIME}"
+
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+				echo ${ERROR_MESSAGE} >> ${LOG}
+
+				# Send Email
+				echo "${ERROR_MESSAGE}" |
+				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+			fi
+
+			# Set USE_SNAPSHOT, only 1 file system
+			USE_SNAPSHOT=NO
+		else
+			# Multiple Partitions to Backup
+			######################################################
+
+			# Stop NTP as needed
+			######################################################
+			if [ ${NTP_STOPED} = NO -a ${RELEASE} != 10 ];then
+				[ ${INTERACTIVE} = YES ] && echo "Stopping xntpd"
+				echo "Stopping xntpd" >> ${LOG}
+				/etc/init.d/xntpd stop
+				NTP_STOPED=YES
+
+			# Solaris 10
+			elif [ ${NTP_STOPED} = NO -a ${RELEASE} = 10 ];then
+				[ ${INTERACTIVE} = YES ] && echo "Stopping xntpd"
+				echo "Stopping ntp" >> ${LOG}
+				svcadm disable ntp
+				NTP_STOPED=YES
+			fi
+
+			# Set SNAP_FS to a directory on a different $STANDARD_FILE_SYSTEMS
+			######################################################
+			if [ ${FS_NAME} = / ];then
+
+				# Determine if /var is a secondary file system and mounted
+				if [ `egrep -c "${STANDARD_VAR}" ${MTAB}` -eq 1 ];then
+					SNAP_FS=/var/tmp
+				else
+					SNAP_FS=/local
+				fi
+
+			else # Used for /var or /local
+				SNAP_FS=/
+			fi
+
+			# Determine if fssnap is busy, Free up shapshoot if posible
+			######################################################
+			if [ `fssnap -i | wc -l` -ge 1 ];then
+	
+   				# Set SNAP_DIR to the directory used for snapshot
+        			SNAP_DIR=`fssnap -i | awk '{print $2}'`
+	
+        			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        			MESSAGE="Deleteing old ${SNAP_DIR} snapshot file on ${HOST}, ${DATE_TIME}"
+        			[ ${INTERACTIVE} = YES ] && echo ${MESSAGE}
+        			echo ${MESSAGE} >> ${LOG}
+	
+        			# Remove snapshot
+        			fssnap -F ufs -d ${SNAP_DIR} 1>> ${LOG} 2>&1
+
+				# Double check that fssnap is free
+				if [ `fssnap -i | wc -l` -ge 1 ];then
+
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: Unable to free up snapshot file on ${HOST}, attempting ${DUMP} with no snapshot, ${DATE_TIME}"
+
+					[ ${INTERACTIVE} = YES ] && echo ""
+					[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+					echo "${ERROR_MESSAGE}" >> ${LOG}
+
+					# Send email then exit
+					echo ${ERROR_MESSAGE} |
+
+					USE_SNAPSHOT=NO
+				fi
+			else
+				USE_SNAPSHOT=YES
+			fi
+
+			# Attemp to create Snapshot if ${USE_SNAPSHOT} is set to YES
+			######################################################
+			if [ "${USE_SNAPSHOT}" = YES ];then
+
+				# Create Snapshot
+				######################################################
+				STATUS=""
+				fssnap -F ufs -o maxsize=1000m,bs=${SNAP_FS},raw,unlink ${FS_NAME} 1>> ${LOG} 2>&1
+				STATUS=$?
+	
+				# Set SNAPSHOT to the name of the newly created snapshot
+				######################################################
+				SNAPSHOT=""
+				SNAPSHOT="/dev/rfssnap/`fssnap -i 2>/dev/null | awk '{print $1}'`"
+	
+				# Confirm $SNAPSHOT is set
+				######################################################
+				if [ "${SNAPSHOT}" = "" -o "${STATUS}" -ne 0 ];then
+	
+					# Create the SNAPSHOT unsuccesful message
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The variable \"SNAPSHOT\" was not set properly, attempting ${DUMP} with no snapshot on ${HOST}, ${DATE_TIME}"
+	
+					[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+					echo ${ERROR_MESSAGE} >> ${LOG}
+	
+					# Send Email
+					echo "${ERROR_MESSAGE}" |
+					${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	
+					USE_SNAPSHOT=NO
+				fi
+			fi
+
+			# Start UFSdump using snapshot if $USE_SNAPSHOT is set to YES
+			if [ "${USE_SNAPSHOT}" = YES ];then
+
+				# Dump ${SNAPSHOT} to ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} 
+				# Using a snapshot
+				######################################################
+
+				# Create the start dump message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Starting ${DUMP} of ${FS_NAME} using snaphot file ${SNAP_FS} on ${HOST}, ${DATE_TIME}"
+
+				# Report dump is starting
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+
+				echo ${MESSAGE} >> ${LOG}
+				${DUMP} 0fb ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} ${BLOCK_SIZE} ${SNAPSHOT} 1>> ${LOG} 2>&1
+			else
+
+				# Dump ${DEV_NAME} to ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE}, 
+				# No snapshot used
+				######################################################
+
+				# Create the start dump message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Starting ${DUMP} of ${FS_NAME} on ${HOST}, ${DATE_TIME}"
+	
+				# Report dump is starting
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+	
+				${DUMP} 0fb ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} ${BLOCK_SIZE} ${DEV_NAME} 1>> ${LOG} 2>&1
+			fi
+
+			# Report dump status
+			######################################################
+			if [ $? -eq 0 ];then
+
+				# Create the dump succesful message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed succesfully, ${DATE_TIME}"
+
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+			else
+
+				# Create the dump unsuccesful message
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed unsuccessfully, ${DATE_TIME}"
+
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+				echo ${ERROR_MESSAGE} >> ${LOG}
+
+				# Send Email
+				echo "${ERROR_MESSAGE}" |
+				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+			fi
+	
+			# Remove snapshot file as needed
+			######################################################
+			if [ "${USE_SNAPSHOT}" = YES ];then
+	
+				# Create delete snapshot message
+        			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        			MESSAGE="Deleteing old ${SNAP_DIR} snapshot file on ${HOST}, ${DATE_TIME}"
+
+				# Report delete snapshot message
+        			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+        			echo ${MESSAGE} >> ${LOG}
+				fssnap -F ufs -d ${FS_NAME} 1>> ${LOG} 2>&1
+
+				# Wait 10 seconds for snapshot to close
+				sleep 10
+			fi
+		fi
+
+	# Determine if this is a Linux system
+	######################################################
+	elif [ ${OS} = Linux ];then
+
+		# Confirm that ${DUMP_DIR_HOST} is not 100% full
+		######################################################
+		if [ `df -k ${DUMP_DIR_HOST} | grep ${DUMP_DIR} | awk '{print $4}' | sed 's/%//'` -eq 100 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The file system ${DUMP_DIR_HOST} is 100% full, unable to backup any ${HOST} file systems, ${DATE_TIME}"
+	
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+	
+			# Send email then exit
+			echo ${ERROR_MESSAGE} |
+			${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	
+			exit
+		fi
+
+		# Set BLOCK_SIZE based on OS version
+		if [ -f  /etc/redhat-release ];then
+			[ `egrep -c 'release 4|release 5' /etc/redhat-release` -eq 0 ] && BLOCK_SIZE=64
+		fi
+				
+
+		# Dump ${DEV_NAME} to ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE}, no snapshot
+		######################################################
+
+		# Create the start dump message
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Starting ${DUMP} of ${FS_NAME} on ${HOST}, ${DATE_TIME}"
+
+		# Report dump is starting
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+
+		# dump ${DEV_NAME}
+		${DUMP} 0aunf ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} -b ${BLOCK_SIZE} ${DEV_NAME} 1>> ${LOG} 2>&1
+
+		# Report dump status
+		######################################################
+		if [ $? -eq 0 ];then
+
+			# Create the dump succesful message
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed succesfully, ${DATE_TIME}"
+
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+		else
+
+			# Create the dump unsuccesful message
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed unsuccessfully, ${DATE_TIME}"
+
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo ${ERROR_MESSAGE} >> ${LOG}
+
+			# Send Email
+			echo "${ERROR_MESSAGE}" |
+			${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+
+		fi
+
+	# Determine if this is a AIX system
+	######################################################
+	elif [ ${OS} = AIX ];then
+
+		# Confirm that ${DUMP_DIR_HOST} is not 100% full
+		######################################################
+		if [ `df ${DUMP_DIR_HOST} | grep ${DUMP_DIR} | awk '{print $4}' | sed 's/%//'` -eq 100 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The file system ${DUMP_DIR_HOST} is 100% full, unable to backup any ${HOST} file systems, ${DATE_TIME}"
+	
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+	
+			# Send email then exit
+			echo ${ERROR_MESSAGE} |
+			${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+	
+			exit
+		fi
+
+		# Backup ${DEV_NAME} to ${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE}, no snapshot
+		######################################################
+
+		# Create the start dump message
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Starting ${DUMP} of ${FS_NAME} on ${HOST}, ${DATE_TIME}"
+
+		# Report dump is starting
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+
+		# dump ${DEV_NAME}
+		/usr/bin/ulimit 3000000; ${DUMP} -0uf${DUMP_DIR_HOST}/${FS_NAME_LABEL}.${HOST}.${DATE} -b 64 -L 20g ${DEV_NAME} 1>> ${LOG} 2>&1
+
+		# Report dump status
+		######################################################
+		if [ $? -eq 0 ];then
+
+			# Create the dump succesful message
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed succesfully, ${DATE_TIME}"
+
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+		else
+
+			# Create the dump unsuccesful message
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="${DUMP} of ${FS_NAME} on ${HOST} completed unsuccessfully, ${DATE_TIME}"
+
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+			echo ${ERROR_MESSAGE} >> ${LOG}
+
+			# Send Email
+			echo "${ERROR_MESSAGE}" |
+			${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${BACKUP_TEAM_EMAIL_LIST}
+		fi
+	fi
+done
+
+# Restart NTP on SunOS systems as needed
+######################################################
+if [ ${OS} = SunOS -a ${NTP_STOPED} = YES -a "${RELEASE}" != 10 ];then
+	[ ${INTERACTIVE} = YES ] && echo -e "Starting xntpd\n"
+	echo "Starting xntpd" >> ${LOG}
+	echo "" >> ${LOG}
+	/etc/init.d/xntpd start
+
+elif [ ${OS} = SunOS -a ${NTP_STOPED} = YES -a "${RELEASE}" = 10 ];then
+	[ ${INTERACTIVE} = YES ] && echo -e "Starting xntpd\n"
+	echo "Starting ntp" >> ${LOG}
+	echo "" >> ${LOG}
+	svcadm enable ntp
+else
+	# Add Blank line to $LOG
+	echo "" >> ${LOG}
+fi

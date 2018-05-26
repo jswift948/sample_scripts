@@ -1,0 +1,658 @@
+#!/bin/bash
+# user_quota_notification
+#
+# Purpose:  To notify the user when and if he/she has exceeded there disk quota(s) limit(s). 
+# This is done by checking the entries in the file /stds/admin/data/quota_report for each user.
+# This reports contains information on how much disk space each user has used in each disk
+# file system. If the user has execeed there limit this script will send that user an email
+# telling the user they have exceeded there disk quota limit. And tells how much data much must 
+# be removed. And if they have only exceeded there soft limit it will tell them how much time 
+# ( days, hours, mins) they have to remaining before quotas will disable their abilty to write 
+# to there home directory. Or This script is intended to by run by cron multi times per day, 
+# once after each completion of the script quota_report.
+#
+# Written by Jon Swift 02/08
+# 08-24-09  Modified email body to the user - Doriane Salem
+# 11-09-10, Corrected a few bugs created by changes to the NIS password file
+# 06-21-13, Update RETURN_EMAIL address to rocket.com
+# 02-09-16, Updated to run on Linux
+
+
+# Initialize variables
+QUOTA_REPORT=/export/data/data01/stds/admin/data//quota_report
+bold=`tput smso`
+norm=`tput rmso`
+IFS_ORG=${IFS}
+OS=`uname -s`
+HOST=`uname -n`
+PROG=`basename $0`
+CLUSTER_FSTAB=/etc/cluster/fstab
+QUOTA_SERVERS="arlaplnfs03|arlaplnfs04"
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin
+LOG=/var/log/${PROG}.log
+MAIL=/bin/mailx
+ERROR_EMAIL_LIST="jon.swift@rocket.com, stephen.marten@rocket.com, doriane.salem@rocket.com"
+RETURN_EMAIL=doriane.salem@rocket.com
+
+###########################################################################
+#
+# Set ALWAYS_NOTIFY to YES if you want this script to notify users with a disk 
+# quota issue every time the scripts runs. Setting it to NO cuases the script 
+# to only notify users with disk quota issues when their soft limit time period 
+# has changed.  Users who have reached the Exceeded time period will only recieve
+# one email notificatyion.
+#
+# Recommended setting is "NO".
+#
+###########################################################################
+ALWAYS_NOTIFY=NO
+
+# Determine if this script is being run interactively
+###########################################################################
+tty -s
+if [ $? != 0 ];then
+	INTERACTIVE=NO
+else
+	INTERACTIVE=YES
+fi
+
+# Confirm this script is run on one of the ${QUOTA_SERVERS}
+###########################################################################
+if [ `echo ${HOST} | egrep -c "${QUOTA_SERVERS}"` -eq 0 ];then
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${PROG} Error: Must be run on `echo ${QUOTA_SERVERS} | 
+		sed 's/|/ or /'`\n"
+	exit
+fi
+
+# Confirm this script is run only as root
+###########################################################################
+if [ `whoami` != root ];then
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${PROG} Error: Must be run as the user root\n"
+	exit
+fi
+
+# Confirm that the $QUOTA_REPORT file exists and is not zero size
+###########################################################################
+if [ ! -s ${QUOTA_REPORT} ];then
+
+       	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   	ERROR_MESSAGE="${PROG} Error: The file ${QUOTA_REPORT} does not exist on ${HOST}, ${DATE_TIME}"
+
+        echo ${ERROR_MESSAGE} >> ${LOG}
+        if [ ${INTERACTIVE} = YES ];then
+          	echo -e "\n${ERROR_MESSAGE}\n"
+        else
+         	# Send Email
+               	echo "${ERROR_MESSAGE}" |
+               	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        fi
+
+	# Exit Now
+	exit
+fi
+
+# Function to send email message to user
+###########################################################################
+EMAIL () {
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M'`
+
+	###########################################################################
+	# Build email message to be sent to the USER
+	###########################################################################
+	MESSAGE_1="      !!!! Warning your LA Unix home directory Disk Quota Exceeded !!!!"
+	MESSAGE_2=""
+	
+	# Based on PERIOD define MESSAGE_3
+	if [ ${PERIOD} = EXPIRED ];then
+        	# This line blocked by SPAM Filters "You can no longer write additional data to this area."
+        	MESSAGE_3="You can no longer write data to your X:\\home\\${USER} (Windows Path), /home/${USER} {Unix Path}."
+	else
+        	MESSAGE_3="Warning, you have ${TIME_LEFT} ${PERIOD} to clean up your X:\\home\\${USER} (Windows Path), /home/${USER} (Unix Path). If this period of time is exceeded without reducing your disk usage you will no longer be able to write to this area."
+
+	fi
+
+	# Append additional info to MESSAGE_3
+	MESSAGE_3="${MESSAGE_3} To resolve your disk quota problem remove ${AMOUNT}k bytes of data from this area."
+
+	# Add additional messages
+	MESSAGE_4=""
+	MESSAGE_5=" If you require an increase in your home directory quota,"
+	MESSAGE_7=" Call 6-Tech.  Mention the proposed increase along with a brief business case.  Also, request that the ticket be assigned to the Unified \"UNIX-LINUX\" LANDesk Queue"
+
+	# Send Email
+	###########################################################################
+	[ ${INTERACTIVE} = YES ] && echo "Sending notification email to ${USER}"
+	echo "${MESSAGE_1}
+${MESSAGE_2}
+${MESSAGE_3}
+${MESSAGE_4}
+${MESSAGE_5}
+${MESSAGE_7}" | ${MAIL} -r ${RETURN_EMAIL} -s "!!! LA Unix Disk quota exceeded on ${HOST}, ${DATE_TIME} !!!" ${USER}
+
+}
+
+# Build list of real users, add each real user to the array VALID_USERS
+###########################################################################
+[ ${INTERACTIVE} = YES ] && echo -e "\n\tBuilding list of users to check on ${HOST}"
+LOOP=1
+for USER in `ypcat passwd | grep CLOCK | awk -F: '{print $1}' | sort -u`
+do
+
+	# Set USERS_HD to $USER's Server name and Home directory as defined in auto.home
+	###########################################################################
+	USERS_HD=""
+	USERS_HD="`ypmatch ${USER} auto.home 2>/dev/null | awk '{print $NF}' | 
+		awk -F: '{print $1, $2}' | sed "s:\&:${USER}:"`"
+
+	USER_SERVER=`echo ${USERS_HD} | awk '{print $1}'`
+	USER_HD=`echo ${USERS_HD} | awk '{print $2}'`
+
+	# Skip any USER if $USER_SERVER or $USER_HD is a null
+	###########################################################################
+	[ "${USER_SERVER}" = "" -o "${USER_HD}" = "" ] && continue
+
+	# Skip any user that does not have a home directory on this server
+	###########################################################################
+	[ "`echo ${HOST} | grep -c ${USER_SERVER}`" -eq 0 ] && continue
+
+	# Display progress dot to interactive user
+	[ ${INTERACTIVE} = YES ] && echo -n '.'
+
+	# Add $USER and the home directory path for $USER to the array VALID_USERS
+	###########################################################################
+	VALID_USERS[${LOOP}]="${USER} ${USER_HD}"
+
+	# Increment LOOP
+	###########################################################################
+	let LOOP=${LOOP}+1
+done
+
+# Display New Line to interactive user
+[ ${INTERACTIVE} = YES ] && echo ''
+
+# Confirm LOOP is not still set to 1, if it is, no users were added to the array VALID_USERS
+###########################################################################
+if [ ${LOOP} -eq 1 ];then
+
+       	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   	ERROR_MESSAGE="Error: ${PROG} failed to populate the required array \"VALID_USERS\" on ${HOST}, ${DATE_TIME}"
+
+        echo ${ERROR_MESSAGE} >> ${LOG}
+        if [ ${INTERACTIVE} = YES ];then
+          	echo -e "\n${ERROR_MESSAGE}"
+        else
+         	# Send Email
+               	echo "${ERROR_MESSAGE}" |
+               	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        fi
+
+       	# Exit Now
+       	exit
+fi
+
+# Loop through all the users in the array VALID_USERS checking their disk quotas
+###########################################################################
+LOOP=1
+while [ "${VALID_USERS[${LOOP}]}" ]
+do
+
+	# Set USER
+	###########################################################################
+	USER=""
+	USER=`echo ${VALID_USERS[${LOOP}]} | awk '{print $1}'`
+	
+	# Set HD to the defined home directory for $USER
+	###########################################################################
+	HD=""
+	HD=`echo ${VALID_USERS[${LOOP}]} | awk '{print $2}'`
+
+	# Increment LOOP
+	###########################################################################
+	let LOOP=${LOOP}+1
+
+	# Confirm the variable USER is set
+	###########################################################################
+	if [ "${USER}" = "" ];then
+
+       		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   		ERROR_MESSAGE="${PROG} Error: The required variable \"USER\" not set, on ${HOST}, ${DATE_TIME}"
+	
+        	echo ${ERROR_MESSAGE} >> ${LOG}
+        	if [ ${INTERACTIVE} = YES ];then
+          		echo -e "\n${ERROR_MESSAGE}\n"
+        	else
+         		# Send Email
+               		echo "${ERROR_MESSAGE}" |
+               		${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        	fi
+
+		# Move on to next user
+		continue
+	fi
+
+	# Confirm the variable HD is set
+	###########################################################################
+	if [ "${HD}" = "" ];then
+
+       		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   		ERROR_MESSAGE="${PROG} Error: The required variable \"HD\" is not set for user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        	echo ${ERROR_MESSAGE} >> ${LOG}
+        	if [ ${INTERACTIVE} = YES ];then
+          		echo -e "\n${ERROR_MESSAGE}\n"
+        	else
+         		# Send Email
+               		echo "${ERROR_MESSAGE}" |
+               		${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        	fi
+
+		# Move on to next user
+		continue
+
+	# Confirm %HD exists
+	###########################################################################
+	elif [ ! -d ${HD} ];then
+
+       		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   		ERROR_MESSAGE="${PROG} Error: The home directory \"${HD}\", does not exist for user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        	echo ${ERROR_MESSAGE} >> ${LOG}
+        	if [ ${INTERACTIVE} = YES ];then
+          		echo -e "\n${ERROR_MESSAGE}\n"
+        	else
+         		# Send Email
+               		echo "${ERROR_MESSAGE}" |
+               		${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        	fi
+
+		# Move on to next user
+		continue
+	fi
+
+	# Display message to interactive user
+	[ ${INTERACTIVE} = YES ] && echo -e "\nChecking quotas for ${USER}"
+
+	# Confirm that $HD exists, skip any user with no home directory
+	###########################################################################
+	if [ ! -d ${HD} ];then
+
+       		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   		ERROR_MESSAGE="${PROG} Error: The defined home directory for the user \"${USER}\", \"${HD}\" does not exist on ${HOST}, ${DATE_TIME}"
+	
+        	echo ${ERROR_MESSAGE} >> ${LOG}
+        	if [ ${INTERACTIVE} = YES ];then
+          		echo -e "\n${ERROR_MESSAGE}\n"
+        	else
+         		# Send Email
+               		echo "${ERROR_MESSAGE}" |
+               		${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        	fi
+
+		# Move on to next user
+		continue
+	fi
+
+	# Look in the QUOTA_REPORT file for $USER entrys that have a ` + ' in them.
+	# The plus means that disk quotas have been exceeded for $USER
+	###########################################################################
+	if [ `grep "^${USER} " ${QUOTA_REPORT} | grep -c '+'` -ne 0 ];then
+
+	# Pre set IFS (Inter Field Seperator) to end of line
+	IFS='
+'
+		# loop for each exceeded partitions for this user
+		###########################################################################
+		for PROBLEM in `grep "^${USER} " ${QUOTA_REPORT} | grep '+'`
+		do
+			# Reset IFS
+			IFS=${IFS_ORG}
+
+			# Display info to interactive user
+			[ ${INTERACTIVE} = YES ] && echo "Quotas execeeded for ${USER}"
+	
+			# Set FS to the name of the filesystem that has had the soft limit exceeded
+			###########################################################################
+			FS=""
+			FS=`sed -n "1,/$PROBLEM/"p ${QUOTA_REPORT} | grep '/dev/emcpower' | tail -1 | awk '{print $NF}'`
+	
+			# Confirm $FS is set
+			###########################################################################
+			if [ "${FS}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required device variable \"FS\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+
+			# Convert /dev/emcpower device name to mount point name
+			FS=`grep -w ${FS} ${CLUSTER_FSTAB} | grep -v ^# | awk '{print $2}'`
+	
+			# Confirm $FS is set
+			###########################################################################
+			if [ "${FS}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"FS\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+
+			# Confirm $FS has the same base directory as $HD
+			###########################################################################
+			if [ `dirname ${HD}` != ${FS} ];then
+
+
+				# Set USR_PART to the partition name including other users directory name
+				USR_PART=""
+				USR_PART=`find ${FS} -user ${USER} -print | head -1 2>/dev/null | 
+					cut -d '/' -f1-5`
+
+				# Set USR_PART to $FS if it is a null
+				[ "${USR_PART}" = "" ] && USR_PART=${FS}
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="Note: ${PROG} has discovered that \"${USER}\" has quota problems in a directory other than his own home directory. ${USER} home directory is \"${HD}\", but the quota problem is with \"${USR_PART}\" on ${HOST}, ${DATE_TIME}"
+				
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+	
+			# Assign position variables
+			###########################################################################
+			set ${PROBLEM}
+	
+			# Set USED to the amount of used disk space
+			###########################################################################
+			USED=""
+			USED=$3
+	
+			# Confirm $USED is set
+			###########################################################################
+			if [ "${USED}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"USED\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+	
+			# Set SOFT_LIMIT to the soft limit level/amount
+			###########################################################################
+			SOFT_LIMIT=""
+			SOFT_LIMIT=$4
+	
+			# Confirm $SOFT_LIMIT is set
+			###########################################################################
+			if [ "${SOFT_LIMIT}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"SOFT_LIMIT\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+	
+			# Set HARD_LIMIT to the hard limit level/amount
+			###########################################################################
+			HARD_LIMIT=""
+			HARD_LIMIT=$5
+	
+			# Confirm $HARD_LIMIT is set
+			###########################################################################
+			if [ "${HARD_LIMIT}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"HARD_LIMIT\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+	
+			# Set PERIOD to days or hours
+			###########################################################################
+			PERIOD=""
+			if [ ${USED} -ge ${HARD_LIMIT} ];then
+				PERIOD=EXPIRED
+			elif [ `echo ${PROBLEM} | grep -c days` -eq 1 ];then
+				PERIOD=days
+			elif [ `echo ${PROBLEM} | grep -cP "\d:\d"` -eq 1 ];then
+				PERIOD=hours
+			elif [ `echo ${PROBLEM} | grep -cP ":\d"` -eq 1 ];then
+				PERIOD=mins
+			elif [ `echo ${PROBLEM} | grep -c none` = 1 ];then
+				PERIOD=EXPIRED
+			fi
+	
+			# Confirm $PERIOD is set
+			###########################################################################
+			if [ "${PERIOD}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+echo "PROBLEM = $PROBLEM"
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"PERIOD\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+	
+			# Set TIME_LEFT to the number of days left before quotas expires
+			###########################################################################
+			TIME_LEFT=""
+			TIME_LEFT=`echo ${PROBLEM} | awk '{print $6}'`
+	
+			# Confirm $TIME_LEFT is set
+			###########################################################################
+			if [ "${TIME_LEFT}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"TIME_LEFT\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+			
+			# Set AMOUNT to the amount the needs to be removed
+			###########################################################################
+			AMOUNT=""
+			let AMOUNT="${USED}-${SOFT_LIMIT}"
+	
+			# Confirm $AMOUNT is set
+			###########################################################################
+			if [ "${AMOUNT}" = "" ];then
+
+       				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+   				ERROR_MESSAGE="${PROG} Error: The required variable \"AMOUNT\" not set for the user \"${USER}\", on ${HOST}, ${DATE_TIME}"
+	
+        			echo ${ERROR_MESSAGE} >> ${LOG}
+        			if [ ${INTERACTIVE} = YES ];then
+          				echo -e "\n${ERROR_MESSAGE}\n"
+        			else
+         				# Send Email
+               				echo "${ERROR_MESSAGE}" |
+               				${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+        			fi
+
+				# Move on to next user
+				continue
+			fi
+
+			# Set NEW_QUOTA_ENTRY to the info to be added to $HD/.quota
+			###########################################################################
+			NEW_QUOTA_ENTRY="SERVER=${HOST} FS=${FS} PERIOD=${PERIOD} TIME_LEFT=${TIME_LEFT}"
+
+			# The following line contols whether to remove ${HD}/.quota
+			# Removing ${HD}/.quota causes this script to notfy user every time it runs
+			###########################################################################
+			[ "${ALWAYS_NOTIFY}" = YES ] && rm -f ${HD}/.quota
+	
+			# Send email message if needed
+			###########################################################################
+			if [ ${PERIOD} != EXPIRED ];then
+
+				# PERIOD has not EXPIRED
+	
+				# Determine if the user already has a $HD/.quota file
+				###########################################################################
+				if [ -f ${HD}/.quota ];then
+	
+					# Check for entry that matches current problem in $USERS .quota file
+					####################################################################
+					if [ `grep -c "${NEW_QUOTA_ENTRY}" ${HD}/.quota` -eq 0 ];then
+
+
+						# Set OLD_QUOATA_ENTRY to the current quota info 
+						OLD_QUOATA_ENTRY=""
+						OLD_QUOATA_ENTRY=`grep "SERVER=${HOST} FS=${FS}" ${HD}/.quota`
+	
+						# Determine if $OLD_QUOATA_ENTRY is set
+						###################################################
+						if [ "${OLD_QUOATA_ENTRY}" = "" ];then
+
+							# Update the users .quota file
+							echo "${NEW_QUOTA_ENTRY}" >> ${HD}/.quota
+						else
+
+							# Update the ${HD}/.quota
+							echo "g{"$OLD_QUOATA_ENTRY"{s{{"$NEW_QUOTA_ENTRY"{
+							:wq!" | ex - ${HD}/.quota
+						fi
+
+						# Send email to $USER to notify user of problem
+						EMAIL
+					fi
+				else
+
+					# Create ${HD/.quota file containing disk usage info
+					echo "${NEW_QUOTA_ENTRY}" > ${HD}/.quota
+
+					# Send email to $USER to notify user of problem
+					EMAIL
+				fi
+			else
+
+				# PERIOD has EXPIRED
+	
+				# Determine if the user already has a $HD/.quota file
+				###########################################################################
+				if [ -f ${HD}/.quota ];then
+	
+					# Check for entry that matches current problem in $USERS .quota file
+					####################################################################
+					if [ `grep -c "${NEW_QUOTA_ENTRY}" ${HD}/.quota` -eq 0 ];then
+
+
+						# Set OLD_QUOATA_ENTRY to the current quota info 
+						OLD_QUOATA_ENTRY=""
+						OLD_QUOATA_ENTRY=`grep "SERVER=${HOST} FS=${FS}" ${HD}/.quota`
+	
+						# Determine if $OLD_QUOATA_ENTRY is set
+						###########################################################################
+						if [ "${OLD_QUOATA_ENTRY}" = "" ];then
+
+							# Update the users .quota file
+							echo "${NEW_QUOTA_ENTRY}" >> ${HD}/.quota
+						else
+
+							# Update the ${HD}/.quota
+							echo "g{"$OLD_QUOATA_ENTRY"{s{{"$NEW_QUOTA_ENTRY"{
+							:wq!" | ex - ${HD}/.quota
+						fi
+
+						# Send email to $USER to notify user of problem
+						EMAIL
+					fi
+				else
+
+					# Create ${HD/.quota file containing disk usage info
+					echo "${NEW_QUOTA_ENTRY}" > ${HD}/.quota
+
+					# Send email to $USER to notify user of problem
+					EMAIL
+				fi
+			fi
+		done
+	
+	else	# Quotas have not been execeeded
+
+		# Remove users .quota file if it exists
+		rm -f /home/${USER}/.quota
+	fi
+done
