@@ -1,0 +1,3580 @@
+#!/bin/bash
+# clone_linux_disks
+# Purpose: To make backup copies of the boot disk using dump | restore.
+# This script expects that there will be 2 disks used, 1 disk for the source 
+# disk and 1 disk for the backup/target. This script intended to be 
+# run by cron once a day. 
+
+# Dependencies
+# The partitioning of the SOURCE disk and the partitioning of the BACKUP disk must match
+# exactly on the /, /var and swap partitions for this script to work. Different partitioning
+# will produce error messages. 
+
+# Written By: Jon Swift 09-10
+# Updated 02-11, Added support for SUSE
+# Updated 01-12, Added logic to allow for multiple partitions sized the same
+# Updated 01-14, Corrected grub-install logic
+# Updated 04-14, Added logic to confirm new clone file systems are working after dump|restore. 
+#	And added fsck of clone file system if clone file system not working
+# Updated 06-15, to support cloning OS disks on EL6 gateway nodes systems with extra partitions
+
+
+# Misc. Variables
+HOST=`uname -n`
+PROG=`basename ${0}`
+OS=`uname -s`
+SOURCE_ROOT_MNT=/
+SOURCE_BOOT_MNT=/boot
+SOURCE_VAR_MNT=/var
+BACKUP_ROOT_MNT=/tmp/BACKUP_ROOT_PARTITION
+BACKUP_BOOT_MNT=/tmp/BACKUP_BOOT_PARTITION
+BACKUP_VAR_MNT=/tmp/BACKUP_VAR_PARTITION
+BACKUP_SWAP_LABEL=SW-clone
+#EMAIL_LIST="jsswift"
+EMAIL_LIST="pl742c"
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin
+IFS_ORIG=${IFS}
+LOG=/tmp/${PROG}.log
+
+# Make sure this script is run only on Linux systems
+################################################################################
+if [ ${OS} != Linux ];then
+	echo ""
+	echo "${PROG} only supported on Linux"
+	exit 1
+fi
+
+# Make sure this script is run as root
+################################################################################
+if [ `whoami` != root ];then
+	echo "You must be root to use ${PROG}"
+	exit 1
+fi
+
+# Set OS_TYPE to either REDHAT or SUSE, based on version
+# Also set GRUB_FILE name to the unique  file name used by $OS_TYPE
+################################################################################
+if [ -f /etc/redhat-release ];then
+	OS_TYPE=REDHAT
+	GRUB_FILE=grub.conf
+elif [ -f /etc/SuSE-release ];then
+	OS_TYPE=SUSE
+	GRUB_FILE=menu.lst
+else
+	echo "${PROG} only supported on RedHat and Suse Linux"
+	exit 1
+fi
+
+# Determine if this script is being run from the command line or from cron
+# Set INTERACTIVE, based on environment
+################################################################################
+tty -s
+if [ $? = 0 ];then
+	INTERACTIVE=YES
+else
+
+	INTERACTIVE=NO
+fi
+
+# The USAGE function is used to display program usage info
+################################################################################
+USAGE () {
+
+	# set -x
+	clear
+
+	if [ ${INTERACTIVE} = YES ];then
+		echo ""
+		echo ""
+		echo "${PROG}: Usage"
+		echo "${PROG} -c,		Clone boot disk to backup disk"
+		echo "${PROG} -c force,	Clone backup disk to primary boot disk"
+		echo "				Must be booted to backup disk to clone"
+		echo "				backup disk to primary boot disk"
+		echo ""
+		echo "${PROG} -t,		Test to determine if SOURCE and BACKUP"
+		echo "				partition/slice values are correct"
+		echo ""
+		echo ""
+	fi
+	exit
+}
+
+# Confirm syntax is correct
+################################################################################
+[ $# -eq 0 ] && USAGE
+
+# The SEND_MAIL function is used to send all emails
+################################################################################
+SEND_MAIL () {
+	
+	# Set SUBJECT as needed
+	[ "${SUBJECT}" = "" ] && SUBJECT="Problem with ${PROG} on ${HOST}"
+
+	# Add $LOG to email if it exists
+	if [ -s ${LOG} ];then
+		echo "
+
+See ${PROG} log data from ${HOST} below:
+
+		`cat ${LOG}`" | mailx -s "${SUBJECT}" ${EMAIL_LIST}
+	else
+		echo -e "${MESSAGE}" | mailx -s "${SUBJECT}" ${EMAIL_LIST}
+	fi
+}
+
+# Parse command line options
+################################################################################
+while getopts "ct" OPT
+do
+	case ${OPT} in
+		c) # Clone disk
+		TASK=CLONE
+		
+		# Set FORCE based on additional agrument
+		if [ "${2}" = force ];then
+			FORCE=YES
+		else
+			FORCE=NO
+		fi
+		;;
+
+		t) # Test
+		TASK=TEST
+		;;
+
+		*) # Error
+		echo "\nError: Invalid syntax"
+		USAGE
+		;;
+	esac
+done
+
+# Display Banner to Interactive users
+################################################################################
+if [ ${INTERACTIVE} = YES -a ${TASK} = CLONE ];then
+	#clear
+	echo ""
+	echo "###########################################################################"
+	echo ""
+	echo "Note 1: For complete details, run \"tail -f ${LOG}\""
+	echo "from another window on this system."
+	echo ""
+	echo "Note 2: Using \"Ctrl C\" to stop this script is likely NOT to work"
+	echo "once the dump/clonning has started. The best way to stop this script" 
+	echo "once the dump/clonning has started is to use the following command"
+	echo "from another window on this system."
+	echo "# pkill -9 -x '(${PROG}|dump|restore)'"
+	echo ""
+	echo "###########################################################################"
+	echo ""
+	echo ""
+fi
+
+# Make sure a dump is not already running
+################################################################################
+if [ `ps -aef | grep -v grep | egrep -c "dump 0fb - 512"` -ge 1 -a ${TASK} = CLONE ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. A dump is already running on ${HOST}. Not Running ${PROG}, ${DATE_TIME}. Please kill the old dump and restore process so ${PROG} will work properly next time\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+else
+	# Zero out log file only if clonning disk
+	[ ${TASK} = CLONE ] && > ${LOG}
+fi
+
+# Set SOURCE_BOOT_PART to the disk device name used to support the source / partition
+################################################################################
+SOURCE_BOOT_PART=`grep ext /etc/mtab | awk '{print $2,$1}' | grep -P '^/boot\s' | awk '{print $2}'`
+
+# Confirm $SOURCE_BOOT_PART is set
+################################################################################
+if [ "${SOURCE_BOOT_PART}" = "" -o `echo ${SOURCE_BOOT_PART} | grep -c '^/dev'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_BOOT_PART\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Set SOURCE_BOOT_LABEL to the disk device name used to support the source /boot file system
+################################################################################
+if [ `grep -P '/boot\s' /etc/fstab | grep -c '^LABEL='` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The source file system /boot is not using a LABEL in the /etc/fstab file. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+else
+	SOURCE_BOOT_LABEL=`grep -P "/boot\s" /etc/fstab | grep '^LABEL=' | grep -v cloning | 
+		awk '{print $1}' | awk -F= '{print $2}'`
+fi
+
+# Confirm $SOURCE_BOOT_LABEL is set
+################################################################################
+if [ "${SOURCE_BOOT_LABEL}" = "" -o `echo ${SOURCE_BOOT_LABEL} | egrep -c '.+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_BOOT_LABEL\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+else
+	# Set BACKUP_BOOT_LABEL based on ${SOURCE_BOOT_LABEL}
+	if [ `echo ${SOURCE_BOOT_LABEL} | egrep -c -- '-clone'` -eq 0 ];then
+	
+		# Appened -clone to ${SOURCE_BOOT_LABEL}
+		BACKUP_BOOT_LABEL=${SOURCE_BOOT_LABEL}-clone
+	else
+	
+		# Remove -clone from ${SOURCE_BOOT_LABEL}
+		BACKUP_BOOT_LABEL=`echo ${SOURCE_BOOT_LABEL} | sed 's:-clone::'`
+	fi
+fi
+
+# Set SOURCE_ROOT_PART to the disk device name used to support the source / file system
+################################################################################
+SOURCE_ROOT_PART=`grep ext /etc/mtab | awk '{print $2,$1}' | grep -P '^/\s' | awk '{print $2}'`
+
+# Confirm $SOURCE_ROOT_PART is set
+################################################################################
+if [ "${SOURCE_ROOT_PART}" = "" -o `echo ${SOURCE_ROOT_PART} | grep -c '^/dev'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_ROOT_PART\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Set SOURCE_ROOT_LABEL to the disk device name used to support the source / file system
+################################################################################
+if [ `grep -P '/\s' /etc/fstab | grep -c '^LABEL='` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The source file system / is not using a LABEL in the /etc/fstab file. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+else
+	SOURCE_ROOT_LABEL=`grep -P "/\s" /etc/fstab | grep '^LABEL=' | grep -v cloning |
+		awk '{print $1}' | awk -F= '{print $2}'`
+fi
+
+# Confirm $SOURCE_ROOT_LABEL is set
+################################################################################
+if [ "${SOURCE_ROOT_LABEL}" = "" -o `echo ${SOURCE_ROOT_LABEL} | egrep -c '.+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_ROOT_LABEL\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+else
+	# Set BACKUP_ROOT_LABEL based on ${SOURCE_ROOT_LABEL}
+	if [ `echo ${SOURCE_ROOT_LABEL} | egrep -c -- '-clone'` -eq 0 ];then
+	
+		# Appened -clone to ${SOURCE_ROOT_LABEL}
+		BACKUP_ROOT_LABEL=${SOURCE_ROOT_LABEL}-clone
+	else
+	
+		# Remove -clone from ${SOURCE_ROOT_LABEL}
+		BACKUP_ROOT_LABEL=`echo ${SOURCE_ROOT_LABEL} | sed 's:-clone::'`
+	fi
+fi
+
+# Set SOURCE_VAR_PART as needed to the disk device name used to support the source /var file system
+################################################################################
+if [ `grep ext /etc/mtab | awk '{print $2,$1}' | grep -c '^/var '` -eq 1 ];then
+
+	# Set SOURCE_VAR_PART to the disk device name used to support /var
+	################################################################################
+	SOURCE_VAR_PART=`grep ext /etc/mtab | awk '{print $2,$1}' | 
+		grep -P '^/var\s' | awk '{print $2}'`
+
+	# Confirm $SOURCE_VAR_PART is set properly
+	################################################################################
+	if [ "${SOURCE_VAR_PART}" != "" -a `echo ${SOURCE_VAR_PART} | grep -c '^/dev'` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_VAR_PART\" not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+
+	# Set SOURCE_VAR_LABEL to the disk device name used to support the source /var file system
+	################################################################################
+	if [ `grep -P '/var\s' /etc/fstab | grep -c '^LABEL='` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The source file system /var is not using a LABEL in the /etc/fstab file. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	else
+		SOURCE_VAR_LABEL=`grep -P "/var\s" /etc/fstab | grep '^LABEL=' | grep -v cloning |
+			awk '{print $1}' | awk -F= '{print $2}'`
+	fi
+	
+	# Confirm $SOURCE_VAR_LABEL is set
+	################################################################################
+	if [ "${SOURCE_VAR_LABEL}" = "" -o `echo ${SOURCE_VAR_LABEL} | egrep -c '.+'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_VAR_LABEL\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	else
+		# Set BACKUP_VAR_LABEL based on ${SOURCE_VAR_LABEL}
+		if [ `echo ${SOURCE_VAR_LABEL} | egrep -c -- '-clone'` -eq 0 ];then
+		
+			# Appened -clone to ${SOURCE_VAR_LABEL}
+			BACKUP_VAR_LABEL=${SOURCE_VAR_LABEL}-clone
+		else
+		
+			# Remove -clone from ${SOURCE_VAR_LABEL}
+			BACKUP_VAR_LABEL=`echo ${SOURCE_VAR_LABEL} | sed 's:-clone::'`
+		fi
+	fi
+else
+	SOURCE_VAR_PART=NONE
+	SOURCE_VAR_SLICE=NONE
+	BACKUP_VAR_MNT=""
+fi
+
+# Make sure that $SOURCE_ROOT_PART, $SOURCE_BOOT_PART, and $SOURCE_VAR_PART 
+# are part of the ame disk
+################################################################################
+################################################################################
+
+
+# Using standard sdxx SCSI device names
+################################################################################
+if [ `echo ${SOURCE_ROOT_PART} | grep -c /dev/sd..` -eq 1 -a ${SOURCE_VAR_PART} != NONE ];then
+
+	# Set DEV to the basic device name
+	DEV=/dev/sd
+
+	if [ `echo ${SOURCE_ROOT_PART} | sed 's/[0-9]//'` != `echo ${SOURCE_VAR_PART} | sed 's/[0-9]//'` ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_VAR_PART \"${SOURCE_VAR_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+
+	elif [ `echo ${SOURCE_ROOT_PART} | sed 's/[0-9]//'` != `echo ${SOURCE_BOOT_PART} | sed 's/[0-9]//'` ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_BOOT_PART \"${SOURCE_BOOT_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	else
+		# Set SOURCE_DISK to the real disk device name(s)
+		SOURCE_DISK=`echo ${SOURCE_ROOT_PART} | sed 's/[0-9]//'`
+	fi
+
+elif [ `echo ${SOURCE_ROOT_PART} | grep -c /dev/sd..` -eq 1 -a ${SOURCE_VAR_PART} = NONE ];then
+
+	# Set DEV to the basic device name
+	DEV=/dev/sd
+
+	if [ `echo ${SOURCE_ROOT_PART} | sed 's/[0-9]//'` != `echo ${SOURCE_BOOT_PART} | sed 's/[0-9]//'` ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_BOOT_PART \"${SOURCE_BOOT_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	else
+		# Set SOURCE_DISK to the real disk device name(s)
+		SOURCE_DISK=`echo ${SOURCE_ROOT_PART} | sed 's/[0-9]//'`
+	fi
+
+# Using HP hardware RAID disk device names
+################################################################################
+elif [ `echo ${SOURCE_ROOT_PART} | grep -c /dev/cciss` -eq 1 -a ${SOURCE_VAR_PART} != NONE ];then
+
+	# Set DEV to the basic device name
+	DEV=/dev/cciss
+
+	if [ `echo ${SOURCE_ROOT_PART} | sed 's/p[0-9]//'` != `echo ${SOURCE_VAR_PART} | sed 's/p[0-9]//'` ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_VAR_PART \"${SOURCE_VAR_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+
+	elif [ `echo ${SOURCE_ROOT_PART} | sed 's/p[0-9]//'` != `echo ${SOURCE_BOOT_PART} | sed 's/p[0-9]//'` ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_BOOT_PART \"${SOURCE_BOOT_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	else
+		# Set SOURCE_DISK to the real disk device name(s)
+		SOURCE_DISK=`echo ${SOURCE_ROOT_PART} | sed 's/p[0-9]//'`
+	fi
+
+elif [ `echo ${SOURCE_ROOT_PART} | grep -c /dev/cciss` -eq 1 -a ${SOURCE_VAR_PART} = NONE ];then
+
+	# Set DEV to the basic device name
+	DEV=/dev/cciss
+
+	if [ `echo ${SOURCE_ROOT_PART} | sed 's/p[0-9]//'` != `echo ${SOURCE_BOOT_PART} | sed 's/p[0-9]//'` ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The SOURCE_ROOT_PART \"${SOURCE_ROOT_PART}\" is not on the same disk as the SOURCE_BOOT_PART \"${SOURCE_BOOT_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	else
+		# Set SOURCE_DISK to the real disk device name(s)
+		SOURCE_DISK=`echo ${SOURCE_ROOT_PART} | sed 's/p[0-9]//'`
+	fi
+
+fi
+
+# Confirm $SOURCE_DISK is set properly
+################################################################################
+if [ "${SOURCE_DISK}" = "" -o `echo ${SOURCE_DISK} | egrep -c 'sd.|c.d.'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_DISK\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE} | tee -a ${LOG}
+       	exit 1
+fi
+
+# Set SOURCE_SWAP_PART to the disk device name used to support the source swap partition
+################################################################################
+SOURCE_SWAP_PART=`swapon -s | grep '^/dev/' | egrep "${SOURCE_DISK}" | awk '{print $1}'`
+
+# Confirm SOURCE_SWAP_PART is set properly
+################################################################################
+if [ "${SOURCE_SWAP_PART}" = "" ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_SWAP_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Set the SOURCE_ROOT_PART_COUNT to the number of blocks used for $SOURCE_ROOT_PART
+################################################################################
+SOURCE_ROOT_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_ROOT_PART} | 
+	awk '{print $4}' | sed 's/\+//'`
+
+# Set SOURCE_ROOT_SLICE
+################################################################################
+SOURCE_ROOT_SLICE=`echo ${SOURCE_ROOT_PART} | sed "s:${SOURCE_DISK}::"`
+
+# Set the SOURCE_BOOT_PART_COUNT to the number of blocks used for $SOURCE_ROOT_PART
+################################################################################
+if [ `fdisk -l ${SOURCE_DISK} | grep ${SOURCE_BOOT_PART} | grep -c '*'` -eq 1 ];then
+	SOURCE_BOOT_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_BOOT_PART} | 
+		awk '{print $5}' | sed 's/\+//'`
+else
+	SOURCE_BOOT_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_BOOT_PART} | 
+		awk '{print $4}' | sed 's/\+//'`
+fi
+
+# Set SOURCE_BOOT_SLICE
+################################################################################
+SOURCE_BOOT_SLICE=`echo ${SOURCE_BOOT_PART} | sed "s:${SOURCE_DISK}::"`
+
+# Set the SOURCE_SWAP_PART_COUNT to the number of blocks used for $SOURCE_SWAP_PART
+################################################################################
+SOURCE_SWAP_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_SWAP_PART} |
+	awk '{print $4}' | sed 's/\+//'`
+
+# Set SOURCE_SWAP_SLICE
+################################################################################
+SOURCE_SWAP_SLICE=`echo ${SOURCE_SWAP_PART} | sed "s:${SOURCE_DISK}::"`
+
+# If there is a real /var partition set SOURCE_VAR_PART_COUNT and SOURCE_VAR_SLICE
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ];then  
+
+	# Set the SOURCE_VAR_PART_COUNT to the number of blocks used for $SOURCE_VAR_PART
+	################################################################################
+	SOURCE_VAR_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_VAR_PART} |
+		awk '{print $4}' | sed 's/\+//'`
+
+	# Set SOURCE_VAR_SLICE
+	################################################################################
+	SOURCE_VAR_SLICE=`echo ${SOURCE_VAR_PART} | sed "s:${SOURCE_DISK}::"`
+fi
+
+# Confirm SOURCE_ROOT_PART_COUNT is set properly
+################################################################################
+if [ "${SOURCE_ROOT_PART_COUNT}" = "" -o `echo ${SOURCE_ROOT_PART_COUNT} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_ROOT_PART_COUNT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm SOURCE_ROOT_SLICE is set properly
+################################################################################
+if [ "${SOURCE_ROOT_SLICE}" = "" -o `echo ${SOURCE_ROOT_SLICE} | grep -c '[0-9]'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_ROOT_SLICE\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+	SEND_MAIL	
+	fi
+   	exit 1
+fi
+
+# Confirm SOURCE_BOOT_PART_COUNT is set properly
+################################################################################
+if [ "${SOURCE_BOOT_PART_COUNT}" = "" -o `echo ${SOURCE_BOOT_PART_COUNT} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_BOOT_PART_COUNT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm SOURCE_BOOT_SLICE is set properly
+################################################################################
+if [ "${SOURCE_BOOT_SLICE}" = "" -o `echo ${SOURCE_BOOT_SLICE} | grep -c '[0-9]'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_BOOT_SLICE\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+	SEND_MAIL	
+	fi
+   	exit 1
+fi
+
+# Confirm SOURCE_VAR_PART_COUNT is set properly
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ] && [ "${SOURCE_VAR_PART_COUNT}" = "" \
+	-o `echo ${SOURCE_VAR_PART_COUNT} | egrep -c '[0-9]+'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_VAR_PART_COUNT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+	
+# Confirm SOURCE_VAR_SLICE is set properly as neeed
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ] && [ "${SOURCE_VAR_SLICE}" = "" \
+	-o `echo ${SOURCE_VAR_SLICE} | grep -c '[0-9]'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_VAR_SLICE\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm SOURCE_SWAP_PART_COUNT is set properly
+################################################################################
+if [ "${SOURCE_SWAP_PART_COUNT}" = "" -o `echo ${SOURCE_SWAP_PART_COUNT} | 
+	egrep -c '[0-9]+'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_SWAP_PART_COUNT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm SOURCE_SWAP_SLICE is set properly
+################################################################################
+if [ "${SOURCE_SWAP_SLICE}" = "" -o `echo ${SOURCE_SWAP_SLICE} | grep -c '[0-9]'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_SWAP_SLICE\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm SOURCE_ROOT_SLICE, SOURCE_BOOT_SLICE, SOURCE_VAR_SLICE 
+# and SOURCE_SWAP_SLICE are all unique
+################################################################################
+if [ "${SOURCE_ROOT_SLICE}" = "${SOURCE_BOOT_SLICE}" \
+	-o "${SOURCE_ROOT_SLICE}" = "${SOURCE_VAR_SLICE}" \
+	-o "${SOURCE_ROOT_SLICE}" = "${SOURCE_SWAP_SLICE}" ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variables \"SOURCE_ROOT_SLICE\" \"${SOURCE_ROOT_SLICE}\", \"SOURCE_BOOT_SLICE\" \"${SOURCE_BOOT_SLICE}\", \"SOURCE_VAR_SLICE\" \"${SOURCE_VAR_SLICE}\" and \"SOURCE_SWAP_SLICE\" \"${SOURCE_SWAP_SLICE}\" are not all unique. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+LOOP=0
+
+# Set IFS to end of line
+IFS='
+'
+
+# Set EXTRA_PARTS as needed to the disk device name(s) used to support ext2 or ext3 
+# file system partitions other than /, /boot, /var that are on $SOURCE_DISK
+# For each EXTRA_PART also set EXTRA_PART_COUNTS, EXTRA_PART_SLICES, and EXTRA_MOUNT_POINTS
+################################################################################
+for LINE in `grep ext /etc/mtab | grep "^${SOURCE_DISK}" | awk '{print $2,$1}' | 
+	egrep -v '^/var |^/ |^/boot '`
+do
+
+	# Set IFS to original value
+	################################################################################
+	IFS=${IFS_ORIG}
+	
+	# Break LINE into multiple fields
+	################################################################################
+	set ${LINE}
+
+	# Set EXTRA_MOUNT_POINT to the 1st field
+	################################################################################
+	EXTRA_MOUNT_POINT=""
+	EXTRA_MOUNT_POINT=$1
+
+	# Set EXTRA_PART to the 2nd field
+	################################################################################
+	EXTRA_PART=""
+	EXTRA_PART=$2
+
+	# Confirm EXTRA_MOUNT_POINT is set properly
+	################################################################################
+	if [ "${EXTRA_MOUNT_POINT}" = "" -o `echo ${EXTRA_MOUNT_POINT} | grep -c '/.'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Confirm EXTRA_PART is set properly
+	################################################################################
+	if [ "${EXTRA_PART}" = "" -o `echo ${EXTRA_PART} | grep -c '/dev/'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Set EXTRA_PART_SLICE to the slice number used for ${EXTRA_PART}
+	###################################################################
+	EXTRA_PART_SLICE=`echo ${EXTRA_PART} | sed "s:${SOURCE_DISK}::"`
+
+	# Confirm ${EXTRA_PART_SLICE} is set properly
+	###################################################################
+	if [ "${EXTRA_PART_SLICE}" = "" -o `echo ${EXTRA_PART_SLICE} | grep -c '[0-9]'` -eq 0 ];then
+				
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART_SLICE\" not set properly for \"EXTRA_PART\", \"${EXTRA_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Set EXTRA_PART_COUNT to the number of sectors used for ${EXTRA_PART}
+	###################################################################
+	EXTRA_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${EXTRA_PART} | 
+		awk '{print $4}' | sed 's/\+//'`
+
+	# Confirm ${EXTRA_PART_COUNT} is set properly
+	###################################################################
+	if [ "${EXTRA_PART_COUNT}" = "" -o `echo ${EXTRA_PART_COUNT} | egrep -vc '[0-9]'` -eq 1 ];then
+		
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART_COUNT\" not set properly for \"EXTRA_PART\", \"${EXTRA_PART}\". Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+		
+	# Build EXTRA_PARTS, EXTRA_PART_COUNTS, and EXTRA_PART_SLICES, 
+	# EXTRA_MOUNT_POINTS
+	###################################################################
+	if [ "${EXTRA_PARTS}" = "" ];then
+		EXTRA_PARTS="${EXTRA_PART}"
+		EXTRA_PART_COUNTS="${EXTRA_PART_COUNT}"
+		EXTRA_PART_SLICES="${EXTRA_PART_SLICE}"
+		EXTRA_MOUNT_POINTS="${EXTRA_MOUNT_POINT}"
+	else
+		EXTRA_PARTS="${EXTRA_PARTS}|${EXTRA_PART}"
+		EXTRA_PART_COUNTS="${EXTRA_PART_COUNTS}|${EXTRA_PART_COUNT}"
+		EXTRA_MOUNT_POINTS="${EXTRA_MOUNT_POINTS}|${EXTRA_MOUNT_POINT}"
+		
+		# Confirm new ${EXTRA_PART_SLICE} is unique
+		if [ `echo ${EXTRA_PART_SLICE} | egrep -c "${EXTRA_PART_SLICES}"` -eq 1 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variables \"EXTRA_PART_SLICE\" is not all unique, it is the same as one of the other partitions used for extrafile systems. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		else
+			EXTRA_PART_SLICES="${EXTRA_PART_SLICES}|${EXTRA_PART_SLICE}"
+		fi
+	fi
+
+	# Increment $LOOP
+	let LOOP=${LOOP}+1
+done
+
+# Set DISKS to the list of possible clone disk device names
+################################################################################
+if [ `echo ${SOURCE_DISK} | grep -c /dev/cciss` -eq 1 ];then
+	DISKS=`grep ' cciss' /proc/partitions | awk '{print $4}' | egrep -v 'p[0-9]$'`
+
+else
+	DISKS=`grep ' sd' /proc/partitions | awk '{print $4}' | grep -Pv '\d'`
+fi
+
+# Try to set BACKUP_DISK, by searching for a disk that has the same partition sizes.
+# That is another disk that has partitions that match the SOURCE_ROOT_PART_COUNT, 
+# SOURCE_BOOT_PART_COUNT, SOURCE_VAR_PART_COUNT, and SOURCE_SWAP_PART_COUNT exactly
+[ ${INTERACTIVE} = YES ] && echo -e "\nLooking for backup/target disk "
+################################################################################
+for DISK in ${DISKS}
+do
+
+	# Set DISK to /dev/$DISK
+	DISK=/dev/${DISK}
+
+	# Skip ${SOURCE_DISK}
+	[ ${DISK} = ${SOURCE_DISK} ] && continue
+
+	# Display dots "." to interactive users for each disk device name checked
+	[ ${INTERACTIVE} = YES ] && echo -n '.'
+
+	# Determine if $DISK has the same size partitions as the source disk
+	# No /var partition and no extra partitions
+	################################################################################
+	if [ ${SOURCE_VAR_PART} = NONE -a "${EXTRA_PARTS}" = "" ];then
+SOURCE_ROOT_PART_COUNT=`fdisk -l ${SOURCE_DISK} | grep ${SOURCE_ROOT_PART} | 
+	awk '{print $4}' | sed 's/\+//'`
+		if [ `fdisk -l ${DISK} | egrep -c "${SOURCE_BOOT_PART_COUNT}|${SOURCE_ROOT_PART_COUNT}|${SOURCE_SWAP_PART_COUNT}"` -ge 3 ];then
+			BACKUP_DISK="${DISK}"
+			break
+		fi
+
+	# No /var partition and with extra partitions
+	################################################################################
+	elif [ ${SOURCE_VAR_PART} = NONE -a "${EXTRA_PARTS}" != "" ];then
+
+		# Set PARTS to 4 plus $LOOP
+		let PARTS=3+${LOOP}
+
+		if [ `fdisk -l ${DISK} | egrep -c "${SOURCE_BOOT_PART_COUNT}|${SOURCE_ROOT_PART_COUNT}|${SOURCE_SWAP_PART_COUNT}|${EXTRA_PART_COUNTS}"` -ge ${PARTS} ];then
+			BACKUP_DISK="${DISK}"
+			break
+		fi
+
+	# With a /var partition and no extra partitions
+	################################################################################
+	elif [ ${SOURCE_VAR_PART} != NONE -a "${EXTRA_PARTS}" = "" ];then
+
+		if [ `fdisk -l ${DISK} | egrep -c "${SOURCE_BOOT_PART_COUNT}|${SOURCE_ROOT_PART_COUNT}|${SOURCE_SWAP_PART_COUNT}|${SOURCE_VAR_PART_COUNT}"` -ge 4 ];then
+			BACKUP_DISK="${DISK}"
+			break
+		fi
+
+	# With a /var partition and with extra partitions
+	################################################################################
+	else
+		# Set PARTS to 4 plus $LOOP
+		let PARTS=4+${LOOP}
+
+		if [ `fdisk -l ${DISK} | egrep -c "${SOURCE_BOOT_PART_COUNT}|${SOURCE_ROOT_PART_COUNT}|${SOURCE_SWAP_PART_COUNT}|${SOURCE_VAR_PART_COUNT}|${EXTRA_PART_COUNTS}"` -ge ${PARTS} ];then
+			BACKUP_DISK="${DISK}"
+			break
+		fi
+	fi
+done
+[ ${INTERACTIVE} = YES ] && echo ""
+
+# Confirm BACKUP_DISK is set
+################################################################################
+if [ "${BACKUP_DISK}" = "" -o `echo ${BACKUP_DISK} | grep -c ${DEV}` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_DISK\" not set properly. This is most likely caused because there are no disks partitioned the same as the boot disk, ${SOURCE_DISK}. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Set BACKUP_ROOT_PART to the disk device name used to support the backup / partition
+################################################################################
+BACKUP_ROOT_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_ROOT_PART_COUNT} | awk '{print $1}'`
+
+# Confirm BACKUP_ROOT_PART is set properly
+################################################################################
+if [ "${BACKUP_ROOT_PART}" = "" -o `echo ${BACKUP_ROOT_PART} | grep -c '[0-9]'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_ROOT_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm ${BACKUP_ROOT_PART} is just 1 partition, Correct as needed
+################################################################################
+if [ `echo ${BACKUP_ROOT_PART} | wc -w` -ne 1 ];then
+
+       	SOURCE_ROOT_PART_MINUS_LETTER=`echo ${SOURCE_ROOT_PART} |
+               	sed 's/sd[a,b,c,d,e,f,g,h,i]/sd\./'`
+
+	BACKUP_ROOT_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_ROOT_PART_COUNT} |
+       	grep ${SOURCE_ROOT_PART_MINUS_LETTER} | awk '{print $1}'`
+
+	# Confirm BACKUP_ROOT_PART is set properly
+	################################################################################
+	if [ "${BACKUP_ROOT_PART}" = "" -o `echo ${BACKUP_ROOT_PART} | grep -c '[0-9]'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_ROOT_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       	exit 1
+	fi
+fi
+
+# Set BACKUP_BOOT_PART to the disk device name used to support the backup /boot partition
+################################################################################
+BACKUP_BOOT_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_BOOT_PART_COUNT} | awk '{print $1}'`
+
+# Confirm BACKUP_BOOT_PART is set properly
+################################################################################
+if [ "${BACKUP_BOOT_PART}" = "" -o `echo ${BACKUP_BOOT_PART} | grep -c '[0-9]'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_BOOT_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm ${BACKUP_BOOT_PART} is just 1 partition, Correct as needed
+################################################################################
+if [ `echo ${BACKUP_BOOT_PART} | wc -w` -ne 1 ];then
+
+       	SOURCE_BOOT_PART_MINUS_LETTER=`echo ${SOURCE_BOOT_PART} |
+               	sed 's/sd[a,b,c,d,e,f,g,h,i]/sd\./'`
+
+	BACKUP_BOOT_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_BOOT_PART_COUNT} |
+       	grep ${SOURCE_BOOT_PART_MINUS_LETTER} | awk '{print $1}'`
+
+	# Confirm BACKUP_BOOT_PART is set properly
+	################################################################################
+	if [ "${BACKUP_BOOT_PART}" = "" -o `echo ${BACKUP_BOOT_PART} | grep -c '[0-9]'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_BOOT_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       	exit 1
+	fi
+fi
+
+# Set BACKUP_SWAP_PART to the disk device name used to support the backup swap partition
+################################################################################
+BACKUP_SWAP_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_SWAP_PART_COUNT} | awk '{print $1}'`
+
+# Confirm BACKUP_SWAP_PART is set properly
+################################################################################
+if [ "${BACKUP_SWAP_PART}" = "" -o `echo ${BACKUP_SWAP_PART} | grep -c '[0-9]'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_SWAP_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Confirm ${BACKUP_SWAP_PART} is just 1 partition, Correct as needed
+################################################################################
+if [ `echo ${BACKUP_SWAP_PART} | wc -w` -ne 1 ];then
+
+       	SOURCE_SWAP_PART_MINUS_LETTER=`echo ${SOURCE_SWAP_PART} |
+               	sed 's/sd[a,b,c,d,e,f,g,h,i]/sd\./'`
+
+	BACKUP_SWAP_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_SWAP_PART_COUNT} |
+       	grep ${SOURCE_SWAP_PART_MINUS_LETTER} | awk '{print $1}'`
+
+	# Confirm BACKUP_SWAP_PART is set properly
+	################################################################################
+	if [ "${BACKUP_SWAP_PART}" = "" -o `echo ${BACKUP_SWAP_PART} | grep -c '[0-9]'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_SWAP_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       	exit 1
+	fi
+fi
+
+## Set BACKUP_VAR_PART and Confirm if ${SOURCE_VAR_PART} != NONE
+#################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ];then
+
+	# Set BACKUP_VAR_PART to the disk device name used to support the backup /var partition
+	################################################################################
+	BACKUP_VAR_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_VAR_PART_COUNT} | awk '{print $1}'`
+	
+	# Confirm BACKUP_VAR_PART is set properly
+	################################################################################
+	if [ "${BACKUP_VAR_PART}" = "" -o `echo ${BACKUP_VAR_PART} | grep -c '[0-9]'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_VAR_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Confirm ${BACKUP_VAR_PART} is just 1 partition
+	# Correct as needed
+	################################################################################
+	if [ `echo ${BACKUP_VAR_PART} | wc -w` -ne 1 ];then
+        	SOURCE_VAR_PART_MINUS_LETTER=`echo ${SOURCE_VAR_PART} |
+                	sed 's/sd[a,b,c,d,e,f,g,h,i]/sd\./'`
+
+		BACKUP_VAR_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${SOURCE_VAR_PART_COUNT} |
+        	grep ${SOURCE_VAR_PART_MINUS_LETTER} | awk '{print $1}'`
+
+		# Confirm BACKUP_VAR_PART is set properly
+		################################################################################
+		if [ "${BACKUP_VAR_PART}" = "" -o `echo ${BACKUP_VAR_PART} | grep -c '[0-9]'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_VAR_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+	fi
+fi
+
+# If ${EXTRA_PARTS} is set, Set BACKUP_EXTRA_PARTS
+################################################################################
+if [ "${EXTRA_PARTS}" != "" ];then
+
+	# Set LOOP to 1
+	LOOP=1
+
+	# Loop through each extra partition, setting EXTRA_PART, EXTRA_MOUNT_POINT, 
+	# EXTRA_PART_COUNT and EXTRA_PART_SLICE
+	################################################################################
+	for EXTRA_PART in `echo ${EXTRA_PARTS} | sed 's:|: :g'`
+	do
+
+		# Confirm EXTRA_PART is set properly
+		################################################################################
+		if [ "${EXTRA_PART}" = "" -o `echo ${EXTRA_PART} | grep -c ${DEV}` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set EXTRA_MOUNT_POINT to the mount point used for $EXTRA_PART
+		################################################################################
+		EXTRA_MOUNT_POINT=""
+		EXTRA_MOUNT_POINT=`echo ${EXTRA_MOUNT_POINTS} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+
+		# Confirm EXTRA_MOUNT_POINT is set properly
+		################################################################################
+		if [ "${EXTRA_MOUNT_POINT}" = "" -o `echo ${EXTRA_MOUNT_POINT} | grep -c '^/.'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set EXTRA_LABEL to the label used to mount $EXTRA_MOUNT_POINT
+		################################################################################
+		if [ `grep -P "${EXTRA_MOUNT_POINT}\s" /etc/fstab | grep -c '^LABEL='` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The source file system /${EXTRA_MOUNT_POINT} is not using a LABEL in the /etc/fstab file. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+			exit 1
+		else
+
+			EXTRA_LABEL=`grep -P "\s${EXTRA_MOUNT_POINT}\s" /etc/fstab | sed 's{/export/{/x/{' |
+				grep '^LABEL=' | awk '{print $1}' | awk -F= '{print $2}'`
+		fi
+
+		# Confirm EXTRA_LABEL is set properly
+		################################################################################
+		if [ "${EXTRA_LABEL}" = "" -o `echo ${EXTRA_LABEL} | egrep -c '.+'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_LABEL\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		else
+			# Set BACKUP_EXTRA_LABEL based on ${EXTRA_LABEL}
+			if [ `echo ${EXTRA_LABEL} | egrep -c -- '-clone'` -eq 0 ];then
+			
+				# Appened -clone to ${EXTRA_LABEL}
+				BACKUP_EXTRA_LABEL=${EXTRA_LABEL}-clone
+			else
+			
+				# Remove -clone from ${EXTRA_LABEL}
+				BACKUP_EXTRA_LABEL=`echo ${EXTRA_LABEL} | sed 's:-clone::'`
+			fi
+		fi
+
+		# Set EXTRA_PART_COUNT to the sector count used for $EXTRA_PART
+		################################################################################
+		EXTRA_PART_COUNT=""
+		EXTRA_PART_COUNT=`echo ${EXTRA_PART_COUNTS} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+
+		# Confirm EXTRA_PART_COUNT is set properly
+		################################################################################
+		if [ "${EXTRA_PART_COUNT}" = "" -o `echo ${EXTRA_PART_COUNT} | egrep -vc '[0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART_COUNT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set EXTRA_PART_SLICE to the sector count used for $EXTRA_PART
+		################################################################################
+		EXTRA_PART_SLICE=""
+		EXTRA_PART_SLICE=`echo ${EXTRA_PART_SLICES} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+
+		# Confirm EXTRA_PART_SLICE is set properly
+		################################################################################
+		if [ "${EXTRA_PART_SLICE}" = "" -o `echo ${EXTRA_PART_SLICE} | egrep -vc '[0-9]'` -eq 1 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART_SLICE\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set BACKUP_EXTRA_PART to the disk device name used to support the backup partition
+		################################################################################
+		BACKUP_EXTRA_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${EXTRA_PART_COUNT} | awk '{print $1}'`
+	
+		# Confirm BACKUP_EXTRA_PART is set properly
+		################################################################################
+		if [ "${BACKUP_EXTRA_PART}" = "" -o `echo ${BACKUP_EXTRA_PART} | grep -c '[0-9]'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		
+		# Confirm ${BACKUP_EXTRA_PART} is just 1 partition
+		# Correct as needed
+		################################################################################
+		if [ `echo ${BACKUP_EXTRA_PART} | wc -w` -ne 1 ];then
+		
+			EXTRA_PART_MINUS_LETTER=`echo ${EXTRA_PART} |
+        			sed 's/sd[a,b,c,d,e,f,g,h,i]/sd\./'`
+
+			BACKUP_EXTRA_PART=`fdisk -l ${BACKUP_DISK} | grep -w ${EXTRA_PART_COUNT} |
+        			grep ${EXTRA_PART_MINUS_LETTER} | awk '{print $1}'`
+	
+			# Confirm BACKUP_EXTRA_PART is set properly
+			################################################################################
+			if [ "${BACKUP_EXTRA_PART}" = "" -o `echo ${BACKUP_EXTRA_PART} | grep -c '[0-9]'` -eq 0 ];then
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+				if [ ${INTERACTIVE} = YES ];then 
+					echo -e ${MESSAGE} | tee -a ${LOG}
+				else
+					echo -e ${MESSAGE} >> ${LOG}
+					SEND_MAIL	
+				fi
+       				exit 1
+			fi
+		fi
+
+		# Build BACKUP_EXTRA_PARTS
+		################################################################################
+		if [ ${LOOP} -eq 1 ];then
+			BACKUP_EXTRA_PARTS="${BACKUP_EXTRA_PART}"
+		else
+			BACKUP_EXTRA_PARTS="${BACKUP_EXTRA_PARTS}|${BACKUP_EXTRA_PART}"
+		fi
+
+		# Build the variable BACKUP_EXTRA_LABELS, which will be used
+		# to edit the clone /etc/fstab file
+		################################################################################
+		if [ "${BACKUP_EXTRA_LABELS}" = "" ];then
+			BACKUP_EXTRA_LABELS="${BACKUP_EXTRA_LABEL}"
+		else
+			BACKUP_EXTRA_LABELS="${BACKUP_EXTRA_LABELS}|${BACKUP_EXTRA_LABEL}"
+		fi
+
+		# Build the variable BACKUP_FSTAB_EXTRA_LABELS, which will be used
+		# to edit the clone /etc/fstab file
+		################################################################################
+		if [ "${BACKUP_FSTAB_EXTRA_LABELS}" = "" ];then
+			BACKUP_FSTAB_EXTRA_LABELS="s:LABEL=${EXTRA_LABEL}\s:LABEL=${BACKUP_EXTRA_LABEL} :"
+		else
+			BACKUP_FSTAB_EXTRA_LABELS="${BACKUP_FSTAB_EXTRA_LABELS}; s:LABEL=${EXTRA_LABEL}\s:LABEL=${BACKUP_EXTRA_LABEL} :"
+		fi
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+	done
+fi
+
+# DISPLAY SOURCE and BACKUP disk partition data as needed
+#################################################################################
+if [ ${TASK} = TEST ];then
+
+	# Display Source disk info
+	################################################################################
+	echo "" | tee -a ${LOG}
+	echo "SOURCE_BOOT_PART = ${SOURCE_BOOT_PART}" | tee -a ${LOG}
+	echo "SOURCE_BOOT_LABEL = ${SOURCE_BOOT_LABEL}" | tee -a ${LOG}
+	echo "SOURCE_ROOT_PART = ${SOURCE_ROOT_PART}" | tee -a ${LOG}
+	echo "SOURCE_ROOT_LABEL = ${SOURCE_ROOT_LABEL}" | tee -a ${LOG}
+	[ ${SOURCE_VAR_PART} != NONE ] && echo "SOURCE_VAR_PART = ${SOURCE_VAR_PART}" | tee -a ${LOG}
+	[ ${SOURCE_VAR_PART} != NONE ] && echo "SOURCE_VAR_LABEL = ${SOURCE_VAR_LABEL}" | tee -a ${LOG}
+	echo "SOURCE_SWAP_PART = ${SOURCE_SWAP_PART}" | tee -a ${LOG}
+
+	for EXTRA_PART in `echo ${EXTRA_PARTS} | sed 's:|: :g'`
+	do
+		echo "EXTRA_PART = ${EXTRA_PART}" | tee -a ${LOG}
+	done
+
+	echo "SOURCE_DISK = `echo ${SOURCE_DISK} | sed 's/\|/ /'`" | tee -a ${LOG}
+	#echo "SOURCE_ROOT_PART_COUNT = ${SOURCE_ROOT_PART_COUNT}" | tee -a ${LOG}
+	#echo "SOURCE_VAR_PART_COUNT = ${SOURCE_VAR_PART_COUNT}" | tee -a ${LOG}
+	#echo "SOURCE_SWAP_PART_COUNT = ${SOURCE_SWAP_PART_COUNT}" | tee -a ${LOG}
+	echo "" | tee -a ${LOG}
+
+	# Display Backup disk info
+	################################################################################
+	echo "BACKUP_BOOT_PART = ${BACKUP_BOOT_PART}" | tee -a ${LOG}
+	echo "BACKUP_BOOT_LABEL = ${BACKUP_BOOT_LABEL}" | tee -a ${LOG}
+	echo "BACKUP_ROOT_PART = ${BACKUP_ROOT_PART}" | tee -a ${LOG}
+	echo "BACKUP_ROOT_LABEL = ${BACKUP_ROOT_LABEL}" | tee -a ${LOG}
+	[ ${SOURCE_VAR_PART} != NONE ] && echo "BACKUP_VAR_PART = ${BACKUP_VAR_PART}" | tee -a ${LOG}
+	echo "BACKUP_SWAP_PART = ${BACKUP_SWAP_PART}" | tee -a ${LOG}
+	echo "BACKUP_SWAP_LABEL = ${BACKUP_SWAP_LABEL}" | tee -a ${LOG}
+
+	for BACKUP_EXTRA_PART in `echo ${BACKUP_EXTRA_PARTS} | sed 's:|: :g'`
+	do
+		echo "BACKUP_EXTRA_PART = ${BACKUP_EXTRA_PART}" | tee -a ${LOG}
+	done
+
+	for BACKUP_EXTRA_LABEL in `echo ${BACKUP_EXTRA_LABELS} | sed 's:|: :g'`
+	do
+		echo BACKUP_EXTRA_LABEL = ${BACKUP_EXTRA_LABEL}
+	done
+
+	echo "BACKUP_DISK = ${BACKUP_DISK}" | tee -a ${LOG}
+	echo "" | tee -a ${LOG}
+
+	exit
+fi
+
+# Confirm the system is booted to the primary disk, not the backup disk.
+# DO NOT clone backwards unless optional arg "force" is used
+#################################################################################
+if [ `grep '^LABEL=' /etc/fstab | awk '{print $1}' | grep -c -- -clone` -ge 1 -a ${FORCE} = NO ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The system is booted to the clone disk. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Make sure BACKUP_BOOT_PART exists
+#################################################################################
+if [ ! -b ${BACKUP_BOOT_PART} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The BACKUP_BOOT_PART \"${BACKUP_BOOT_PART}\" does not exist. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure BACKUP_ROOT_PART exists
+#################################################################################
+if [ ! -b ${BACKUP_ROOT_PART} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The BACKUP_ROOT_PART \"${BACKUP_ROOT_PART}\" does not exist. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure BACKUP_VAR_PART exists
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ] && [ ! -b ${BACKUP_VAR_PART} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The BACKUP_VAR_PART \"${BACKUP_VAR_PART}\"  does not exist. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure BACKUP_SWAP_PART exists
+################################################################################
+if [ ! -b ${BACKUP_SWAP_PART} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The BACKUP_SWAP_PART \"${BACKUP_SWAP_PART}\"  does not exist. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure that the BACKUP_BOOT_PART is not mounted, and if it is umount it
+################################################################################
+if [ `grep -Pc "^${BACKUP_BOOT_PART}\s" /etc/mtab` -ne 0 ];then
+
+	# Determine BOOT_MOUNT_POINT for $BACKUP_ROOT_PART
+	################################################################################
+	BOOT_MOUNT_POINT=`grep -P "^${BACKUP_BOOT_PART}\s" /etc/mtab | awk '{print $2}'`
+
+	# Confirm BOOT_MOUNT_POINT is set
+	################################################################################
+	if [ "${BOOT_MOUNT_POINT}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BOOT_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Confirm the mount point is something this script uses, else do not umount
+	################################################################################
+	if [ `echo ${BOOT_MOUNT_POINT} | egrep -c '^/tmp/BACKUP_[A-Z]'` -eq 1 ];then
+
+		# Try to umount BOOT_MOUNT_POINT
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Attempting to umount \"${BOOT_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+		umount ${BOOT_MOUNT_POINT} 2>/dev/null
+
+		# Confirm BACKUP_BOOT_PART umounted
+		if [ `grep -Pc "^${BACKUP_BOOT_PART}\s" /etc/mtab` -ne 0 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system failed to umount. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+	else
+		# Non standard ${BACKUP_BOOT_PART} mount point, not umounting ${BACKUP_BOOT_PART}
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system is mounted on \"${BOOT_MOUNT_POINT}\", which was not assigned by ${PROG}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+fi
+
+# Make sure that the BACKUP_ROOT_PART is not mounted, and if it is umount it
+################################################################################
+if [ `grep -Pc "^${BACKUP_ROOT_PART}\s" /etc/mtab` -ne 0 ];then
+
+	# Determine ROOT_MOUNT_POINT for $BACKUP_ROOT_PART
+	################################################################################
+	ROOT_MOUNT_POINT=`grep -P "^${BACKUP_ROOT_PART}\s" /etc/mtab | awk '{print $2}'`
+
+	# Confirm ROOT_MOUNT_POINT is set
+	################################################################################
+	if [ "${ROOT_MOUNT_POINT}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"ROOT_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Confirm the mount point is something this script uses, else do not umount
+	################################################################################
+	if [ `echo ${ROOT_MOUNT_POINT} | egrep -c '^/tmp/BACKUP_[A-Z]'` -eq 1 ];then
+
+		# Try to umount ROOT_MOUNT_POINT
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Attempting to umount \"${ROOT_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+		umount ${ROOT_MOUNT_POINT} 2>/dev/null
+
+		# Confirm BACKUP_ROOT_PART umounted
+		if [ `grep -Pc "^${BACKUP_ROOT_PART}\s" /etc/mtab` -ne 0 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup root file system failed to umount. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+	else
+		# Non standard ${BACKUP_ROOT_PART} mount point, not umounting ${BACKUP_ROOT_PART}
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup root file system is mounted on \"${ROOT_MOUNT_POINT}\", which was not assigned by ${PROG}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+fi
+
+# Make sure that the BACKUP_VAR_PART is not mounted, and if it is umount it
+################################################################################
+VAR_MOUNT_POINT=""
+if [ ${SOURCE_VAR_PART} != NONE ] && [ `grep -Pc "^${BACKUP_VAR_PART}\s" /etc/mtab` -ne 0 ];then
+
+	# Determine VAR_MOUNT_POINT for $BACKUP_VAR_PART
+	################################################################################
+	VAR_MOUNT_POINT=`grep -P "^${BACKUP_VAR_PART}\s" /etc/mtab | awk '{print $2}'`
+
+	# Confirm VAR_MOUNT_POINT is set
+	################################################################################
+	if [ "${VAR_MOUNT_POINT}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"VAR_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Confirm the mount point is something this script uses, else do not umount
+	################################################################################
+	if [ `echo ${VAR_MOUNT_POINT} | egrep -c '^/tmp/BACKUP_[A-Z]'` -eq 1 ];then
+
+		# Try to umount BACKUP_VAR_PART
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Attempting to umount \"${VAR_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+		umount ${VAR_MOUNT_POINT} 2>/dev/null
+	
+		# If BACKUP_VAR_PART still mounted report problem
+		################################################################
+		if [ `grep -Pc "^${BACKUP_VAR_PART}\s" /etc/mtab` -ne 0 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup var file system failed to umount. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+	else
+		# Non standard ${BACKUP_VAR_PART} mount point, not umounting ${BACKUP_VAR_PART}
+		################################################################
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup var file system is mounted on \"${VAR_MOUNT_POINT}\", which was  not assigned by ${PROG}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+fi
+
+# Make sure that the BACKUP_EXTRA_PARTS are not mounted, and if they are, umount them
+################################################################################
+if [ "${BACKUP_EXTRA_PARTS}" != "" ];then
+
+	# Set LOOP to 1
+	LOOP=1
+
+	# Loop through each extra partition, setting BACKUP_EXTRA_PART, EXTRA_MOUNT_POINT, 
+	# EXTRA_PART_COUNT and EXTRA_PART_SLICE
+	################################################################################
+	for BACKUP_EXTRA_PART in `echo ${BACKUP_EXTRA_PARTS} | sed 's:|: :g'`
+	do
+
+		# Confirm BACKUP_EXTRA_PART is set properly
+		################################################################################
+		if [ "${BACKUP_EXTRA_PART}" = "" -o `echo ${BACKUP_EXTRA_PART} | 
+			grep -c '/dev'` -eq 0 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set EXTRA_MOUNT_POINT to each value in EXTRA_MOUNT_POINTS one at a time
+		################################################################################
+		EXTRA_MOUNT_POINT=""
+		EXTRA_MOUNT_POINT=`echo ${EXTRA_MOUNT_POINTS} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+	
+		# Confirm that the variable EXTRA_MOUNT_POINT is set properly
+		################################################################################
+		if [ "${EXTRA_MOUNT_POINT}" = "" -o `echo ${EXTRA_MOUNT_POINT} | 
+			egrep -c '^/'` -eq 0 ];then
+			
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_MOUNT_POINT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+
+		# Set BACKUP_EXTRA_MOUNT_POINT to the standard backup mount for $BACKUP_EXTRA_PART
+		################################################################################
+		BACKUP_EXTRA_MOUNT_POINT=""
+		if [ `echo ${EXTRA_MOUNT_POINT} | grep -c cloning` -eq 0 ];then
+			BACKUP_EXTRA_MOUNT_POINT="/tmp/BACKUP_`basename ${EXTRA_MOUNT_POINT} | 
+			tr '[a-z]' '[A-Z]'`_PARTITION"
+		else
+			BACKUP_EXTRA_MOUNT_POINT="/tmp/BACKUP_CLONING_`basename ${EXTRA_MOUNT_POINT} | 
+			tr '[a-z]' '[A-Z]'`_PARTITION"
+
+		fi
+
+		# Create the mount point for BACKUP_VAR_PART if it does not exist
+        	################################################################################
+        	[ ! -d ${BACKUP_EXTRA_MNT} ] && mkdir ${BACKUP_EXTRA_MNT}
+		
+	
+		# Confirm that the variable BACKUP_EXTRA_MOUNT_POINT is set properly
+		################################################################################
+		if [ `echo ${BACKUP_EXTRA_MOUNT_POINT} | egrep -c '^/tmp/BACKUP_[A-Z]'` -eq 0 ];then
+			
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_MOUNT_POINT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Set BACKUP_EXTRA_MOUNT_POINTS to all the standard backup mount 
+		# points of each BACKUP_EXTRA_MOUNT_POINT
+		################################################################################
+		if [ "${BACKUP_EXTRA_MOUNT_POINTS}" = "" ];then
+			BACKUP_EXTRA_MOUNT_POINTS=${BACKUP_EXTRA_MOUNT_POINT}
+		else
+			# Confirm $BACKUP_EXTRA_MOUNT_POINT is unique, that it is
+			# not already used in $BACKUP_EXTRA_MOUNT_POINTS
+			if [ `echo ${BACKUP_EXTRA_MOUNT_POINTS} | sed 's:|: :g' | 
+				grep -wc "${BACKUP_EXTRA_MOUNT_POINT}"` -eq 1 ];then
+
+				# Append _${LOOP} to $BACKUP_EXTRA_MOUNT_POINT until it is unique
+				while [ `echo ${BACKUP_EXTRA_MOUNT_POINTS} | sed 's:|: :g' |
+					grep -wc "${BACKUP_EXTRA_MOUNT_POINT}"` -eq 1 ]
+				do
+					BACKUP_EXTRA_MOUNT_POINT="${BACKUP_EXTRA_MOUNT_POINT}_${LOOP}"
+				done
+			fi
+
+			# Append $BACKUP_EXTRA_MOUNT_POINT to $BACKUP_EXTRA_MOUNT_POINTS
+			BACKUP_EXTRA_MOUNT_POINTS="${BACKUP_EXTRA_MOUNT_POINTS}|${BACKUP_EXTRA_MOUNT_POINT}"
+		fi
+
+		# Confirm that the variable BACKUP_EXTRA_MOUNT_POINTS is set 
+		################################################################################
+		if [ "${BACKUP_EXTRA_MOUNT_POINTS}" = "" ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_MOUNT_POINT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Determine if $BACKUP_EXTRA_PART is already mounted
+		################################################################################
+		if [ `grep -Pc "^${BACKUP_EXTRA_PART}\s" /etc/mtab` -eq 1 ];then
+
+			# Set CURRENT_BACKUP_EXTRA_MOUNT_POINT to the mount point used for $EXTRA_PART
+			################################################################################
+			CURRENT_BACKUP_EXTRA_MOUNT_POINT=""
+			CURRENT_BACKUP_EXTRA_MOUNT_POINT=`grep -P "^${BACKUP_EXTRA_PART}\s" \
+				/etc/mtab | awk '{print $2}'`
+	
+			# Confirm CURRENT_BACKUP_EXTRA_MOUNT_POINT is set properly
+			################################################################################
+			if [ "${CURRENT_BACKUP_EXTRA_MOUNT_POINT}" = "" -o \
+			`echo ${CURRENT_BACKUP_EXTRA_MOUNT_POINT} | grep -c '^/.'` -eq 0 ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"CURRENT_BACKUP_EXTRA_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+				if [ ${INTERACTIVE} = YES ];then 
+					echo -e ${MESSAGE} | tee -a ${LOG}
+				else
+					echo -e ${MESSAGE} >> ${LOG}
+					SEND_MAIL	
+				fi
+       				exit 1
+			fi
+
+			# Confirm the mount point is something this script uses, else do not umount
+			################################################################################
+			if [ `echo ${CURRENT_BACKUP_EXTRA_MOUNT_POINT} | 
+				egrep -c '^/tmp/BACKUP_[A-Z]'` -eq 1 ];then
+		
+				# Try to umount CURRENT_BACKUP_EXTRA_MOUNT_POINT
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Attempting to umount \"${CURRENT_BACKUP_EXTRA_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+				umount ${CURRENT_BACKUP_EXTRA_MOUNT_POINT} 2>/dev/null
+		
+				# Confirm BACKUP_EXTRA_MOUNT_POINT umounted
+				if [ `grep -Pc "^${BACKUP_EXTRA_PART}\s" /etc/mtab` -ne 0 ];then
+			
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The extra file system \"${BACKUP_EXTRA_MOUNT_POINT}\" failed to umount. Not Running ${PROG}, ${DATE_TIME}.\n"
+					if [ ${INTERACTIVE} = YES ];then 
+						echo -e ${MESSAGE} | tee -a ${LOG}
+					else
+						echo -e ${MESSAGE} >> ${LOG}
+						SEND_MAIL	
+					fi
+       					exit 1
+				fi
+			else
+				# Non standard ${BACKUP_EXTRA_MOUNT_POINT} mount point, not umounting ${BACKUP_EXTRA_PART}
+				################################################################################
+			
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The extra file system \"${BACKUP_EXTRA_PART}\" is mounted on \"${BACKUP_EXTRA_MOUNT_POINT}\", which was not assigned by ${PROG}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+				if [ ${INTERACTIVE} = YES ];then 
+					echo -e ${MESSAGE} | tee -a ${LOG}
+				else
+					echo -e ${MESSAGE} >> ${LOG}
+					SEND_MAIL	
+				fi
+       				exit 1
+			fi
+		fi
+	done
+fi
+
+# Clone ${SOURCE_BOOT_MNT} to ${BACKUP_BOOT_MNT}
+##########################################################################################
+##########################################################################################
+
+# Set EXT to the ext file system type being used
+##########################################################################################
+EXT=""
+EXT=`grep -P "^${SOURCE_BOOT_PART}\s" /etc/mtab | awk '{print $3}'`
+
+# Confirm $EXT  is set properly
+##########################################################################################
+if [ "${EXT}" = "" -o `echo ${EXT} | grep -c ext` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Create new file system on the BACKUP_BOOT_PART
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="\nRunning \"mkfs.${EXT} ${BACKUP_BOOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+mkfs.${EXT} ${BACKUP_BOOT_PART} 1>> ${LOG} 2>&1
+if [ $? != 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"mkfs.${EXT} ${BACKUP_BOOT_PART}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Label new file system on $BACKUP_BOOT_PART using $BACKUP_BOOT_LABEL
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Setting file system label to \"${BACKUP_BOOT_LABEL}\" on \"${BACKUP_BOOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Label Backup file system
+################################################################################
+e2label ${BACKUP_BOOT_PART} ${BACKUP_BOOT_LABEL} 1>> ${LOG} 2>&1
+
+# Confirm label was set properly
+################################################################################
+if [ "`e2label ${BACKUP_BOOT_PART}`" != ${BACKUP_BOOT_LABEL} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"e2label ${BACKUP_BOOT_PART} ${BACKUP_BOOT_LABEL}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Create the mount point ${BACKUP_BOOT_MNT} as needed
+################################################################################
+[ ! -d ${BACKUP_BOOT_MNT} ] && mkdir ${BACKUP_BOOT_MNT}
+
+# Mount ${BACKUP_BOOT_PART} on ${BACKUP_BOOT_MNT}
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Mounting \"${BACKUP_BOOT_PART}\" on \"${BACKUP_BOOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Mount ${BACKUP_BOOT_PART} on ${BACKUP_BOOT_MNT}
+################################################################################
+mount -t ${EXT} ${BACKUP_BOOT_PART} ${BACKUP_BOOT_MNT}
+
+# Pause 5 seconds to allow mount to complete
+################################################################################
+sleep 5
+
+# Make sure that the BACKUP_BOOT_PART is mounted
+#################################################################################
+if [ `grep -Pc "^${BACKUP_BOOT_PART}\s" /etc/mtab` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system did not mount properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Set SOURCE_BOOT_USED to the amount of used disk space in ${SOURCE_BOOT_MNT}
+################################################################################
+SOURCE_BOOT_USED=`df -k ${SOURCE_BOOT_MNT} | grep /dev | awk '{print $3}'`
+
+# Confirm $SOURCE_BOOT_USED is set properly
+##########################################################################################
+if [ "${SOURCE_BOOT_USED}" = "" -o `echo ${SOURCE_BOOT_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_BOOT_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Backup the /boot file system 
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Clonning \"${SOURCE_BOOT_PART}\" to \"${BACKUP_BOOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Clone ${SOURCE_BOOT_MNT} to ${BACKUP_BOOT_MNT} 
+################################################################################
+cd ${BACKUP_BOOT_MNT}
+
+# Start Clone
+################################################################################
+dump 0fb - 512 ${SOURCE_BOOT_PART} 2>> ${LOG} | restore rfby - 512 2>> ${LOG}
+
+# Remove restoresymtable file as needed
+###############################################################################
+if [ `ls ${BACKUP_BOOT_MNT} | wc -l` -eq 0 ];then
+
+	cd /
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Problem with \"${BACKUP_BOOT_MNT}\", on ${HOST}, requires fsck, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Attempting to umount \"${BACKUP_BOOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	umount ${BACKUP_BOOT_MNT} 2>> ${LOG}
+
+	# Confirm BACKUP_BOOT_PART umounted
+	if [ `grep -Pc "^${BACKUP_BOOT_PART}\s" /etc/mtab` -ne 0 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system failed to umount, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Running fsck on \"${BACKUP_BOOT_PART}\", on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	fsck -y ${BACKUP_BOOT_PART} 2>> ${LOG}
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Mounting \"${BACKUP_BOOT_PART}\" on \"${BACKUP_BOOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	mount ${BACKUP_BOOT_PART} ${BACKUP_BOOT_MNT} 2>> ${LOG}
+
+	# Confirm BACKUP_BOOT_PART mounted
+	if [ `grep -Pc "^${BACKUP_BOOT_PART}\s" /etc/mtab` -ne 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system failed to mount, ${DATE_TIME}\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	rm ${BACKUP_BOOT_MNT}/restoresymtable
+	STATUS=$?
+else
+	rm ${BACKUP_BOOT_MNT}/restoresymtable
+	STATUS=$?
+fi
+
+# Confirm exist status of dump|restore command is 0
+################################################################################
+if [ ${STATUS} != 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump ${SOURCE_BOOT_PART} | restore on the /boot file system did not complete succesfully. ${PROG} ended in error, ${DATE_TIME}.\n"
+
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Set BACKUP_BOOT_USED to the amount of used disk space in ${BACKUP_BOOT_MNT}
+###############################################################################
+BACKUP_BOOT_USED=`df -k ${BACKUP_BOOT_MNT} | grep /dev | awk '{print $3}'`
+
+# Confirm $BACKUP_BOOT_USED is set properly
+##########################################################################################
+if [ "${BACKUP_BOOT_USED}" = "" -o `echo ${BACKUP_BOOT_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_BOOT_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Set BACKUP_BOOT_USED_PLUS_TEN to $BACKUP_BOOT_USED plus 10%
+################################################################################
+BACKUP_BOOT_USED_PLUS_TEN=`echo "scale=2;$BACKUP_BOOT_USED*1.1" | bc | awk -F. '{print $1}'`
+
+# Set BACKUP_BOOT_USED_MINUS_TEN to $BACKUP_BOOT_USED minus 10%
+################################################################################
+BACKUP_BOOT_USED_MINUS_TEN=`echo "scale=2;$BACKUP_BOOT_USED*.9" | bc | awk -F. '{print $1}'`
+
+# Make sure that $BACKUP_BOOT_USED is within +- 10% of $SOURCE_BOOT_USED
+################################################################################
+if [ "${BACKUP_BOOT_USED_MINUS_TEN}" -gt "${SOURCE_BOOT_USED}" ] || 
+[ "${BACKUP_BOOT_USED_PLUS_TEN}" -lt "${SOURCE_BOOT_USED}" ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump | restore on the /boot file system did not complete succesfully. The size of ${BACKUP_BOOT_MNT} does not match ${SOURCE_BOOT_MNT}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Clone ${SOURCE_ROOT_MNT} to ${BACKUP_ROOT_MNT}
+##########################################################################################
+##########################################################################################
+
+# Set EXT to the ext file system type being used
+##########################################################################################
+EXT=""
+EXT=`grep -P "^${SOURCE_ROOT_PART}\s" /etc/mtab | awk '{print $3}'`
+
+# Confirm $EXT  is set properly
+##########################################################################################
+if [ "${EXT}" = "" -o `echo ${EXT} | grep -c ext` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Create new file system on the BACKUP_ROOT_PART
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="\nRunning \"mkfs.${EXT} ${BACKUP_ROOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+mkfs.${EXT} ${BACKUP_ROOT_PART} 1>> ${LOG} 2>&1
+if [ $? != 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"mkfs.${EXT} ${BACKUP_ROOT_PART}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Label new file system on $BACKUP_ROOT_PART using $BACKUP_ROOT_LABEL
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Setting file system label to \"${BACKUP_ROOT_LABEL}\" on \"${BACKUP_ROOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Label Backup file system
+################################################################################
+e2label ${BACKUP_ROOT_PART} ${BACKUP_ROOT_LABEL} 1>> ${LOG} 2>&1
+
+# Confirm label was set properly
+################################################################################
+if [ "`e2label ${BACKUP_ROOT_PART}`" != ${BACKUP_ROOT_LABEL} ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"e2label ${BACKUP_ROOT_PART} ${BACKUP_ROOT_LABEL}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Create the mount point ${BACKUP_ROOT_MNT} as needed
+################################################################################
+[ ! -d ${BACKUP_ROOT_MNT} ] && mkdir ${BACKUP_ROOT_MNT}
+
+# Mount ${BACKUP_ROOT_PART} on ${BACKUP_ROOT_MNT}
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Mounting \"${BACKUP_ROOT_PART}\" on \"${BACKUP_ROOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Mount ${BACKUP_ROOT_PART} on ${BACKUP_ROOT_MNT}
+################################################################################
+mount -t ${EXT} ${BACKUP_ROOT_PART} ${BACKUP_ROOT_MNT}
+
+# Pause 5 seconds to allow mount to complete
+################################################################################
+sleep 5
+
+# Make sure that the BACKUP_ROOT_PART is mounted
+#################################################################################
+if [ `grep -Pc "^${BACKUP_ROOT_PART}\s" /etc/mtab` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup root disk did not mount properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+        exit 1
+fi
+
+# Set SOURCE_ROOT_USED to the amount of used disk space in ${SOURCE_ROOT_MNT}
+################################################################################
+SOURCE_ROOT_USED=`df -k ${SOURCE_ROOT_MNT} | grep /dev | awk '{print $3}'`
+
+# Confirm $SOURCE_ROOT_USED is set properly
+##########################################################################################
+if [ "${SOURCE_ROOT_USED}" = "" -o `echo ${SOURCE_ROOT_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_ROOT_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Create backup of /etc/fstab if FORCE is set to NO
+################################################################################
+if [ ${FORCE} = NO ];then
+	cp /etc/fstab /etc/fstab.pre_clone 2>> ${LOG}
+
+	# Confirm that fstab.pre_clone exists and is greater than 0 sized
+	if [ ! -s /etc/fstab.pre_clone ];then
+		
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"/etc/fstab.pre_clone\" was not created succesfully on ${HOST}, ${DATE_TIME}\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+fi
+
+# Backup the root partition disk
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Clonning \"${SOURCE_ROOT_PART}\" to \"${BACKUP_ROOT_PART}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+
+# Clone ${SOURCE_ROOT_MNT} to ${BACKUP_ROOT_MNT} 
+################################################################################
+cd ${BACKUP_ROOT_MNT}
+
+# Start Clone
+################################################################################
+dump 0fb - 512 ${SOURCE_ROOT_PART} 2>> ${LOG} | restore rfby - 512 2>> ${LOG}
+
+
+# Remove restoresymtable file as needed
+###############################################################################
+if [ `ls ${BACKUP_ROOT_MNT} | wc -l` -eq 0 ];then
+
+	cd /
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Problem with \"${BACKUP_ROOT_MNT}\", on ${HOST}, requires fsck, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Attempting to umount \"${BACKUP_ROOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	umount ${BACKUP_ROOT_MNT} 2>> ${LOG}
+
+	# Confirm BACKUP_ROOT_PART umounted
+	if [ `grep -Pc "^${BACKUP_ROOT_PART}\s" /etc/mtab` -ne 0 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system failed to umount, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Running fsck on \"${BACKUP_ROOT_PART}\", on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	fsck -y ${BACKUP_ROOT_PART} 2>> ${LOG}
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Mounting \"${BACKUP_ROOT_PART}\" on \"${BACKUP_BOOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	mount ${BACKUP_ROOT_PART} ${BACKUP_ROOT_MNT} 2>> ${LOG}
+
+	# Confirm BACKUP_ROOT_PART mounted
+	if [ `grep -Pc "^${BACKUP_ROOT_PART}\s" /etc/mtab` -ne 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /boot file system failed to mount, ${DATE_TIME}\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	rm ${BACKUP_ROOT_MNT}/restoresymtable
+	STATUS=$?
+else
+	rm ${BACKUP_ROOT_MNT}/restoresymtable
+	STATUS=$?
+fi
+
+# Confirm exist status of dump|restore command is 0
+################################################################################
+if [ ${STATUS} != 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump ${SOURCE_ROOT_PART} | restore on the root file system did not complete succesfully. ${PROG} ended in error, ${DATE_TIME}.\n"
+
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+## Install grub boot block
+#################################################################################
+if [ ${FORCE} = YES ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nInstalling grub boot block on ${BACKUP_DISK} on ${HOST}, ${DATE_TIME}."
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	grub-install --recheck ${BACKUP_DISK} 1>> ${LOG} 2>&1
+fi
+
+# Set BACKUP_ROOT_USED to the amount of used disk space in ${BACKUP_ROOT_MNT}
+###############################################################################
+BACKUP_ROOT_USED=`df -k ${BACKUP_ROOT_MNT} | grep /dev | awk '{print $3}'`
+
+# Confirm $BACKUP_ROOT_USED is set properly
+##########################################################################################
+if [ "${BACKUP_ROOT_USED}" = "" -o `echo ${BACKUP_ROOT_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_ROOT_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+       	exit 1
+fi
+
+# Set BACKUP_ROOT_USED_PLUS_TEN to $BACKUP_ROOT_USED plus 10%
+################################################################################
+BACKUP_ROOT_USED_PLUS_TEN=`echo "scale=2;$BACKUP_ROOT_USED*1.1" | bc | awk -F. '{print $1}'`
+
+# Set BACKUP_ROOT_USED_MINUS_TEN to $BACKUP_ROOT_USED minus 10%
+################################################################################
+BACKUP_ROOT_USED_MINUS_TEN=`echo "scale=2;$BACKUP_ROOT_USED*.9" | bc | awk -F. '{print $1}'`
+
+# Make sure that $BACKUP_ROOT_USED is within +- 10% of $SOURCE_ROOT_USED
+################################################################################
+if [ "${BACKUP_ROOT_USED_MINUS_TEN}" -gt "${SOURCE_ROOT_USED}" ] || 
+[ "${BACKUP_ROOT_USED_PLUS_TEN}" -lt "${SOURCE_ROOT_USED}" ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump | restore on the root file system did not complete succesfully. The size of ${BACKUP_ROOT_MNT} does not match ${SOURCE_ROOT_MNT}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Clone ${SOURCE_VAR_MNT} to ${BACKUP_VAR_MNT}
+# if a /var partition exists
+################################################################################
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ];then
+
+	# Set EXT to the ext file system type being used
+	##########################################################################################
+	EXT=""
+	EXT=`grep -P "^${SOURCE_VAR_PART}\s" /etc/mtab | awk '{print $3}'`
+	
+	# Confirm $EXT  is set properly
+	##########################################################################################
+	if [ "${EXT}" = "" -o `echo ${EXT} | grep -c ext` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+
+	# Create new file system on the BACKUP_VAR_PART
+	################################################################################
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nRunning \"mkfs.${EXT} ${BACKUP_VAR_PART}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	
+	mkfs.${EXT} ${BACKUP_VAR_PART} 1>> ${LOG} 2>&1
+	if [ $? != 0 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The \"mkfs.${EXT} ${BACKUP_VAR_PART}\" command failed on the backup /var file system. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	fi
+
+	# Label new file system on $BACKUP_VAR_PART using $BACKUP_VAR_LABEL
+	################################################################################
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Setting file system label to \"${BACKUP_VAR_LABEL}\" on \"${BACKUP_VAR_PART}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	
+	# Label Backup file system
+	################################################################################
+	e2label ${BACKUP_VAR_PART} ${BACKUP_VAR_LABEL} 1>> ${LOG} 2>&1
+
+	# Confirm label was set properly
+	################################################################################
+	if [ "`e2label ${BACKUP_VAR_PART}`" != ${BACKUP_VAR_LABEL} ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"e2label ${BACKUP_VAR_PART} ${BACKUP_VAR_LABEL}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	fi
+	
+	# Create the mount point for BACKUP_VAR_PART if it does not exist
+	################################################################################
+	[ ! -d ${BACKUP_VAR_MNT} ] && mkdir ${BACKUP_VAR_MNT}
+	
+	# Mount ${BACKUP_VAR_PART} on ${BACKUP_VAR_MNT}
+	################################################################################
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Mounting \"${BACKUP_VAR_PART}\" on \"${BACKUP_VAR_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+
+	# Mount ${BACKUP_VAR_PART} on ${BACKUP_VAR_MNT}
+	#################################################################################
+	mount -t ${EXT} ${BACKUP_VAR_PART} ${BACKUP_VAR_MNT}
+	
+	# Pause 5 seconds to allow mount to complete
+	#################################################################################
+	sleep 5
+	
+	# Make sure that the BACKUP_VAR_PART is mounted
+	################################################################################
+	if [ `grep -Pc "^${BACKUP_VAR_PART}\s" /etc/mtab` -eq 0 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /var file system did not mount properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+        	exit 1
+	fi
+	
+	# Set SOURCE_VAR_USED to the amount of used disk space in ${SOURCE_VAR_MNT}
+	################################################################################
+	SOURCE_VAR_USED=`df -k ${SOURCE_VAR_MNT} | grep /dev | awk '{print $3}'`
+
+	# Confirm $SOURCE_VAR_USED is set properly
+	##########################################################################################
+	if [ "${SOURCE_VAR_USED}" = "" -o `echo ${SOURCE_VAR_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"SOURCE_VAR_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+	
+	# Backup the var partition disk
+	################################################################################
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Clonning \"${SOURCE_VAR_PART}\" to \"${BACKUP_VAR_PART}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	
+	# Clone ${SOURCE_VAR_MNT} to ${BACKUP_VAR_MNT} using snapshot ${SNAPSHOT}
+	################################################################################
+	cd ${BACKUP_VAR_MNT}
+
+	# Clone Disk
+	################################################################################
+	dump 0fb - 512 ${SOURCE_VAR_PART} 2>> ${LOG} | restore rfby - 512 2>> ${LOG}
+
+	# Remove restoresymtable file as needed
+	###############################################################################
+	if [ `ls ${BACKUP_VAR_MNT} | wc -l` -eq 0 ];then
+
+		cd /
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Problem with \"${BACKUP_VAR_MNT}\", on ${HOST}, requires fsck, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Attempting to umount \"${BACKUP_VAR_MNT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		umount ${BACKUP_VAR_MNT} 2>> ${LOG}
+	
+		# Confirm BACKUP_VAR_PART umounted
+		if [ `grep -Pc "^${BACKUP_VAR_PART}\s" /etc/mtab` -ne 0 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /var file system failed to umount, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Running fsck on \"${BACKUP_VAR_PART}\", on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		fsck -y ${BACKUP_VAR_PART} 2>> ${LOG}
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Mounting \"${BACKUP_VAR_PART}\" on \"${BACKUP_VAR_MNT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		mount ${BACKUP_VAR_PART} ${BACKUP_VAR_MNT} 2>> ${LOG}
+
+		# Confirm BACKUP_VAR_PART mounted
+		if [ `grep -Pc "^${BACKUP_VAR_PART}\s" /etc/mtab` -ne 1 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup /var file system failed to mount, ${DATE_TIME}\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		rm ${BACKUP_VAR_MNT}/restoresymtable
+		STATUS=$?
+	else
+		rm ${BACKUP_VAR_MNT}/restoresymtable
+		STATUS=$?
+	fi
+
+	# Confirm exist status of dump|restore command is 0
+	################################################################################
+	if [ ${STATUS} != 0 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump ${SOURCE_VAR_PART} | restore of the /var disk did not complete succesfully, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+	
+	# Set BACKUP_VAR_USED to the amount of used disk space in ${BACKUP_VAR_MNT}
+	################################################################################
+	BACKUP_VAR_USED=`df -k ${BACKUP_VAR_MNT} | grep /dev | awk '{print $3}'`
+
+	# Confirm $BACKUP_VAR_USED is set properly
+	##########################################################################################
+	if [ "${BACKUP_VAR_USED}" = "" -o `echo ${BACKUP_VAR_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_VAR_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+       		exit 1
+	fi
+	
+	# Set BACKUP_VAR_USED_PLUS_TEN to $BACKUP_VAR_USED plus 15%
+	################################################################################
+	BACKUP_VAR_USED_PLUS_TEN=`echo "scale=2;$BACKUP_VAR_USED*1.15" | bc | awk -F. '{print $1}'`
+	
+	# Set BACKUP_VAR_USED_MINUS_TEN to $BACKUP_VAR_USED minus 15%
+	################################################################################
+	BACKUP_VAR_USED_MINUS_TEN=`echo "scale=2;$BACKUP_VAR_USED*.85" | bc | awk -F. '{print $1}'`
+	
+	# Make sure that $BACKUP_VAR_USED is within +- 10% of $SOURCE_VAR_USED
+	################################################################################
+	if [ "${BACKUP_VAR_USED_MINUS_TEN}" -gt "${SOURCE_VAR_USED}" ] || 
+	[ "${BACKUP_VAR_USED_PLUS_TEN}" -lt "${SOURCE_VAR_USED}" ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump | restore on the /var file system did not complete succesfully. The size of ${BACKUP_VAR_MNT} does not match ${SOURCE_VAR_MNT}, ${DATE_TIME}\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+fi
+
+# Configure $BACKUP_SWAP_PART to support being used for swap
+##########################################################################################
+##########################################################################################
+if [ ${FORCE} = NO ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nConfiguring ${BACKUP_SWAP_PART} to support being used for swap on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+	echo -e ${MESSAGE} >> ${LOG}
+	mkswap -L ${BACKUP_SWAP_LABEL} ${BACKUP_SWAP_PART} 1>> ${LOG} 2>&1
+	STATUS=$?
+
+	# Confirm exist status of mkswap command is 0
+	################################################################################
+	if [ ${STATUS} != 0 ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The mkswap command used on \"${BACKUP_SWAP_PART}\" not complete succesfully, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+fi
+
+# Clone all of the ${EXTRA_MOUNT_POINTS} to all of the ${BACKUP_EXTRA_MOUNT_POINTS} as needed
+##########################################################################################
+##########################################################################################
+if [ "${EXTRA_PARTS}" != "" ];then
+
+	# Set LOOP to 1
+	LOOP=1
+
+	# Loop through each extra partition mount point set EXTRA_MOUNT_POINT
+	# EXTRA_PART_COUNT and EXTRA_PART_SLICE
+	################################################################################
+	for EXTRA_MOUNT_POINT in `echo ${EXTRA_MOUNT_POINTS} | sed 's:|: :g'`
+	do
+
+		# Set EXTRA_PART to the partition name used for clone $EXTRA_MOUNT_POINT
+		################################################################################
+		EXTRA_PART=""
+		EXTRA_PART=`echo ${EXTRA_PARTS} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+
+		# Confirm EXTRA_PART is set properly
+		################################################################################
+		if [ "${EXTRA_PART}" = "" -o `echo ${EXTRA_PART} | egrep -c '/dev/'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+
+       			exit 1
+		fi
+
+		# Set BACKUP_EXTRA_MOUNT_POINT to the mount point used for $EXTRA_PART
+		################################################################################
+		BACKUP_EXTRA_MOUNT_POINT=""
+		BACKUP_EXTRA_MOUNT_POINT=`echo ${BACKUP_EXTRA_MOUNT_POINTS} | sed 's:|: :g' | 
+			cut -d' ' -f ${LOOP}`
+
+		# Confirm BACKUP_EXTRA_MOUNT_POINT is set properly
+		################################################################################
+		if [ "${BACKUP_EXTRA_MOUNT_POINT}" = "" -o `echo ${BACKUP_EXTRA_MOUNT_POINT} | 
+			grep -c '^/.'` -eq 0 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_MOUNT_POINT\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+
+       			exit 1
+		fi
+
+		# Set BACKUP_EXTRA_PART to the partition name used for clone $EXTRA_MOUNT_POINT
+		################################################################################
+		BACKUP_EXTRA_PART=""
+		BACKUP_EXTRA_PART=`echo ${BACKUP_EXTRA_PARTS} | sed 's:|: :g' | cut -d' ' -f ${LOOP}`
+
+		# Confirm BACKUP_EXTRA_PART is set properly
+		################################################################################
+		if [ "${BACKUP_EXTRA_PART}" = "" -o `echo ${BACKUP_EXTRA_PART} | egrep -c '/dev/'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_PART\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+
+       			exit 1
+		fi
+
+		# Set BACKUP_EXTRA_LABEL to the label name name used for $BACKUP_EXTRA_PART
+		################################################################################
+		BACKUP_EXTRA_LABEL=""
+		BACKUP_EXTRA_LABEL=`echo ${BACKUP_EXTRA_LABELS} | sed 's:|: :g' | 
+			cut -d' ' -f ${LOOP}`
+
+		# Confirm BACKUP_EXTRA_LABEL is set properly
+		################################################################################
+		if [ ${FORCE} = NO ] && [ "${BACKUP_EXTRA_LABEL}" = "" -o `echo ${BACKUP_EXTRA_LABEL} | grep -c -- '-clone'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_LABEL\" not set properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+
+       			exit 1
+		fi
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+
+		# Set EXT to the ext file system type being used
+		##########################################################################################
+		EXT=""
+		EXT=`grep -P "^${EXTRA_PART}\s" /etc/mtab | awk '{print $3}'`
+
+		# Confirm $EXT  is set properly
+		##########################################################################################
+		if [ "${EXT}" = "" -o `echo ${EXT} | grep -c ext` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXT\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+
+		# Create new file system on the $BACKUP_EXTRA_PART
+		################################################################################
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nRunning \"mkfs.${EXT} ${BACKUP_EXTRA_PART}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		
+		mkfs.${EXT} ${BACKUP_EXTRA_PART} 1>> ${LOG} 2>&1
+		if [ $? != 0 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The newfs command on the backup partition \"${RAW_BACKUP_EXTRA_PART}\" failed. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+        		exit 1
+		fi
+
+		# Label new file system on $BACKUP_EXTRA_PART using $BACKUP_EXTRA_LABEL
+		################################################################################
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Setting file system label to \"${BACKUP_EXTRA_LABEL}\" on \"${BACKUP_EXTRA_PART}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		
+		# Label Backup file system
+		################################################################################
+		e2label ${BACKUP_EXTRA_PART} ${BACKUP_EXTRA_LABEL} 1>> ${LOG} 2>&1
+
+		# Confirm label was set properly
+		################################################################################
+		if [ "`e2label ${BACKUP_EXTRA_PART}`" != ${BACKUP_EXTRA_LABEL} ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The command \"e2label ${BACKUP_EXTRA_PART} ${BACKUP_EXTRA_LABEL}\" failed to complete. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+        		exit 1
+		fi
+		
+		# Create the mount point for BACKUP_EXTRA_MOUNT_POINT if it does not exist
+		################################################################################
+		[ ! -d ${BACKUP_EXTRA_MOUNT_POINT} ] && mkdir ${BACKUP_EXTRA_MOUNT_POINT}
+		
+		# Mount ${BACKUP_EXTRA_PART} on ${BACKUP_EXTRA_MOUNT_POINT}
+		################################################################################
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Mounting \"${BACKUP_EXTRA_PART}\" on \"${BACKUP_EXTRA_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		mount -t ${EXT} ${BACKUP_EXTRA_PART} ${BACKUP_EXTRA_MOUNT_POINT}
+	
+		# Pause 5 seconds to allow mount to complete
+		################################################################################
+		sleep 5
+		
+		# Make sure that the BACKUP_EXTRA_PART is mounted
+		################################################################################
+		if [ `grep -Pc "^${BACKUP_EXTRA_PART}\s" /etc/mtab` -eq 0 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The extra file system \"${BACKUP_EXTRA_PART}\" did not mount properly. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+        		exit 1
+		fi
+		
+		# Set EXTRA_PART_USED to the amount of used disk space in ${EXTRA_PART}
+		################################################################################
+		EXTRA_PART_USED=`df -k ${EXTRA_MOUNT_POINT} | grep /dev | awk '{print $3}'`
+
+		# Confirm $EXTRA_PART_USED is set properly
+		##########################################################################################
+		if [ "${EXTRA_PART_USED}" = "" -o `echo ${EXTRA_PART_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"EXTRA_PART_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+		
+		# Backup the extra partition 
+		################################################################################
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Clonning \"${EXTRA_PART}\" to \"${BACKUP_EXTRA_PART}\" on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+		echo -e ${MESSAGE} >> ${LOG}
+		
+		# Clone ${BACKUP_EXTRA_PART} to ${BACKUP_EXTRA_PART}
+		################################################################################
+		cd ${BACKUP_EXTRA_MOUNT_POINT}
+
+		# Clone Disk
+		dump 0fb - 512 ${EXTRA_PART} 2>> ${LOG} | restore rfby - 512 2>> ${LOG}
+
+		# Remove restoresymtable file as needed
+		###############################################################################
+		if [ `ls ${BACKUP_EXTRA_MOUNT_POINT} | wc -l` -eq 0 ];then
+
+			cd /
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Problem with \"${BACKUP_EXTRA_MOUNT_POINT}\", on ${HOST}, requires fsck, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+			echo -e ${MESSAGE} >> ${LOG}
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Attempting to umount \"${BACKUP_EXTRA_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+			echo -e ${MESSAGE} >> ${LOG}
+			umount ${BACKUP_EXTRA_MOUNT_POINT} 2>> ${LOG}
+		
+			# Confirm BACKUP_EXTRA_MOUNT_POINT umounted
+			if [ `grep -Pc "^${BACKUP_EXTRA_PART}}\s" /etc/mtab` -ne 0 ];then
+			
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup extra file system failed to umount, ${DATE_TIME}.\n"
+				if [ ${INTERACTIVE} = YES ];then 
+					echo -e ${MESSAGE} | tee -a ${LOG}
+				else
+					echo -e ${MESSAGE} >> ${LOG}
+					SEND_MAIL	
+				fi
+       				exit 1
+			fi
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Running fsck on \"${BACKUP_EXTRA_PART}\", on ${HOST}, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+			echo -e ${MESSAGE} >> ${LOG}
+			fsck -y ${BACKUP_EXTRA_PART} 2>> ${LOG}
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Mounting \"${BACKUP_EXTRA_PART}\" on \"${BACKUP_EXTRA_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+			echo -e ${MESSAGE} >> ${LOG}
+			mount ${BACKUP_EXTRA_PART} ${BACKUP_EXTRA_MOUNT_POINT} 2>> ${LOG}
+	
+			# Confirm BACKUP_EXTRA_MOUNT_POINT mounted
+			if [ `grep -Pc "^${BACKUP_EXTRA_PART}\s" /etc/mtab` -ne 1 ];then
+			
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The backup extra file system failed to mount, ${DATE_TIME}\n"
+				if [ ${INTERACTIVE} = YES ];then 
+					echo -e ${MESSAGE} | tee -a ${LOG}
+				else
+					echo -e ${MESSAGE} >> ${LOG}
+					SEND_MAIL	
+				fi
+       				exit 1
+			fi
+	
+			rm ${BACKUP_EXTRA_MOUNT_POINT}/restoresymtable
+			STATUS=$?
+		else
+			rm ${BACKUP_EXTRA_MOUNT_POINT}/restoresymtable
+			STATUS=$?
+		fi
+
+		# Confirm exist status of dump|restore command is 0
+		################################################################################
+		if [ ${STATUS} != 0 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump | restore of the file system \"${BACKUP_EXTRA_PART}\" disk did not complete succesfully, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+			exit 1
+		fi
+		
+		# Set BACKUP_EXTRA_PART_USED to the amount of used disk space in ${BACKUP_VAR_MNT}
+		################################################################################
+		BACKUP_EXTRA_PART_USED=`df -k ${BACKUP_EXTRA_MOUNT_POINT} | grep /dev | awk '{print $3}'`
+
+		# Confirm $BACKUP_EXTRA_PART_USED is set properly
+		##########################################################################################
+		if [ "${BACKUP_EXTRA_PART_USED}" = "" -o `echo ${BACKUP_EXTRA_PART_USED} | egrep -c '[0-9]+'` -eq 0 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BACKUP_EXTRA_PART_USED\" not set properly on ${HOST}.  Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+       			exit 1
+		fi
+		
+		# Set BACKUP_EXTRA_PART_USED_PLUS_TEN to $BACKUP_EXTRA_PART_USED plus 10%
+		################################################################################
+		BACKUP_EXTRA_PART_USED_PLUS_TEN=`echo "scale=2;$BACKUP_EXTRA_PART_USED*1.1" | bc | 
+			awk -F. '{print $1}'`
+		
+		# Set BACKUP_EXTRA_PART_USED_MINUS_TEN to $BACKUP_EXTRA_PART_USED minus 10%
+		################################################################################
+		BACKUP_EXTRA_PART_USED_MINUS_TEN=`echo "scale=2;$BACKUP_EXTRA_PART_USED*.9" | bc | 
+			awk -F. '{print $1}'`
+		
+		# Make sure that $BACKUP_EXTRA_PART_USED is within +- 10% of $EXTRA_PART_USED
+		################################################################################
+		if [ "${BACKUP_EXTRA_PART_USED_MINUS_TEN}" -gt "${EXTRA_PART_USED}" ] || 
+		[ "${BACKUP_EXTRA_PART_USED_PLUS_TEN}" -lt "${EXTRA_PART_USED}" ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The dump | restore on the extra file system \"${BACKUP_EXTRA_MOUNT_POINT}\" did not complete succesfully. The size of ${BACKUP_EXTRA_MOUNT_POINT} does not match ${EXTRA_MOUNT_POINT}, ${DATE_TIME}\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+			exit 1
+		fi
+	done
+fi
+
+# Confirm that ${BACKUP_ROOT_MNT}/etc/fstab exists
+################################################################################
+if [ ! -s ${BACKUP_ROOT_MNT}/etc/fstab -a ${FORCE} = NO ];then
+		
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"${BACKUP_ROOT_MNT}/etc/fstab\" does not exist or is zero sized on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+
+elif [ ! -s ${BACKUP_ROOT_MNT}/etc/fstab.pre_clone -a ${FORCE} = YES ];then
+		
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"${BACKUP_ROOT_MNT}/etc/fstab.pre_clone\" does not exist or is zero sized on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Change ${BACKUP_ROOT_MNT}/etc/fstab only if $FORCE is set to NO
+################################################################################
+if [ ${FORCE} = NO ];then
+
+# Rebuild ${BACKUP_ROOT_MNT}/etc/fstab using $BACKUP_SWAP_LABEL and only
+# add a single swap entry regardless of how many are in the original
+################################################################################
+
+# Make backup copy of ${BACKUP_ROOT_MNT}/etc/fstab
+cp ${BACKUP_ROOT_MNT}/etc/fstab ${BACKUP_ROOT_MNT}/etc/fstab.pre_swap_changes
+
+# Create ${BACKUP_ROOT_MNT}/etc/fstab.no_swap using original fstab file 
+# minus all of the existing swap partitions and or files
+################################################################################
+grep -Pv "\sswap\s" ${BACKUP_ROOT_MNT}/etc/fstab > ${BACKUP_ROOT_MNT}/etc/fstab.no_swap
+
+# Confirm that fstab.no_swap exists and is greater than 0 sized
+################################################################################
+if [ ! -s ${BACKUP_ROOT_MNT}/etc/fstab.no_swap ];then
+		
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"${BACKUP_ROOT_MNT}/etc/fstab.no_swap\" does not exist or is zero sized on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Remove original ${BACKUP_ROOT_MNT}/etc/fstab file
+rm -f ${BACKUP_ROOT_MNT}/etc/fstab
+
+# Rebuild backup fstab using fstab.no_swap by adding the new swap line
+# just afetr the "proc     /proc         proc" line in fstab.no_swap
+################################################################################
+cat ${BACKUP_ROOT_MNT}/etc/fstab.no_swap | while read LINE
+do
+	# When line containing proc is found, add new swap line
+	# RHEL
+	if [ `echo ${LINE} | grep -c '^proc'` -eq 1 ];then
+		echo ${LINE} >> ${BACKUP_ROOT_MNT}/etc/fstab
+		echo -e "LABEL=${BACKUP_SWAP_LABEL}\tswap\tswap\tdefaults 0 0" >> ${BACKUP_ROOT_MNT}/etc/fstab
+		echo "#" >> ${BACKUP_ROOT_MNT}/etc/fstab
+	# CentOS
+	elif [ `echo ${LINE} | grep '^none' | grep -c '/proc'` -eq 1 ];then
+		echo ${LINE} >> ${BACKUP_ROOT_MNT}/etc/fstab
+		echo -e "LABEL=${BACKUP_SWAP_LABEL}\tswap\tswap\tdefaults 0 0" >> ${BACKUP_ROOT_MNT}/etc/fstab
+	else
+		echo ${LINE} >> ${BACKUP_ROOT_MNT}/etc/fstab
+	fi
+done
+
+# Confirm that the new ${BACKUP_ROOT_MNT}/etc/fstab exists
+################################################################################
+if [ ! -s ${BACKUP_ROOT_MNT}/etc/fstab ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The new \"${BACKUP_ROOT_MNT}/etc/fstab\" file does not exist or is zero sized on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Confirm that the new ${BACKUP_ROOT_MNT}/etc/fstab has only the backup swap entry
+################################################################################
+if [ `grep -Pc '\sswap\s' ${BACKUP_ROOT_MNT}/etc/fstab` -ne 1 -o \
+	`grep -P '\sswap\s' ${BACKUP_ROOT_MNT}/etc/fstab | 
+	grep -c "^LABEL=${BACKUP_SWAP_LABEL}"` -ne 1 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The new \"${BACKUP_ROOT_MNT}/etc/fstab\" does not have the correct swap configuration on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Edit the fstab file on the BACKUP_DISK
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="\nEditing ${BACKUP_ROOT_MNT}/etc/fstab, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e ${MESSAGE}
+echo -e ${MESSAGE} >> ${LOG}
+sleep 1
+cd ${BACKUP_ROOT_MNT}/etc
+cp fstab fstab.pre_dump
+
+# Confirm that the new ${BACKUP_ROOT_MNT}/etc/fstab..pre_dump exists
+################################################################################
+if [ ! -s ${BACKUP_ROOT_MNT}/etc/fstab.pre_dump ];then
+			#
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"${BACKUP_ROOT_MNT}/etc/fstab.pre_dump\" does not exist or is zero sized on ${HOST}, ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# No /var partition and no extra ext partition(s)
+################################################################################
+if [ ${SOURCE_VAR_PART} = NONE -a "${BACKUP_EXTRA_LABELS}" = "" ];then
+
+	sed "s:LABEL=${SOURCE_BOOT_LABEL}\s:LABEL=${BACKUP_BOOT_LABEL} :; s:LABEL=${SOURCE_ROOT_LABEL}\s:LABEL=${BACKUP_ROOT_LABEL} :" < fstab.pre_dump > fstab
+
+# No /var partition and extra ext partition(s)
+#################################################################################
+elif [ ${SOURCE_VAR_PART} = NONE -a "${BACKUP_EXTRA_LABELS}" != "" ];then
+
+	sed "s:LABEL=${SOURCE_BOOT_LABEL}\s:LABEL=${BACKUP_BOOT_LABEL} :; s:LABEL=${SOURCE_ROOT_LABEL}\s:LABEL=${BACKUP_ROOT_LABEL} :; ${BACKUP_FSTAB_EXTRA_LABELS} " < fstab.pre_dump > fstab
+
+# With a /var partition and no extra ext partition(s)
+################################################################################
+elif [ ${SOURCE_VAR_PART} != NONE -a "${BACKUP_EXTRA_LABELS}" = "" ];then
+	sed "s:LABEL=${SOURCE_BOOT_LABEL}\s:LABEL=${BACKUP_BOOT_LABEL} :; s:LABEL=${SOURCE_ROOT_LABEL}\s:LABEL=${BACKUP_ROOT_LABEL} :; s:LABEL=${SOURCE_VAR_LABEL}\s:LABEL=${BACKUP_VAR_LABEL} :" < fstab.pre_dump > fstab
+
+# With a /var partition and extra ext partition(s)
+#################################################################################
+elif [ ${SOURCE_VAR_PART} != NONE -a "${BACKUP_EXTRA_LABELS}" != "" ];then
+	sed "s:LABEL=${SOURCE_BOOT_LABEL}\s:LABEL=${BACKUP_BOOT_LABEL} :; s:LABEL=${SOURCE_ROOT_LABEL}\s:LABEL=${BACKUP_ROOT_LABEL} :; s:LABEL=${SOURCE_VAR_LABEL}\s:LABEL=${BACKUP_VAR_LABEL} :; ${BACKUP_FSTAB_EXTRA_LABELS}" < fstab.pre_dump > fstab
+
+fi
+
+# Make sure the ${BACKUP_ROOT_MNT}/etc/fstab was updated for /boot
+#################################################################################
+if [ `grep -Pc "^LABEL=${BACKUP_BOOT_LABEL}\s" ${BACKUP_ROOT_MNT}/etc/fstab` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The ${BACKUP_ROOT_MNT}/etc/fstab file was not properly edited for the backup root partition.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure the ${BACKUP_ROOT_MNT}/etc/fstab was updated for root (/)
+#################################################################################
+if [ `grep -Pc "^LABEL=${BACKUP_ROOT_LABEL}\s" ${BACKUP_ROOT_MNT}/etc/fstab` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The ${BACKUP_ROOT_MNT}/etc/fstab file was not properly edited for the backup root partition.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure the ${BACKUP_ROOT_MNT}/etc/fstab was updated for /var
+################################################################################
+if [ ${SOURCE_VAR_PART} != NONE ] && [ `grep -Pc "^LABEL=${BACKUP_VAR_LABEL}\s" ${BACKUP_ROOT_MNT}/etc/fstab` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The ${BACKUP_ROOT_MNT}/etc/fstab file was not properly edited for the backup /var partition.\n" 
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Make sure the LABEL for each $BACKUP_EXTRA_PART was updated 
+# in ${BACKUP_ROOT_MNT}/etc/fstab as needed
+################################################################################
+if [ "${BACKUP_EXTRA_LABELS}" != "" ];then
+
+	# Check each $BACKUP_EXTRA_LABEL separately
+	for BACKUP_EXTRA_LABEL in `echo ${BACKUP_EXTRA_LABELS} | sed 's:|: :g'`
+	do
+		if [ `grep -Pc "^LABEL=${BACKUP_EXTRA_LABEL}\s" ${BACKUP_ROOT_MNT}/etc/fstab` -eq 0 \
+			-a "${BACKUP_EXTRA_LABEL}" != /x/apps-clone ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The ${BACKUP_ROOT_MNT}/etc/fstab file was not properly edited for the backup /EXTRA partition.\n" 
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+			exit 1
+		fi
+	done
+fi
+
+# Set BOOT_LINE to the number assigned to default
+################################################################################
+if [ ${OS_TYPE} = REDHAT ];then
+	BOOT_LINE=`egrep '^default=[0-9]' ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} |
+	awk -F= '{print $2}'`
+else
+	BOOT_LINE=`egrep '^default [0-9]' ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} |
+	awk '{print $2}'`
+fi
+
+# Confirm $BOOT_LINE is set and set properly
+################################################################################
+if [ "${BOOT_LINE}" = "" -o `echo ${BOOT_LINE} | egrep -c '[^0-9]'` -eq 1 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BOOT_LINE\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Increment $BOOT_LINE by 1
+################################################################################
+let BOOT_LINE=${BOOT_LINE}+1
+
+# Set KERNEL_LINE to the "kernel /vmlinuz-2.6.xxxx" line used to
+# support the primary boot entry, but with LABEL set $BACKUP_ROOT_LABEL
+################################################################################
+KERNEL_LINE=`grep -P '^\s+kernel' ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} | head -${BOOT_LINE} |
+	tail -1 | sed "s:LABEL=${SOURCE_ROOT_LABEL}\s:LABEL=${BACKUP_ROOT_LABEL} :"`
+
+# Confirm $KERNEL_LINE is set properly
+################################################################################
+if [ "${KERNEL_LINE}" = "" -o `echo ${KERNEL_LINE} | grep -c -- '-clone'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"KERNEL_LINE\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Set INITRD_LINE to the "initrd /initrd-2.6..xxxx" line 
+# used to support the primary boot entry
+################################################################################
+INITRD_LINE=`grep -P '^\s+initrd' ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} | 
+	head -${BOOT_LINE} | tail -1`
+
+# Confirm $INITRD_LINE is set properly
+################################################################################
+if [ "${INITRD_LINE}" = "" -o `echo ${INITRD_LINE} | grep -c 'initrd'` -eq 0 ];then
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"INITRD_LINE\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e ${MESSAGE} | tee -a ${LOG}
+	else
+		echo -e ${MESSAGE} >> ${LOG}
+		SEND_MAIL	
+	fi
+	exit 1
+fi
+
+# Add "Clone boot disk" to /boot/grub/${GRUB_FILE}
+# an ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} as needed
+################################################################################
+if [ `grep -c "title Clone boot disk" ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}` -eq 0 ];then
+
+	# Make backup copy of /boot/grub/${GRUB_FILE}
+	cp /boot/grub/${GRUB_FILE} /boot/grub/${GRUB_FILE}.pre_clone 2>> ${LOG}
+	cp ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone 2>> ${LOG}
+
+	# Add additional lines to ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE}
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nAdding additional lines to ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE} to support booting from clone disk on ${HOST}, ${DATE_TIME}\n"
+	[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+	echo -e "${MESSAGE}" >> ${LOG}
+
+	# Update primary boot file system
+	echo "title Clone boot disk" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	if [ ${OS_TYPE} = REDHAT ];then
+		echo -e "\troot (hd1,0)" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	else
+		echo "    root (hd1,0)" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	fi
+	echo "${KERNEL_LINE}" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	echo "${INITRD_LINE}" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+
+	# Update backup boot file system
+	echo "title Clone boot disk" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	if [ ${OS_TYPE} = REDHAT ];then
+		echo -e "\troot (hd1,0)" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	else
+		echo "    root (hd1,0)" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	fi
+	echo "${KERNEL_LINE}" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	echo "${INITRD_LINE}" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+
+# Confirm the clone disk lines have the correct kernel version, update as needed
+################################################################################
+elif [ `grep -c "${KERNEL_LINE}" ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}` -eq 0 \
+	-o `grep -P '\sinitrd\s' ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} | grep -v '^#' |
+		tail -1 | grep -c "${INITRD_LINE}"` -eq 0 ];then
+
+	# Make backup copy of /boot/grub/${GRUB_FILE}
+	################################################################################
+	cp /boot/grub/${GRUB_FILE} /boot/grub/${GRUB_FILE}.pre_clone 2>> ${LOG}
+	cp ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone 2>> ${LOG}
+
+	# Set CLONE_DISK_NUM to the line containing "title Clone boot disk"
+	################################################################################
+	CLONE_DISK_NUM=`grep -n "title Clone boot disk" /boot/grub/${GRUB_FILE} | 
+		awk -F: '{print $1}'`
+
+	# Confirm $CLONE_DISK_NUM is set properly
+	################################################################################
+	if [ "${CLONE_DISK_NUM}" = "" -o `echo ${CLONE_DISK_NUM} | egrep -c '[^0-9]'` -eq 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"CLONE_DISK_NUM\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+
+	# Set BOOT_DISK_LAST_NUM to $CLONE_DISK_NUM minus 1
+	################################################################################
+	let BOOT_DISK_LAST_NUM=${CLONE_DISK_NUM}-1
+
+	# Confirm $BOOT_DISK_LAST_NUM is set properly
+	################################################################################
+	if [ "${BOOT_DISK_LAST_NUM}" = "" -o `echo ${BOOT_DISK_LAST_NUM} | egrep -c '[^0-9]'` -eq 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"BOOT_DISK_LAST_NUM\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+
+	# Set CLONE_DISK_LAST_NUM to $CLONE_DISK_NUM plus 3
+	################################################################################
+	let CLONE_DISK_LAST_NUM=${CLONE_DISK_NUM}+3
+
+	# Confirm $CLONE_DISK_LAST_NUM is set properly
+	################################################################################
+	if [ "${CLONE_DISK_LAST_NUM}" = "" -o `echo ${CLONE_DISK_LAST_NUM} | egrep -c '[^0-9]'` -eq 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"CLONE_DISK_LAST_NUM\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+
+	# Set GRUB_TOTAL_LINES to the total lines in /boot/grub/${GRUB_FILE}
+	################################################################################
+	GRUB_TOTAL_LINES=`wc -l < /boot/grub/${GRUB_FILE}`
+
+	# Confirm $GRUB_TOTAL_LINES is set properly
+	################################################################################
+	if [ "${GRUB_TOTAL_LINES}" = "" -o `echo ${GRUB_TOTAL_LINES} | egrep -c '[^0-9]'` -eq 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"GRUB_TOTAL_LINES\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		exit 1
+	fi
+
+	# Rebuild ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE} minus
+	# the "title Clone boot disk" line and the next 3 lines
+	################################################################################
+	sed -n "1,${BOOT_DISK_LAST_NUM}"p /boot/grub/${GRUB_FILE}.pre_clone > /boot/grub/${GRUB_FILE}
+	sed -n "1,${BOOT_DISK_LAST_NUM}"p ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone > ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}
+
+	# If there are lines that come after ${CLONE_DISK_LAST_NUM}, add them to 
+	# ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE}
+	################################################################################
+	if [ ${GRUB_TOTAL_LINES} -gt ${CLONE_DISK_LAST_NUM} ];then
+
+		# Add 1 to $CLONE_DISK_LAST_NUM
+		################################################################################
+		let CLONE_DISK_LAST_NUM=${CLONE_DISK_LAST_NUM}+1
+
+		# Confirm $CLONE_DISK_LAST_NUM is set properly
+		################################################################################
+		if [ "${CLONE_DISK_LAST_NUM}" = "" -o `echo ${CLONE_DISK_LAST_NUM} | egrep -c '[^0-9]'` -eq 1 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required variable \"CLONE_DISK_LAST_NUM\" not set or not set propelry. Not Running ${PROG}, ${DATE_TIME}.\n"
+			if [ ${INTERACTIVE} = YES ];then 
+				echo -e ${MESSAGE} | tee -a ${LOG}
+			else
+				echo -e ${MESSAGE} >> ${LOG}
+				SEND_MAIL	
+			fi
+			exit 1
+		fi
+
+		sed -n "${CLONE_DISK_LAST_NUM},$"p /boot/grub/${GRUB_FILE}.pre_clone > /boot/grub/${GRUB_FILE}
+		sed -n "${CLONE_DISK_LAST_NUM},$"p ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone > ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}
+	fi
+
+	# Confirm /boot/grub/${GRUB_FILE} and ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} were created
+	################################################################################
+	if [ ! -s /boot/grub/${GRUB_FILE} ];then
+		
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"/boot/grub/${GRUB_FILE}\" was not created propelry. Installing /boot/grub/${GRUB_FILE}.pre_clone as /boot/grub/${GRUB_FILE}. Unable to boot to clone disk, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		cp /boot/grub/${GRUB_FILE}.pre_clone /boot/grub/${GRUB_FILE}
+		exit 1
+	fi
+	if [ ! -s ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} ];then
+		
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. The required file \"${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}\" was not created propelry. Installing ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone as ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}. Unable to boot to clone disk, ${DATE_TIME}.\n"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e ${MESSAGE} | tee -a ${LOG}
+		else
+			echo -e ${MESSAGE} >> ${LOG}
+			SEND_MAIL	
+		fi
+		cp ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}.pre_clone ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}
+		exit 1
+	fi
+
+	# Add additional lines to ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE}
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nAdding updated additional lines to ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE} to support booting from clone disk on ${HOST}, ${DATE_TIME}\n"
+	[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+	echo -e "${MESSAGE}" >> ${LOG}
+
+	# Update primary boot file system
+	echo "title Clone boot disk" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	if [ ${OS_TYPE} = REDHAT ];then
+		echo -e "\troot (hd1,0)" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	else
+		echo "    root (hd1,0)" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	fi
+	echo "${KERNEL_LINE}" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+	echo "${INITRD_LINE}" >> /boot/grub/${GRUB_FILE} 2>> ${LOG}
+
+	# Update backup boot file system
+	echo "title Clone boot disk" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	if [ ${OS_TYPE} = REDHAT ];then
+		echo -e "\troot (hd1,0)" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	else
+		echo "    root (hd1,0)" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	fi
+	echo "${KERNEL_LINE}" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+	echo "${INITRD_LINE}" >> ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} 2>> ${LOG}
+else
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nAdditional clone disk lines already added to ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE} and /boot/grub/${GRUB_FILE} on ${HOST}, ${DATE_TIME}\n"
+	[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+	echo -e "${MESSAGE}" >> ${LOG}
+fi
+
+else
+	# $FORCE = YES
+
+	# Copy ${BACKUP_ROOT_MNT}/etc/fstab.pre_clone to ${BACKUP_ROOT_MNT}/etc/fstab
+	cp ${BACKUP_ROOT_MNT}/etc/fstab.pre_clone ${BACKUP_ROOT_MNT}/etc/fstab 2>> ${LOG}
+	if [ $? != 0 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nProblem with ${PROG}, running on ${HOST}. Copying  \"${BACKUP_ROOT_MNT}/etc/fstab.pre_clone\" to \"${BACKUP_ROOT_MNT}/etc/fstab\" failed on ${HOST}. Unable to update the files \"${BACKUP_ROOT_MNT}/etc/fstab\" and ${BACKUP_BOOT_MNT}/grub/${GRUB_FILE}, ${DATE_TIME}.\n"
+		[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+fi
+
+# Umount all BACKUP file systems
+################################################################################
+cd /
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="\nAttempting to umount \"${BACKUP_BOOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+echo -e "${MESSAGE}" >> ${LOG}
+umount ${BACKUP_BOOT_MNT} 2>> ${LOG}
+
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="Attempting to umount \"${BACKUP_ROOT_MNT}\" on ${HOST}, ${DATE_TIME}"
+[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+echo -e "${MESSAGE}" >> ${LOG}
+umount ${BACKUP_ROOT_MNT} 2>> ${LOG}
+
+if [ "${BACKUP_VAR_MNT}" != "" ];then 
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Attempting to umount \"${BACKUP_VAR_MNT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+	echo -e "${MESSAGE}" >> ${LOG}
+	umount ${BACKUP_VAR_MNT} 2>> ${LOG}
+fi
+
+for BACKUP_EXTRA_MOUNT_POINT in `echo ${BACKUP_EXTRA_MOUNT_POINTS} | sed 's:|: :g'`
+do
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="Attempting to umount \"${BACKUP_EXTRA_MOUNT_POINT}\" on ${HOST}, ${DATE_TIME}"
+	[ ${INTERACTIVE} = YES ] && echo -e "${MESSAGE}"
+	echo -e "${MESSAGE}" >> ${LOG}
+	umount ${BACKUP_EXTRA_MOUNT_POINT} 2>> ${LOG}
+done
+
+# Send dump_disks complete email
+################################################################################
+DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+MESSAGE="\n${PROG} completed succesfully on ${HOST}, ${DATE_TIME}\n"
+if [ ${INTERACTIVE} = YES ];then 
+	echo -e "${MESSAGE}" | tee -a ${LOG}
+else
+	echo -e "${MESSAGE}" >> ${LOG}
+	SUBJECT="${PROG} completed on ${HOST}, ${DATE_TIME}"
+	SEND_MAIL	
+fi
+exit 0
