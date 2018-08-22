@@ -1,0 +1,480 @@
+#!/bin/bash
+# maintain_centos_repos
+# Purpose: This scripts job is to maintain the multiple CentOS repositories.
+
+HOST=`uname -n`
+PROG=`basename $0`
+LOG=/var/log/${PROG}.log
+#EMAIL_LIST=jsswift
+EMAIL_LIST=linux_admin@pwrutc.com
+CREATEREPO=/usr/bin/createrepo
+REPO_PARENT_DIR=/export/data/rpm_updates/centos
+#export RSYNC_PROXY=proxyva.utc.com:8080
+#export RSYNC_PROXY=pwrproxy-cpc-in.pwrutc.com:8080
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+# Written By: Jon Swift 07/10
+# 11-18-14, Added -d option to createrepo command
+# 04-25-16, Updated to support the epel repo
+# 08-12-16, Updated to support EL7
+
+# Determine if this script is being run interactively
+#########################################################################
+tty -s
+if [ $? = 0 ];then
+	INTERACTIVE=YES
+else
+	INTERACTIVE=NO
+fi
+
+# Confirm this script is run as root
+#########################################################################
+if [ `whoami` != root ];then
+	echo -e "\nError: ${PROG} must be run as root\n"
+	exit
+fi
+
+# Confirm the $CREATEREPO command is installed
+#########################################################################
+if [ ! -x ${CREATEREPO} ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: The required command \"${CREATEREPO}\" no installed on ${HOST}\n"
+	else
+		echo -e "\nError: The required command \"${CREATEREPO}\" no installed on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm that the required repo directory exists, and is not part of /
+#########################################################################
+if [ ! -d ${REPO_PARENT_DIR} ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: The required repository directory \"${REPO_PARENT_DIR}\" does exist on ${HOST}\n"
+	else
+		echo -e "\nError: The required repository directory \"${REPO_PARENT_DIR}\" does exist on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+elif [ `df -k ${REPO_PARENT_DIR} | grep /dev | awk '{print $NF}'` = / ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: The directory \"${REPO_PARENT_DIR}\" is part of /, must be in a different file system\n"
+	else
+		echo -e "\nError: The directory \"${REPO_PARENT_DIR}\" is part of /, must be in a different file system\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# The USAGE function is used to display usage options
+#########################################################################
+USAGE () {
+	[ ${INTERACTIVE} = NO ] && exit
+
+	echo -e "\n\n${PROG} Usage:\n"
+	echo -e "\t\t**********************"
+	echo -e "\t\t* Function Arguments *"
+	echo -e "\t\t**********************\n"
+	echo -e " -D\tDownload latest CentOS updates to the local repoistory."
+	echo -e " -E\tDownload latest EPEL updates to the local repoistory."
+	echo -e " -U\tUpdate local repoistory repodata files."
+	echo -e " -C\tClone local CentOS repoistory."
+	echo -e " -R\tRemove local CentOS repoistory.\n"
+	echo -e "\t\t***************************"
+	echo -e "\t\t* Clarification Arguments *"
+	echo -e "\t\t***************************\n"
+	echo -e " -d\tDefines function applies to \"development\" repository."
+	echo -e " -p\tDefines function applies to \"production\" repository."
+	echo -e " -v #\tDefines the CentOS EL version (5, 6, 7).\n\n"
+	echo -e " Example: Download latest CentOS updates to the production EL5 respository."
+	echo -e "\t${PROG} -D -p -v 5\n"
+	echo -e " Example: Download latest CentOS 7 updates to the development EL7"
+	echo " respository, and update the local EL7 development repodata files."
+	echo -e "\t${PROG} -Dd -U -v 7\n"
+	echo -e " Example: Clone the local EL5 development repo to the local EL5 production repo."
+	echo -e "\t${PROG} -Cdv5\n"
+	echo -e " Required: One \"Function Argument\" is always needed."
+	echo -e " Note: The -C and -R arguments can only be used by themselves.\n"
+	echo -e " Required: Either the -d or -p argument is always needed."
+	echo -e " Note: The -d and -p arguments are mutually exclusive.\n"
+	echo -e " Required: The -v \"Ver. #\" argument is always needed."
+	echo -e " Note: Current valid version numbers are 5, 6 and 7.\n"
+	echo -e " Note: -D & -E are mutally exclusive.\n\n"
+	exit
+}
+
+# Confirm syntax is correct
+#########################################################################
+[ $# -eq 0 ] && USAGE
+
+# Set OPTERR to 0, turns off getops error reporting
+OPTERR=0
+
+# Pre Set several variables
+DOWNLOAD=""
+EPEL=""
+UPDATE=""
+CLONE=""
+REMOVE=""
+PRO_DEV=""
+VER=""
+
+# Parse command line options
+#########################################################################
+while getopts "DEUCRdpv:" OPT
+do
+	case ${OPT} in
+
+		D) # Download latest CentOS updates to the local repoistory
+		DOWNLOAD=YES
+		
+		# Confirm that only $DOWNLOAD and or $UPDATE are set
+		if [ "${CLONE}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		E) # Download latest EPEL updates to the local repoistory
+		EPEL=YES
+		
+		# Confirm that only $DOWNLOAD and or $UPDATE are set
+		if [ "${CLONE}" != "" -o "${REMOVE}" != "" -o "${DOWNLOAD}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		DOWNLOAD=YES
+		;;
+
+		U) # Update local repoistory repodata files
+		UPDATE=YES
+		
+		# Confirm that only $UPDATE and or $DOWNLOAD are set
+		if [ "${CLONE}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		C) # Clone local repository
+		CLONE=YES
+		
+		# Confirm that only $CLONE is set
+		if [ "${UPDATE}" != "" -o "${DOWNLOAD}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		R) # Remove local repository
+		REMOVE=YES
+		
+		# Confirm that only $REMOVE is set
+		if [ "${UPDATE}" != "" -o "${CLONE}" != "" -o "${DOWNLOAD}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		d) # Defines that udates apply to "development" repository
+		# Confirm that $PRO_DEV is not already set
+		if [ "${PRO_DEV}" = "" ];then
+			PRO_DEV=dev
+		else
+			USAGE
+		fi
+		;;
+
+		p) # Defines that udates apply to "production" repository
+		# Confirm that $PRO_DEV is not already set
+		if [ "${PRO_DEV}" = "" ];then
+			PRO_DEV=pro
+		else
+			USAGE
+		fi
+		;;
+
+		v) # Defines the CentOS version to update
+		VER=${OPTARG}
+		
+		# Confirm $VER is set to a 5, 6 or 7
+		if [ "${VER}" != 5 -a "${VER}" != 6 -a "${VER}" != 7 ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		*) # Error
+		if [ ${INTERACTIVE} = YES ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		else
+			exit
+		fi
+		;;
+	esac
+done
+
+# Confirm that $PRO_DEV is set
+#########################################################################
+if [ "${PRO_DEV}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Confirm that $VER is set
+#########################################################################
+if [ "${VER}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Confirm that $DOWNLOAD and or $UPDATE are set
+#########################################################################
+if [ "${DOWNLOAD}" = "" -a "${EPEL}" = "" -a "${UPDATE}" = "" -a "${CLONE}" = "" -a "${REMOVE}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Set REPO based on $VER and $PRO_DEV
+#########################################################################
+REPO=${REPO_PARENT_DIR}/${PRO_DEV}/${VER}
+
+# Set CLONE_TARGET_REPO
+#########################################################################
+if [ ${PRO_DEV} = pro ];then
+	CLONE_TARGET_REPO=${REPO_PARENT_DIR}/dev/${VER}
+else
+	CLONE_TARGET_REPO=${REPO_PARENT_DIR}/pro/${VER}
+fi
+
+# Set RSYNC_URL based on $VER
+#########################################################################
+if [ ${VER} = 5 -a "${EPEL}" != YES ];then
+	#RSYNC_URL="rsync://mirrors.usc.edu/centos/5.11/"
+	#RSYNC_URL="rsync://mirrors.usc.edu/centos/5.11/"
+	RSYNC_URL="rsync://linux.mirrors.es.net/centos/5.11/"
+elif [ ${VER} = 6 -a "${EPEL}" != YES ];then
+	#RSYNC_URL="rsync://mirrors.usc.edu/centos/6.9/"
+	RSYNC_URL="rsync://linux.mirrors.es.net/centos/6.9/"
+elif [ ${VER} = 7 -a "${EPEL}" != YES ];then
+	RSYNC_URL="rsync://linux.mirrors.es.net/centos/7.2.1511/"
+elif [ ${VER} = 5 -a "${EPEL}" = YES ];then
+	RSYNC_URL="rsync://linux.mirrors.es.net/fedora-epel/5/x86_64"
+	REPO=${REPO}/epel
+elif [ ${VER} = 6 -a "${EPEL}" = YES ];then
+	RSYNC_URL="rsync://linux.mirrors.es.net/fedora-epel/6/x86_64"
+	REPO=${REPO}/epel
+elif [ ${VER} = 7 -a "${EPEL}" = YES ];then
+	RSYNC_URL="rsync://linux.mirrors.es.net/fedora-epel/7/x86_64"
+	REPO=${REPO}/epel
+fi
+
+#  The CONFIRM function is used to interactively confirm the clonning/removal operations
+#########################################################################
+CONFIRM () {
+	# set -x
+
+	# Comfirm operation
+	ANSWER=""
+	echo -e "\n\t*********************"
+	echo -e "\t* Confirm Operation *"
+	echo -e "\t*********************\n"
+	until [ -n "${ANSWER}" ]
+	do
+		if [ "${CLONE}" = YES ];then
+
+			echo -n " Clone \"${REPO}\" to \"${CLONE_TARGET_REPO}\" Y/N > "
+		else
+			echo -n " Remove \"${REPO}\" Y/N > "
+		fi
+		read ANSWER
+
+		case ${ANSWER} in
+
+			"") # Do Nothing
+			echo ""
+			;;
+
+			q|Q|N|n|NO|no|No)  # No
+			ANSWER=NO
+			exit
+			;;
+
+			Y|y|YES|yes|Yes) # Yes
+			ANSWER=YES
+			;;
+
+			*) # Invalid Answer
+			echo -e "\n Invalid selection ${ANSWER}\n"
+			ANSWER=""
+			sleep 2
+			;;
+		esac
+	done
+}
+
+# Download the latest updates from the external CentOS mirror site using rsync as needed
+#########################################################################
+if [ "${DOWNLOAD}" = YES -a "${EPEL}" != YES ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nStarting rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+
+	# Download repo data from external CentOS repository using rsync
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		rsync -avrt --delete --verbose --progress --exclude addons --exclude apt \
+		--exclude build --exclude contrib --exclude csgfs --exclude docs --exclude epel \
+		--exclude fastrack --exclude isos --exclude testing ${RSYNC_URL} ${REPO} 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		rsync -avrt --delete --exclude addons --exclude apt --exclude build \
+		--exclude contrib --exclude csgfs --exclude docs --exclude fastrack --exclude epel \
+		--exclude isos --exclude testing ${RSYNC_URL} ${REPO} 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+
+elif [ "${DOWNLOAD}" = YES -a "${EPEL}" = YES ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nStarting rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+
+	# Download repo data from external CentOS repository using rsync
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		rsync -avrt --delete --exclude centosplus --exclude cloud --exclude cr --exclude extras \
+		--exclude fasttrack --exclude os --exclude SCL --exclude sclo --exclude storage \
+		--exclude updates --exclude virt --exclude xen4 ${RSYNC_URL} ${REPO} 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		rsync -avrt --delete --exclude centosplus --exclude cloud --exclude cr --exclude extras \
+		--exclude fasttrack --exclude os --exclude SCL --exclude sclo --exclude storage \
+		--exclude updates --exclude virt --exclude xen4 ${RSYNC_URL} ${REPO} 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted rsync from ${RSYNC_URL} to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+fi
+
+# Update the local repoistory repodata files as needed
+#########################################################################
+if [ "${UPDATE}" = YES ];then
+
+	# Define CREATEREPO based on the existance of ${REPO}/repodata/
+	if [ -d ${REPO}/repodata ];then
+		CREATEREPO="createrepo --update -d ${REPO}"
+	else
+		CREATEREPO="createrepo -d ${REPO}"
+	fi
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nStarting repotdata update of ${REPO} on ${HOST} at ${DATE_TIME}\n"
+
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		${CREATEREPO} 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted repodata update of ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		${CREATEREPO} 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nCompleted repodata update of ${REPO} on ${HOST} at ${DATE_TIME}\n"
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+
+# Clone local repoistory files as needed
+#########################################################################
+elif [ "${CLONE}" = YES ];then
+
+	# Clonning local repository only supported in interactive mode
+	[ ${INTERACTIVE} = NO ] && exit
+
+	# Confirm clonning operation
+	CONFIRM
+
+	# Create $CLONE_TARGET_REPO as needed
+	[ ! -d ${CLONE_TARGET_REPO} ] && mkdir -p ${CLONE_TARGET_REPO}
+
+	#  Report activity
+	echo -e "\n Clonning \"${REPO}\" to \"${CLONE_TARGET_REPO}\"\n"
+
+	# rsync $REPO to $CLONE_TARGET_REPO
+	rsync -a --progress --delete ${REPO}/ ${CLONE_TARGET_REPO}
+
+# Remove local repoistory repodata files as needed
+#########################################################################
+elif [ "${REMOVE}" = YES ];then
+
+	# Removing local repository only supported in interactive mode
+	[ ${INTERACTIVE} = NO ] && exit
+
+	# Confirm removal operation
+	CONFIRM
+
+	#  Report activity
+	echo -e "\n Removing ${REPO}\n"
+
+	# Remove $REPO
+	rm -f ${REPO}
+
+	# Create new ${REPO} directory
+	mkdir -p ${REPO}
+fi

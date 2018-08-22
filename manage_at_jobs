@@ -1,0 +1,362 @@
+#!/bin/bash
+# manage_at_jobs
+# This scripts job is create, remove and check the "at" jobs for ufsdumps/dumps 
+# & update_patch script scheduled to run on this system.
+
+# Written By: Jon Swift 04/07
+# Updated 04/15 to support being used by update_linux script too
+# Updated 07/15, Changed at job submital to redirect at job output to /dev/null
+
+HOST=`uname -n`
+PROG=`basename $0`
+OS=`uname -s`
+ERROR_EMAIL_LIST=ufsdump_team@pwrutc.com
+EMAIL_LIST=jsswift
+ACTION=$1
+INTERACTIVE=$2
+SCRIPT=$3
+START_TIME=$4
+TODAY=`date '+%a'`
+YEAR=`date '+%Y'`
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/ucb:/usr/local/bin
+
+# Make sure this script is run only on SunOS or Linux
+if [ ${OS} = SunOS ];then
+        MAIL=mailx
+        DNS=/usr/sbin/nslookup
+	LOG=/var/adm/${PROG}.log
+	AT_DIR=/var/spool/cron/atjobs
+        LOCAL_LOG=/var/adm/${PROG}.${YEAR}.log
+
+elif [ ${OS} = Linux ];then
+        MAIL=mail
+        DNS=host
+	LOG=/var/log/${PROG}.log
+	AT_DIR=/var/spool/at
+        LOCAL_LOG=/var/log/${PROG}.${YEAR}.log
+
+elif [ ${OS} = AIX ];then
+        MAIL=mail
+        DNS=host
+	LOG=/var/adm/${PROG}.log
+	AT_DIR=/var/spool/cron/atjobs
+        LOCAL_LOG=/var/adm/${PROG}.${YEAR}.log
+
+else
+        echo ""
+   	echo "${PROG} Error: ${PROG} not supported on ${OS}"
+        exit
+fi
+
+# Confirm this script is run as root
+if [ `whoami` != root ];then
+        echo ""
+        echo "${PROG} Error: ${PROG} Must be run as root"
+    	exit
+fi
+
+# The function ASK_REMOVE is used to ask "Would you like to remove the existing job before adding the new job"
+ASK_REMOVE () {
+
+	ANSWER=""
+	until [ "${ANSWER}" != "" ]
+	do
+		echo -n "Remove \"at\" job ${AT_JOB}, Y/N > "
+		read ANSWER
+
+		case ${ANSWER} in
+
+        		"") # Do Nothing
+        		;;
+	
+        		N|n|NO|no|No)  # No
+        		ANSWER=NO
+       			echo ""
+        		;;
+	
+   			Y|y|YES|yes|Yes) # Yes
+        		ANSWER=YES
+      			;;
+	
+        		q|Q) # Exit Now
+        		ANSWER=NO
+       			echo ""
+			exit
+			;;
+	
+			*) # Invalid Answer
+        		echo ""
+        		echo " Invalid selection ${ANSWER}"
+        		echo ""
+        		ANSWER=""
+    			sleep 1
+        		;;
+		esac
+	done
+}
+
+# Confirm that $ACTION is set
+if [ "${ACTION}" = "" ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable ACTION not set, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+
+elif [ "${ACTION}" != ADD -a "${ACTION}" != REMOVE ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable ACTION not set properly, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+fi
+
+# Confirm that $INTERACTIVE is set
+if [ "${INTERACTIVE}" = "" ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable INTERACTIVE not set, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+
+# Confirm that $INTERACTIVE is set properly
+elif [ "${INTERACTIVE}" != YES -a "${INTERACTIVE}" != NO ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable INTERACTIVE not set properly, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+fi
+
+# Confirm that $SCRIPT is set
+if [ "${SCRIPT}" = "" ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable SCRIPT not set, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+
+# Confirm that $SCRIPT exists
+elif [ ! -f "${SCRIPT}" ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The SCRIPT ${SCRIPT} does not exist, unable to manage at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+else
+
+	# Set CHECK_SCRIPT_NAME to ${SCRIPT} minus the path name
+	CHECK_SCRIPT_NAME=`basename "${SCRIPT}"`
+fi
+
+# Confirm that $START_TIME is set
+if [ "${START_TIME}" = "" -a ${ACTION} = ADD ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable START_TIME not set, unable to create at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+
+# Confirm that $START_TIME is set properly
+elif [ `echo ${START_TIME} | egrep -c '[0-9][0-9]:[0-9][0-9]'` -eq 0 -a ${ACTION} = ADD ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="${DATE_TIME} ${PROG} Error:  The variable START_TIME not set properly, unable to create at job"
+	
+      	# Display error message to interactive users
+       	[ "${INTERACTIVE}" = YES ] && echo ""
+       	[ "${INTERACTIVE}" = YES ] && echo "${ERROR_MESSAGE}"
+	
+       	# Log Error message
+       	echo "${ERROR_MESSAGE}" >> ${LOG}
+
+       	# Send Email
+       	echo "${ERROR_MESSAGE}" |
+       	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+    	exit
+fi
+
+# If the ACTION is set to ADD create new at job to run ${SCRIPT}
+if [ ${ACTION} = ADD ];then
+
+	# Confirm first that there are not already any "at" scheduled 
+	if [ ${OS} = SunOS -a "${INTERACTIVE}" = YES ];then
+
+		# Look through all at jobs
+		for AT_JOB in `at -l | awk '{print $4}'`
+		do 
+			# Look for at job used to tun $CHECK_SCRIPT_NAME
+			if [ `grep -c ${CHECK_SCRIPT_NAME} ${AT_DIR}/${AT_JOB}` -ge 1 ];then
+
+				echo ""
+				echo "Note: There is already an \"at\" job sheduled to run ${CHECK_SCRIPT_NAME} on \"${HOST}\" today."
+				echo "Would you like to remove this existing \"at\" job beforing scheduling a new one?"
+				ANSWER=""
+				ASK_REMOVE
+				[ ${ANSWER} = YES ] && at -r ${AT_JOB}
+			fi
+		done
+	
+	# Confirm first that there are not already any "at" scheduled 
+	elif [ ${OS} = Linux -a "${INTERACTIVE}" = YES ];then
+	
+		# Look through all at jobs
+		for AT_JOB in `at -l | awk '{print $1}'`
+		do 
+			# Look for at job used to tun $CHECK_SCRIPT_NAME
+			if [ `at -c ${AT_JOB} | grep -c ${CHECK_SCRIPT_NAME}` -ge 1 ];then
+
+				echo ""
+				echo "Note: There is already an \"at\" job sheduled to run ${CHECK_SCRIPT_NAME} on \"${HOST}\" today."
+				echo "Would you like to remove this existing \"at\" job beforing scheduling a new one?"
+				ANSWER=""
+				ASK_REMOVE
+				[ ${ANSWER} = YES ] && atrm ${AT_JOB}
+			fi
+		done
+	fi
+
+	[ "${INTERACTIVE}" = YES ] && echo ""
+	[ "${INTERACTIVE}" = YES ] && echo "Scheduling \"at\" job to run ${CHECK_SCRIPT_NAME} on \"${HOST}\" today ${TODAY}, at ${START_TIME}" 
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Scheduling \"at\" job to run ${CHECK_SCRIPT_NAME} on \"${HOST}\" today ${TODAY}, at ${START_TIME} ${DATE_TIME}" >> ${LOG}
+	echo "Scheduling \"at\" job to run ${CHECK_SCRIPT_NAME} on \"${HOST}\" today ${TODAY}, at ${START_TIME} ${DATE_TIME}" >> ${LOCAL_LOG}
+
+	# Create at job based on $OS
+	if [ ${OS} = SunOS ];then
+	
+		# Create at job
+		sleep 1
+		at -s -f ${SCRIPT} ${START_TIME} >/dev/null 2>&1
+	else
+	
+		# Create at job
+		sleep 1
+		at -f ${SCRIPT} ${START_TIME} >/dev/null 2>&1
+	fi
+	[ "${INTERACTIVE}" = YES ] && echo ""
+
+# If the ACTION is set to REMOVE delete old at jobs configured run ${SCRIPT}
+else	# ${ACTION} = REMOVE
+
+	# Remove at jobs must be done interactively
+	if [ ${OS} = SunOS -a "${INTERACTIVE}" = YES ];then
+		if [ `at -l | wc -l` -eq 0 ];then
+			echo ""
+			echo "No existing \"at\" jobs configured to run ${CHECK_SCRIPT_NAME} scheduled for today on \"${HOST}\"."
+		else
+			# Look through all at jobs
+			for AT_JOB in `at -l | awk '{print $4}'`
+			do 
+				# Look for at job used to tun $CHECK_SCRIPT_NAME
+				if [ `grep -c ${CHECK_SCRIPT_NAME} ${AT_DIR}/${AT_JOB}` -ge 1 ];then
+	
+					# Ask user if they want to delet this at job
+					ANSWER=""
+					echo ""
+					echo "Would you like to remove this existing \"at\" job on \"${HOST}\"?"
+					ASK_REMOVE
+					[ ${ANSWER} = YES ] && at -r ${AT_JOB}
+				else
+					echo ""
+					echo "No existing \"at\" jobs configured to run ${CHECK_SCRIPT_NAME} scheduled for today on \"${HOST}\"."
+				fi
+			done
+		fi
+	
+	# Remove at jobs must be done interactively
+	elif [ ${OS} = Linux -a "${INTERACTIVE}" = YES ];then
+		if [ `at -l | wc -l` -eq 0 ];then
+			echo ""
+			echo "No existing \"at\" jobs configured to run ${CHECK_SCRIPT_NAME} scheduled for today on \"${HOST}\"."
+		else
+			# Look through all at jobs
+			for AT_JOB in `at -l | awk '{print $1}'`
+			do 
+				# Look for at job used to tun $CHECK_SCRIPT_NAME
+				if [ `at -c ${AT_JOB} | grep -c ${CHECK_SCRIPT_NAME}` -ge 1 ];then
+
+					# Ask user if they want to delet this at job
+					ANSWER=""
+					echo ""
+					echo "Would you like to remove this existing \"at\" job on \"${HOST}\"?"
+					ASK_REMOVE
+					[ ${ANSWER} = YES ] && atrm ${AT_JOB}
+				else
+					echo ""
+					echo "No existing \"at\" jobs configured to run ${CHECK_SCRIPT_NAME} scheduled for today on \"${HOST}\"."
+				fi
+			done
+		fi
+	fi
+fi

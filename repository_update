@@ -1,0 +1,146 @@
+#!/bin/bash
+# repository_update
+# Purpose: This scripts is aw wrapper for the maintain_redhat_repos
+# and maintain_centos_repos script. It sets the correct options to
+# each script based on the system it is being run from.
+
+# Written By: Jon Swift 06/04/15
+# Updated 04-16-16, Added support for the EL6 epel repository
+# Updated 06-27-16, Changed UPDATE_HOSTS
+# Updated 06-12-16, Added support for CentOS EL7
+
+HOST=`hostname -s`
+PROG=`basename $0`
+LOG=/tmp/${PROG}.log
+TODAY=`date '+%a'`
+SCHEDULED_DAY=Mon
+ERROR_EMAIL_LIST="jon.swift@rocket.com"
+let FIRST_WEEKDAY="7-`cal -m | grep -w 1 | wc -w`"
+LAST_DAY=`cal | grep . | tail -1 | awk '{print $NF}'`
+UPDATE_HOSTS="arlaplnfs03 arlaplnfs04 pwrlmail pwr-nfs-01"
+DATE=`date '+%d' | sed 's/^0//'`
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+tty -s
+if [ $? = 0 ];then
+        INTERACTIVE=YES
+else
+        INTERACTIVE=NO
+fi
+
+# Confirm this script is run as root
+if [ `whoami` != root ];then
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e "\nError: ${PROG} must be run as root\n"
+	else
+		echo -e "\nError: ${PROG} must be run as root\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm this script is being run only on 1 of the $UPDATE_HOSTS
+if [ `echo ${UPDATE_HOSTS} | grep -wc ${HOST}` -eq 0 ];then
+	if [ ${INTERACTIVE} = YES ];then 
+		echo -e "\nError: ${PROG} may not be run on ${HOST}\n"
+	else
+		echo -e "\nError: ${PROG} may not be run on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Set REDHAT_CENTOS to REDAHT or CENTOS based on OS type
+if [ `grep -c CentOS /etc/redhat-release` -eq 1 ];then
+	REDHAT_CENTOS=CENTOS
+else
+	REDHAT_CENTOS=REDHAT
+fi
+
+# Set EL to the EL version number
+if [ `grep -c 'release 5' /etc/redhat-release` -eq 1 ];then
+	EL=5
+elif [ `grep -c 'release 6' /etc/redhat-release` -eq 1 ];then
+	EL=6
+elif [ `grep -c 'release 7' /etc/redhat-release` -eq 1 ];then
+	EL=7
+fi
+
+# Confirm $EL is set
+if [ "${EL}" = "" ];then
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: The required variable EL, not set on ${HOST}"
+
+	# Display error message to interactive users
+	sleep 1
+	if [ ${INTERACTIVE} = YES ];then  
+		echo ""
+		echo "${ERROR_MESSAGE}"
+	else
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+	fi
+
+	# Send Email
+	echo "${ERROR_MESSAGE}" |
+	${MAIL} -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+
+	exit
+fi
+
+# Update Local patch repository
+DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+if [ ${REDHAT_CENTOS} = REDHAT ];then
+	if [ ${INTERACTIVE} = YES ];then 
+		echo "Starting RedHat pro ${EL} repo update ${DATE_TIME}" | tee -a ${LOG}
+		/usr/local/bin/maintain_redhat_repos -DUpv ${EL} 2>&1 | tee -a ${LOG}
+	else
+		echo -e "\nStarting RedHat pro ${EL} repo update ${DATE_TIME}" >> ${LOG}
+		/usr/local/bin/maintain_redhat_repos -UDpv ${EL} 1>> ${LOG} 2>&1
+	fi
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	echo "Completed RedHat pro ${EL} repo update ${DATE_TIME}" >> ${LOG}
+else
+	if [ ${INTERACTIVE} = YES ];then  	
+		echo "Starting CentOS pro 5 repo update ${DATE_TIME}" | tee -a ${LOG}
+ 		/usr/local/bin/maintain_centos_repos -UDpv 5 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS pro 5 repo update ${DATE_TIME}" | tee -a ${LOG}
+
+		sleep 2
+
+		echo "Starting CentOS 6 pro repo update ${DATE_TIME}" | tee -a ${LOG}
+		/usr/local/bin/maintain_centos_repos -UDpv 6 2>&1 | tee -a ${LOG}
+		/usr/local/bin/maintain_centos_repos -UEpv 6 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS 6 pro repo update ${DATE_TIME}" | tee -a ${LOG}
+
+		sleep 2
+
+		echo "Starting CentOS 7 pro repo update ${DATE_TIME}" | tee -a ${LOG}
+		/usr/local/bin/maintain_centos_repos -UDpv 7 2>&1 | tee -a ${LOG}
+		/usr/local/bin/maintain_centos_repos -UEpv 7 2>&1 | tee -a ${LOG}
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS 7 pro repo update ${DATE_TIME}" | tee -a ${LOG}
+	else
+		echo -e "\nStarting CentOS pro 5 repo update ${DATE_TIME}" >> ${LOG}
+ 		/usr/local/bin/maintain_centos_repos -UDpv 5 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS pro 5 repo update ${DATE_TIME}" >> ${LOG}
+
+		sleep 2
+
+		echo -e "\nStarting CentOS 6 pro repo update ${DATE_TIME}"  >> ${LOG}
+		/usr/local/bin/maintain_centos_repos -UDpv 6 1>> ${LOG} 2>&1
+		echo -e "\nStarting CentOS  epel 6 pro repo update ${DATE_TIME}"  >> ${LOG}
+		/usr/local/bin/maintain_centos_repos -EUDpv 6 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS 6 pro repo update ${DATE_TIME}"  >> ${LOG}
+
+		sleep 2
+
+		echo -e "\nStarting CentOS 7 pro repo update ${DATE_TIME}"  >> ${LOG}
+		/usr/local/bin/maintain_centos_repos -UDpv 7 1>> ${LOG} 2>&1
+		echo -e "\nStarting CentOS  epel 7 pro repo update ${DATE_TIME}"  >> ${LOG}
+		/usr/local/bin/maintain_centos_repos -EUDpv 7 1>> ${LOG} 2>&1
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		echo "Completed CentOS 7 pro repo update ${DATE_TIME}"  >> ${LOG}
+	fi
+fi

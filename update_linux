@@ -1,0 +1,2396 @@
+#!/bin/bash
+# update_linux patch_linux
+# Purpose: This scripts job is to both update the system to the lastest EL version
+# of the same type available. And to correct most issues caused by the update. It
+# is not going to try and correct problems with applications, only OS issues. It
+# also can be used to check and or just updates predefined list of custom OS files.
+
+# Written By: Jon Swift 07/10
+# 01/11, Added additional logic to manage turning certain services off & on durring and upgrade
+# 04/11, Aded additional logic to wait 5 minutes to allow update to total complete before
+#	RESTORE function starts in UPDATE section
+# 05/13/11, Added support for RHEL6
+# 06/11, Added logic to run the script /stds/admin/bin/manage_plugins which
+#       will update java and flash as needed
+# 08/11, Added logic to disable the virbr0 Virtual network on EL6 after upgrade as needed
+# 11/11, Added trap logic to restart any stopped services when "Ctrl C" is used to stop script
+# 12/11, Added logic to collect the services being used (services that are on)  before the 
+#	upgrade, then confirm no changes were made to the list of services by the upgrade.
+# 05/01/12, Added support for CentOS 6
+# 06/04/13, Added logic to rebuild sendmail.cf as needed
+# 01/14/14, Updated RedHat logic to use a local respository rather than a Channel
+# 04/03/14, Add extra PERMS
+# 09/22/14, Updated for RedHat systems only to rename /etc/sysconfig/rhn/up2date prior
+#	to starting patching and put it back after patching. Required to prevent external RedHat
+#	repository from being visable durring patching.
+# 09/29/14, Removed EL3 sections, added logic to RedHat sections to rename repo files to repo.off
+# 10/08/14, Added logic to provide default dev yum.conf file for each OS
+# 01/27/15, Added logic to rename the file /lib/udev/write_net_rules to /lib/udev/write_net_rules.off on EL6
+# 03/18/15, Added usr/local/nagios to the EXCLUDE_FILES variable, and set SERVICES to a null
+# 09/16/15, Added lustre.conf.eth & lustre.conf.ib to the EXCLUDE_FILES variable
+# 09/16/15, Removed logic from CentOS RENAME_UP2DATE & REPLACE_UP2DATE functions
+# 08/12/16, Updated Special EXCLUDE_FILES section
+# 02/10/17, Updated to support changed required by RedHat subscription-manager
+
+HOST=`uname -n`
+PROG=`basename $0`
+LOG=/var/log/update_linux.log
+TEST_RPM=redhat-logos
+EMAIL_LIST=linux_admin@pwrutc.com
+#EMAIL_LIST=jsswift
+ARCH=`uname -m`
+ROLLBACK_DIR=/var/spool/repackage
+RPM_DATE=`date '+%a %d %b %Y'`
+eval `date '+DATE=%m%d%y DAY=%d MONTH=%m HOUR=%H MIN=%M SEC=%S'`
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+KERNEL_CHECKS=/stds/admin/bin/kernel_update_checks
+MANAGE_PLUGINS=/stds/admin/bin/manage_plugins
+SET_DEV_AR_YUM_CONF=NO
+AR_YUM_CONF=/etc/yum.conf.ar
+DEV_PRO=PRO
+UP2DATE=/etc/sysconfig/rhn/up2date
+AR_REPO_DIR=/etc/yum.repos-ar.d
+
+# Set EXCLUDE_FILES to the list of files to be excluded from being updates on all systems
+EXCLUDE_FILES="var/log/|root/|usr/local/bin/|/usr/lib/firefox|/usr/lib/mozilla|/var/spool/cron/|/usr/local/etc/|etc/rc.d/rc3.d|etc/rc.d/rc5.d|.*\.orig|etc/inittab|kernel/drivers|etc/rc.d/rc.local|hosts.equiv|.junk|tmp/|usr/share/man|etc/dhcpd.conf|ocfs2|dell/oldiags|o2cb|limits.conf.dev|access.conf.dev|grub.conf|Navisphere|boot/initrd|network-scripts/ifcfg-eth|release.redhat|/etc/sysconfig/rhn/systemid|/etc/mail/sendmail.cf|/etc/syslog.conf|/etc/rsyslog.conf|usr/local/nagios|opt/nagios|usr/share/cups/model/ps|snmpd.conf|yum.conf|lustre.conf.eth|lustre.conf.ib"
+
+# Set SERVICES to the indivual service names that should managed, 
+# turned off & on durring an upgrade
+SERVICES="nfs|smb|named|sendmail"
+SERVICES=""
+
+# Determine if this script is being run interactively
+#########################################################################
+tty -s
+if [ $? = 0 -o `echo $@ | grep -- 'i' | wc -l` -eq 1 ];then
+	INTERACTIVE=YES
+
+	# Pre Set PRE_CONFIRM to NO
+	PRE_CONFIRM=NO
+else	
+	INTERACTIVE=NO
+
+	# Pre Set PRE_CONFIRM to YES
+	PRE_CONFIRM=YES
+fi
+
+# Confirm this script is run only as root
+#########################################################################
+if [ `whoami` != root ];then
+	[ ${INTERACTIVE} = YES ] && echo -e "\nError: ${PROG} must be run as root\n"
+	exit
+fi
+
+# Set REDHAT_RELEASE to the redhat-release file name to be used
+#########################################################################
+if [ -f /etc/redhat-release.${PROG}.orig ];then
+	REDHAT_RELEASE=/etc/redhat-release.${PROG}.orig
+
+elif [ -f /etc/redhat-release ];then
+	REDHAT_RELEASE=/etc/redhat-release
+else
+	# Error
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: ${PROG} only supported on RedHat and CentOS Linux systems with a properly configured /etc/redhat-release file, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Special EXCLUDE_FILES section
+#########################################################################
+if [ `echo ${HOST} | egrep -c 'node[1-5]00[1,2]'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|etc/ssh/ssh_known_hosts"
+
+elif [ `echo ${HOST} | egrep -c 'node[3-6][1-6][0-9][0-9]'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|etc/rc.d/init.d/swatch|access.conf|limits.conf|AR-CentOS.repo"
+
+elif [ `echo ${HOST} | grep -c '^emv'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|texlive|emvtest|emvdev"
+	PRUNE_EXCLUDE="usr/local/texlive"
+
+elif [ `echo ${HOST} | egrep -c '^lpc0|^cfd0|^stress'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|swatch|/local/apps|AR-CentOS.repo"
+
+elif [ `echo ${HOST} | grep -c '^arlaplnfs'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|/etc/cluster/fstab"
+
+elif [ `echo ${HOST} | grep -c '^oidsvr'` -eq 1 ];then
+	PRUNE_EXCLUDE="local/home/oracle"
+
+elif [ `ypcat -k netgroup | grep devel_hosts | grep -c ${HOST}` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|limits.conf|access.conf"
+fi
+
+if [ `chkconfig --list ypserv 2>/dev/null | grep -c on` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|etc/yp.conf"
+fi
+
+if [ `powermt version 2>/dev/null | grep -c 'Version 5'` -eq 1 ];then
+	EXCLUDE_FILES="${EXCLUDE_FILES}|etc/profile"
+fi
+
+# Define KICK_HOST as needed for compute cluster hosts
+#########################################################################
+if [ `echo ${HOST} | grep -c 'node1[1-5]..'` -eq 1 ];then
+	KICK_HOST=hurricane
+elif [ `echo ${HOST} | grep -c 'node4[1-4]..'` -eq 1 ];then
+	KICK_HOST=twister
+elif [ `echo ${HOST} | grep -c 'node[5,6][1-5]..'` -eq 1 ];then
+	KICK_HOST=vortex
+else
+	KICK_HOST=${HOST}
+fi
+
+# Set OS_TYPE to either REDHAT or CENTOS based on OS type
+#########################################################################
+OS_TYPE=""
+if [ `rpm -q ${TEST_RPM} | wc -l` -ge 1 ];then
+	if [ `rpm -q ${TEST_RPM} | grep -ic centos` -eq 0 ];then
+		OS_TYPE=REDHAT
+		YUM_DIR=/data/redhat_repo/pro
+	elif [ `rpm -q ${TEST_RPM} | grep -ic centos` -ge 1 ];then
+		OS_TYPE=CENTOS
+		YUM_DIR=/data/centos_repo/pro
+	else
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: ${PROG} only supported on RedHat and CentOS, ${HOST} ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+else
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: the required RPM, \"${TEST_RPM}\" not installed on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Confirm OS_TYPE is set
+#########################################################################
+if [ "${OS_TYPE}" = "" ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The required variable \"OS_TYPE\" not set on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Set CURRENT_VERSION to the Major EL version, 3, 4, 5
+#########################################################################
+CURRENT_VERSION=""
+if [ `grep -c 'release 3' ${REDHAT_RELEASE}` -eq 1 ];then
+	CURRENT_VERSION=3
+elif [ `grep -c 'release 4' ${REDHAT_RELEASE}` -eq 1 ];then
+	CURRENT_VERSION=4
+elif [ `grep -c 'release 5' ${REDHAT_RELEASE}` -eq 1 ];then
+	CURRENT_VERSION=5
+elif [ `grep -c 'release 6' ${REDHAT_RELEASE}` -eq 1 ];then
+	CURRENT_VERSION=6
+else
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: ${PROG} only supported on EL 3, 4, 5 and 6 on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Confirm CURRENT_VERSION is set
+#########################################################################
+if [ "${CURRENT_VERSION}" = "" ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The required variable \"CURRENT_VERSION\" not set on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# The SET_KICK_DIR function is used to determine if there is defined custom kickstart
+# directory for this system
+#########################################################################
+SET_KICK_DIR () {
+	#set -x
+
+	# EL5 and above Section
+	if [ ${CURRENT_VERSION} -ge 5 ];then
+
+		# Determine if there is secondary data to install/configure for ${HOST}
+		if [ -d ${KICK_BASE}/${KICK_HOST} -o -h ${KICK_BASE}/${KICK_HOST} ];then
+	
+        		# Set KICK_DIR to the directory name containing the custom data for ${HOST}
+        		KICK_DIRS="${KICK_BASE}/${KICK_HOST}/ROOT ${KICK_BASE}/ROOT"
+		else
+		
+    			# Set HOST_DIGITS to the total number of digits in $HOST minus 1
+    			let HOST_DIGITS="`echo ${KICK_HOST} | wc -c`-2"
+		
+        		# Removing 1 digit at a time looking for custom secondary
+        		# data directory to install/configure for ${HOST}
+        		while [ ${HOST_DIGITS} -ge 3 ]
+        		do
+		
+                		# Set CUSTOM_HOST to $HOST mninus $HOST_DIGITS
+              			CUSTOM_HOST=`echo ${KICK_HOST} | cut -c1-${HOST_DIGITS}`
+		
+                		# Determine if ${KICK_BASE}/${CUSTOM_HOST} exists
+                		if [ -d ${KICK_BASE}/${CUSTOM_HOST} -o -h ${KICK_BASE}/${CUSTOM_HOST} ];then
+		
+                        		# Set KICK_DIR to the directory name containing the 
+					# custom secondary data for $HOST
+                        		KICK_DIR=${KICK_BASE}/${CUSTOM_HOST}
+		
+                    			# exit this loop
+                        		break
+                		else
+                   			# Decrement HOST_DIGITS by 1
+                        		let HOST_DIGITS=${HOST_DIGITS}-1
+                		fi
+        		done
+		
+        		# Confirm $KICK_DIR is set, redine as needed
+        		if [ "${KICK_DIR}" = "" ];then
+				KICK_DIRS=${KICK_BASE}/ROOT
+			else
+        			KICK_DIRS="${KICK_DIR}/ROOT ${KICK_BASE}/ROOT"
+   			fi
+		fi
+
+	# EL4 section
+	elif [ ${CURRENT_VERSION} -eq 4 ];then
+
+		# Loop through each CD_image dir in reverse order looking for custom
+		# kickstart area for $HOST
+		for KICK_DIR in `ls -r1d ${KICK_BASE}* 2>/dev/null`
+		do
+
+			# Determine if there is secondary data to install/configure for ${HOST}
+			if [ -d ${KICK_DIR}/${KICK_HOST} -o -h ${KICK_DIR}/${KICK_HOST} ];then
+	
+        			# Set KICK_DIR to the directory name containing the custom data for ${HOST}
+        			KICK_DIRS="${KICK_DIR}/${KICK_HOST}/ROOT"
+
+				# exit loop now
+				break
+			else
+    				# Set HOST_DIGITS to the total number of digits in $HOST minus 1
+    				let HOST_DIGITS="`echo ${KICK_HOST} | wc -c`-2"
+			
+        			# Removing 1 digit at a time looking for custom secondary
+        			# data directory to install/configure for ${KICK_HOST}
+        			while [ ${HOST_DIGITS} -ge 3 ]
+        			do
+			
+                			# Set CUSTOM_HOST to $HOST mninus $HOST_DIGITS
+              				CUSTOM_HOST=`echo ${KICK_HOST} | cut -c1-${HOST_DIGITS}`
+			
+                			# Determine if ${KICK_BASE}/${CUSTOM_HOST} exists
+                			if [ -d ${KICK_DIR}/${CUSTOM_HOST} -o -h ${KICK_DIR}/${CUSTOM_HOST} ];then
+			
+                        			# Set KICK_DIR to the directory name containing the 
+						# custom secondary data for $HOST
+                        			KICK_DIRS=${KICK_DIR}/${CUSTOM_HOST}/ROOT
+			
+                    				# exit both loops now
+                        			break 2
+                			else
+                   				# Decrement HOST_DIGITS by 1
+                        			let HOST_DIGITS=${HOST_DIGITS}-1
+                			fi
+        			done
+			fi
+		done
+			
+        	# Redfine $KICK_DIRS as needed
+        	[ "${KICK_DIRS}" = "" ] && KICK_DIRS=/data/kickstart_4/CD_image_64_v8/base/ROOT
+
+	# EL3 section, Use the default $KICK_DIRS
+		
+	fi
+}
+
+# The USAGE function is used to display usage options
+#########################################################################
+USAGE () {
+	[ ${INTERACTIVE} = NO ] && exit
+
+	echo -e "\n\n${PROG} Usage:"
+	echo -e "${PROG} -u\t\tUpdate to latest EL version and OS updates"
+	echo -e "\t\t\tNo standard custom OS files restored\n"
+	echo -e "${PROG} -r\t\tRestore all standard custom OS files\n"
+	echo -e "${PROG} -U\t\tUpdate to latest EL version, OS updates"
+	echo -e "\t\t\tand standard custom OS files restored\n"
+	echo -e "${PROG} -t\t\tTest to determine if standard custom OS files are installed\n"
+	echo -e "${PROG} -D\t\tDisplay yum repository info\n"
+	echo -e "\tNote: None of the arguments above can be combined\n"
+	echo -e "\t**\tOptional arguments\t**\n"
+	echo -e "\t-y\tPreconfirm file replacement"
+	echo -e "\t\tUsed only with -r or -U arguments\n"
+	echo -e "\t-i\tSet session to Interactive"
+	echo -e "\t\tRequired to use through ssh\n"
+	echo -e "\t-d\tUse Dev repository and default"
+	echo -e "\t\tdev repository yum.conf file\n"
+	echo -e "\t-c file-name\tAlternate yum.conf file name"
+	echo -e "\t\\t\tUsed to allow for secondary repository\n"
+	echo -e "\t-o\tUpdate OMSA, Firmware and system BIOS's\n"
+	exit
+}
+
+# The CHECK_FILE function is confirm $CUSTOM_FILE has not 
+# already been added to the array CUSTOM_FILES
+#########################################################################
+CHECK_FILE () {
+	#set -x
+
+	# Pre Set CHECK_LOOP to 0
+	CHECK_LOOP=0
+
+	# Pre Set SAVE to YES
+	SAVE=YES
+	
+	# Loop through file name listed in the array $CUSTOM_FILES looking
+	# for a match to the file name $CUSTOM_FILE
+	while [ "${CUSTOM_FILES[${CHECK_LOOP}]}" ]
+ 	do
+		# Set CHECK_FILE
+		CHECK_FILE=""
+		CHECK_FILE=${CUSTOM_FILES[${CHECK_LOOP}]}
+
+		# Confirm $CHECK_FILE is set
+		if [ "${CHECK_FILE}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable \"CHECK_FILE\" is not set  on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+
+		# Compare $CHECK_FILE to $CUSTOM_FILE, if it is the same
+		# move onto the next $CUSTOM_FILE
+		if [ ${CHECK_FILE} = ${CUSTOM_FILE} ] ;then
+			SAVE=NO
+			break
+		fi
+
+		# Increment $CHECK_LOOP
+		let CHECK_LOOP=${CHECK_LOOP}+1
+	done
+}
+
+# The BUILD_CUSTOM_FILES function is used to build the list of custom 
+# OS files as defined the files in kickstart
+#########################################################################
+BUILD_CUSTOM_FILES () {
+
+	#set -x
+
+	# Clear all old entrys in CUSTOM_FILES
+	unset CUSTOM_FILES[*]
+
+	# Pre-Set LOOP to 0
+	LOOP=0
+
+	# Loop through each DIR in $KICK_DIRS
+	for KICK_DIR in ${KICK_DIRS}
+	do
+	
+		# Confirm that $KICK_DIR exists
+		ls ${KICK_DIR} 1>/dev/null 2>&1
+		if [ ! -d ${KICK_DIR} ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required directory \"${KICK_DIR}\" does not exist or is not accessable from ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+	
+		# Create the array CUSTOM_FILES from the files contained in $KICK_DIR
+		# -path "${KICK_DIR}/usr/local/texlive" -prune added to improve speed on key systems
+		for CUSTOM_FILE in `find ${KICK_DIR} -path "${KICK_DIR}/${PRUNE_EXCLUDE}" -prune \
+		-o -type f | egrep -v "${EXCLUDE_FILES}" | sed "s:${KICK_DIR}/::"`
+		do
+			CHECK_FILE
+
+			# Move onto next $CUSTOM_FILE if SAVE is set to NO
+			[ ${SAVE} = NO ] && continue
+
+			# Add ${CUSTOM_FILE} to the array CUSTOM_FILES as needed
+			CUSTOM_FILES[${LOOP}]=${CUSTOM_FILE}
+	
+			# Increment $LOOP
+			let LOOP=${LOOP}+1
+		done
+	
+		# Add any linked files to the array CUSTOM_FILES from the files contained in $KICK_DIR
+		# -path "${KICK_DIR}/usr/local/texlive" -prune added to improve speed on key systems
+		for CUSTOM_FILE in `find ${KICK_DIR} -path "${KICK_DIR}/${PRUNE_EXCLUDE}" -prune \
+		-o -type l | egrep -v "${EXCLUDE_FILES}" | sed "s:${KICK_DIR}/::"`
+		do
+			CHECK_FILE
+
+			# Move onto next $CUSTOM_FILE if SAVE is set to NO
+			[ ${SAVE} = NO ] && continue
+
+			# Add ${CUSTOM_FILE} to the array CUSTOM_FILES as needed
+			CUSTOM_FILES[${LOOP}]=${CUSTOM_FILE}
+	
+			# Increment $LOOP
+			let LOOP=${LOOP}+1
+		done
+
+		# Set NEW_LOOP to $LOOP if $NEW_LOOP not set
+		[ "${NEW_LOOP}" = "" ] && NEW_LOOP=${LOOP}
+	done
+}
+
+# Set CURRENT_UPDATE to the current update level of the system
+#########################################################################
+CURRENT_UPDATE=""
+if [ ${OS_TYPE} = REDHAT ];then
+	if [ ${CURRENT_VERSION} -lt 5 ];then
+		CURRENT_UPDATE=`awk '{print $NF}' < ${REDHAT_RELEASE} | sed 's/)//'`
+	else
+		CURRENT_UPDATE=`awk '{print $7}' < ${REDHAT_RELEASE} | awk -F. '{print $2}'`
+	fi
+else
+	CURRENT_UPDATE=`awk '{print $3}' < ${REDHAT_RELEASE} | awk -F. '{print $2}'`
+fi
+
+# Confirm CURRENT_UPDATE is set
+#########################################################################
+if [ "${CURRENT_UPDATE}" = "" ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The required variable \"CURRENT_UPDATE\" not set on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Set KICK_DIR based on $OS_TYPE, $CURRENT_VERSION and $CURRENT_UPDATE
+#########################################################################
+if [ ${OS_TYPE} = REDHAT ];then
+
+	# Confirm that the file $AR_YUM_CONF and the directory $AR_REPO_DIR exist
+	if [ ! -f ${AR_YUM_CONF} -o ! -d ${AR_REPO_DIR} ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: Either the required file \"${AR_YUM_CONF}\" or the required directory \"${AR_REPO_DIR}\" does not exist on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# EL4 Section
+	if [ ${CURRENT_VERSION} = 4 ];then
+
+		# Set AR_YUM_CONF to the default values
+		AR_YUM_CONF=/etc/sysconfig/rhn/up2date
+
+		# Define upgrade command
+		UPGRADE="up2date --update --verbose --nox"
+
+		# Based on system archecture define RedHat EL4 kickstart base directory
+		if [ ${ARCH} = x86_64 ];then
+			KICK_BASE=/data/kickstart_4/CD_image_64_v${CURRENT_UPDATE}
+		else
+			KICK_BASE=/data/kickstart_4/CD_image_v${CURRENT_UPDATE}
+		fi
+
+		# Import GPG
+		rpm --import /usr/share/rhn/RPM-GPG-KEY 2>&1 | tee -a ${LOG}
+	
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+			
+	# EL5 Section
+	elif [ ${CURRENT_VERSION} = 5 ];then
+
+		# Set DEV_AR_YUM_CONF
+		DEV_AR_YUM_CONF=/data/redhat_repo/dev/rhel-5-server-rpms/yum.conf
+
+		# Define RedHat EL5 kickstart base directory
+		KICK_BASE=/data/kickstart_5/CD_image_64_u${CURRENT_UPDATE}/base
+
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+			
+	# EL6 Section
+	elif [ ${CURRENT_VERSION} = 6 ];then
+
+		# Set DEV_AR_YUM_CONF
+		DEV_AR_YUM_CONF=/data/redhat_repo/dev/rhel-6-server-rpms/yum.conf
+
+		# Define RedHat EL6 kickstart base directory
+		KICK_BASE=/data/kickstart_6/CD_image_64_u${CURRENT_UPDATE}/base
+
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+
+	else	# Error
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: ${PROG} only supported on RHEL 3, 4, 5 and 6 on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+else	# CentOS
+
+	# Set DEV_AR_YUM_CONF
+	DEV_AR_YUM_CONF=/data/centos_repo/dev/yum.conf
+
+	# Import GPG as needed
+	[ ${CURRENT_VERSION} = 4 ] && rpm --import /usr/share/rhn/RPM-GPG-KEY 2>/dev/null
+
+	# Confirm that the file $AR_YUM_CONF and the directory $AR_REPO_DIR exist
+	if [ ! -f ${AR_YUM_CONF} -o ! -d ${AR_REPO_DIR} ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: Either the required file \"${AR_YUM_CONF}\" or the required directory \"${AR_REPO_DIR}\" does not exist on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# EL4 Section
+	if [ ${CURRENT_VERSION} = 4 ];then
+
+		# Based on system archecture define CentOS EL4 kickstart base directory
+		if [ ${ARCH} = x86_64 ];then
+			KICK_BASE=/data/kickstart_4/CD_image_64_v${CURRENT_UPDATE}
+		else
+			KICK_BASE=/data/kickstart_4/CD_image_v${CURRENT_UPDATE}
+		fi
+
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+
+	# EL5 Section
+	elif [ ${CURRENT_VERSION} = 5 ];then
+
+		# Define CentOS EL5 kickstart base directory
+		KICK_BASE=/data/kickstart_5/CD_image_64_u${CURRENT_UPDATE}_centos/base
+
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+			
+	# EL6 Section
+	elif [ ${CURRENT_VERSION} = 6 ];then
+
+		# Define CentOS EL5 kickstart base directory
+		KICK_BASE=/data/kickstart_6/CD_image_64_centos/base
+
+		# Look for and set custom kickstart directory
+		SET_KICK_DIR
+
+	else	# Error
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: ${PROG} only supported on CentOS EL 4, 5 and 6 on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+fi
+
+# Confirm syntax is correct
+#########################################################################
+[ $# -eq 0 -a ${PROG} = update_linux ] && USAGE
+
+# Set OPTERR to 0, turns off getops error reporting
+OPTERR=0
+
+# Pre Set DISPLAY to a null
+DISPLAY=""
+
+# Parse command line options
+#########################################################################
+if [ ${PROG} = update_linux ];then
+	while getopts "uUrtDiodc:y" OPT
+	do
+		case ${OPT} in
+	
+			u ) # Update to latest EL version and OS updates
+	            	# No standard custom OS files restored
+	
+				# Confirm the following are not already set
+				if [ "${UPDATE}" != "" -o "${RESTORE}" != "" -o "${DISPLAY}" != "" ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				fi
+				UPDATE=YES
+				RESTORE=NO
+				DISPLAY=NO
+			;;	
+	
+			U ) # Update to latest EL version and OS updates
+	            	# Restore standard custom OS files
+	
+				# Confirm the following are not already set
+				if [ "${UPDATE}" != "" -o "${RESTORE}" != "" -o "${DISPLAY}" != "" ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				fi
+	
+				UPDATE=YES
+				RESTORE=YES
+				DISPLAY=NO
+				BUILD_CUSTOM_FILES
+			;;
+	
+			r ) # Restore standard custom OS files
+	
+				# Confirm the following are not already set
+				if [ "${UPDATE}" != "" -o "${RESTORE}" != "" -o "${DISPLAY}" != "" ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				fi
+	
+				UPDATE=NO
+				RESTORE=YES
+				DISPLAY=NO
+				BUILD_CUSTOM_FILES
+			;;
+			
+			t ) # Test to determine if standard custom OS files are installed
+	
+				# Confirm the following are not already set
+				if [ "${UPDATE}" != "" -o "${RESTORE}" != "" -o "${DISPLAY}" != "" ];then
+					echo -e "\nInvalid syntax"
+					USAGE
+				fi
+	
+				UPDATE=NO
+				RESTORE=TEST
+				DISPLAY=NO
+				BUILD_CUSTOM_FILES
+			;;
+	
+			y ) # Set PRE_CONFIRM optional argument to YES
+				
+				# Check syntax, Confirm $RESTORE is set to YES
+				if [ "${RESTORE}" != YES -a ${INTERACTIVE} = YES ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				elif [ "${RESTORE}" != YES -a ${INTERACTIVE} = NO ];then
+					exit
+				fi
+				DISPLAY=NO
+				PRE_CONFIRM=YES
+			;;
+	
+			D ) #  Display yum/up2date resoistory/config info
+	
+				# Confirm the following are not already set
+				if [ "${UPDATE}" != "" -o "${RESTORE}" != "" -o "${DISPLAY}" != "" ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				fi
+					
+				UPDATE=NO
+				RESTORE=NO
+				DISPLAY=YES
+				if [ ${INTERACTIVE} = NO ];then
+					exit
+				fi
+			;;
+	
+			d ) # Choose the Dev repository
+				DEV_PRO=DEV
+				SET_DEV_AR_YUM_CONF=YES
+			;;
+	
+			c ) # Defines secondary yum.conf on CentOS systems only
+	
+				# Set AR_YUM_CONF to $OPTARG
+				AR_YUM_CONF=${OPTARG}
+				SET_DEV_AR_YUM_CONF=NO
+	
+				# ALTERNATE_CONFIG to YES is #OPTARG exists
+				if [ -f ${AR_YUM_CONF} ];then
+					ALTERNATE_CONFIG=YES
+	
+					# Set AR_REPO_DIR alternate yum repos.d dir
+					AR_REPO_DIR=`grep "^reposdir=" ${AR_YUM_CONF} | awk -F= '{print $2}'`
+	
+					# Confirm $AR_REPO_DIR is set
+					if [ "${AR_REPO_DIR}" = "" ];then
+			
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						ERROR_MESSAGE="\nError: The required variable \"AR_REPO_DIR\" not set on ${HOST}, ${DATE_TIME}"
+						if [ ${INTERACTIVE} = YES ];then
+							echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+						else
+							echo -e "${ERROR_MESSAGE}" >> ${LOG}
+							echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+						fi
+						exit
+					fi
+				else
+					echo -e "\nError: Alternate yum.conf file, \"${AR_YUM_CONF}\" does not exist\n"
+					exit
+				fi
+			;;
+	
+			i ) # Set INTERACTIVE to YES, even if it is not really an interactive session
+				INTERACTIVE=YES
+				PRE_CONFIRM=NO
+			;;
+	
+			o ) # Upgrade OMSA, system firmware and BIOS's
+				UPDATE_BIOS=YES
+			;;
+	
+			*) # Error
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "\nInvalid syntax"
+					sleep 2
+					USAGE
+				else
+					exit
+				fi
+			;;	
+		esac
+	done
+else
+	# Confirm ${INTERACTIVE} is set to NO
+	if [ ${INTERACTIVE} = YES ];then
+		echo "Error: ${PROG} can only be run using the command name update_linux"
+		exit
+	fi
+
+	UPDATE=YES
+	RESTORE=NO
+	DISPLAY=NO
+	AR_YUM_CONF=${YUM_DIR}/yum.conf
+fi
+
+# Confirm that the following are set
+#########################################################################
+if [ "${UPDATE}" = "" -o "${RESTORE}" = "" -o "${DISPLAY}" = "" ];then
+	echo -e "\nInvalid syntax"
+	sleep 2
+	USAGE
+fi
+
+# Set AR_YUM_CONF to ${DEV_AR_YUM_CONF} as needed
+[ ${SET_DEV_AR_YUM_CONF} = YES ] && AR_YUM_CONF=${DEV_AR_YUM_CONF}
+
+# Confirm $AR_YUM_CONF Exists
+if [ ! -f ${AR_YUM_CONF} ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="\nError: The yum.conf file \"${AR_YUM_CONF}\" does not exist on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${ERROR_MESSAGE}" >> ${LOG}
+		echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+	fi
+	exit
+fi
+
+# Define UPGRADE as needed
+[ "${UPGRADE}" = "" ] && UPGRADE="yum -c ${AR_YUM_CONF} -yt --nogpgcheck upgrade"
+
+# Rename default repository files as needed
+for REPO_FILE in `ls /etc/yum.repos.d/* | egrep -v 'AR|PWR|\.off' 2>/dev/null`
+do
+	if [ `echo ${REPO_FILE} | egrep -ci 'centos|rhel'` -eq 1 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nMoving ${REPO_FILE} to ${REPO_FILE}.off, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		# Rename ${REPO_FILE}
+		mv ${REPO_FILE} ${REPO_FILE}.off 2>&1 | tee -a ${LOG}
+	fi
+done
+
+# Determine if being started by kickstart process
+if [ -f /tmp/S99update-linux.log ];then
+
+	FILE_DATA=`ls -la /tmp/S99update-linux.log | awk '{print $6,$7,$8}'`
+	set $FILE_DATA
+	FILE_MONTH=$1
+	FILE_DAY=$2
+	FILE_TIME=$3
+
+	# Confirm FILE_MONTH is set
+	#########################################################################
+	if [ "${FILE_MONTH}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FILE_MONTH\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	else
+		# Convert 2 digit month to alpha month
+		case ${MONTH} in
+        		01|1 ) MONTH=Jan
+                	;;
+        		02|2 ) MONTH=Feb
+                	;;
+        		03|3 ) MONTH=Mar
+                	;;
+        		04|4 ) MONTH=Apr
+                	;;
+        		05|5 ) MONTH=May
+                	;;
+        		06|6 ) MONTH=Jun
+                	;;
+        		07|7 ) MONTH=Jul
+                	;;
+        		08|8 ) MONTH=Aug
+                	;;
+        		09|9 ) MONTH=Sep
+                	;;
+        		10 ) MONTH=Oct
+                	;;
+        		11 ) MONTH=Nov
+                	;;
+        		12 ) MONTH=Dec
+                	;;
+		esac
+	fi
+
+	# Confirm FILE_DAY is set
+	#########################################################################
+	if [ "${FILE_DAY}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FILE_DAY\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Confirm FILE_TIME is set
+	#########################################################################
+	if [ "${FILE_TIME}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FILE_TIME\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Set FILE_HOUR and FILE_MIN
+	#########################################################################
+	FILE_HOUR=`echo ${FILE_TIME} | awk -F: '{print $1}'`
+	FILE_MIN=`echo ${FILE_TIME} | awk -F: '{print $2}'`
+
+	# Confirm FILE_HOUR is set
+	#########################################################################
+	if [ "${FILE_HOUR}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FILE_HOUR\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Confirm FILE_MIN is set
+	#########################################################################
+	if [ "${FILE_MIN}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FILE_MIN\" not set on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	# Confirm this file was create within the last few minutes
+	#########################################################################
+	if [ ${FILE_MONTH} = ${MONTH} -a ${FILE_HOUR} = ${HOUR} -a ${FILE_MIN} = ${MIN} ];then
+		KICKSTART=YES
+	elif [ `echo ${SEC} | grep -c '5.'` -eq 1 ] && [ ${FILE_HOUR} -ne 0 -o ${FILE_HOUR} != 00 ];then
+		if [ ${FILE_MIN} -eq 0 -o ${FILE_MIN} = 00 ];then
+			FILE_MIN=59
+		else
+			let FILE_MIN=${FILE_MIN}-1
+		fi
+		if [ ${FILE_MONTH} = ${MONTH} -a ${FILE_HOUR} = ${HOUR} -a ${FILE_MIN} = ${MIN} ];then
+			KICKSTART=YES
+		else
+			KICKSTART=NO
+		fi
+	else
+		KICKSTART=NO
+
+	fi
+else
+	KICKSTART=NO
+	
+fi
+
+# Add file names to be checked file permssions and the correct permissions 
+# of each to the array FILE_PERMS
+#########################################################################
+unset FILE_PERMS[*]
+FILE_PERMS[0]="/usr/bin/ypcat 550"
+FILE_PERMS[1]="/usr/bin/ypmatch 550"
+FILE_PERMS[2]="/etc/securetty 600"
+FILE_PERMS[3]="/var/spool/cron/root 600"
+FILE_PERMS[4]="/etc/sudoers 440"
+FILE_PERMS[5]="/etc/ssh/ssh_config 644"
+FILE_PERMS[6]="/etc/ssh/sshd_config 600"
+FILE_PERMS[7]="/etc/vsftpd/vsftpd.conf 600"
+FILE_PERMS[8]="/etc/securetty 600"
+FILE_PERMS[9]="/root/.rhosts 600"
+FILE_PERMS[10]="/usr/bin/logger 4755"
+FILE_PERMS[11]="/bin/logger 4755"
+FILE_PERMS[12]="/opt/Navisphere/bin/navicli 4755"
+FILE_PERMS[13]="/sbin/powermt 4755"
+FILE_PERMS[14]="/etc/init.d/ipmi.hp 755"
+FILE_PERMS[15]="/etc/sso.conf 600"
+FILE_PERMS[16]="/etc/powermt.custom 666"
+FILE_PERMS[17]="/etc/named.conf 644"
+FILE_PERMS[18]="/etc/sysconfig/rhn/up2date 600"
+FILE_PERMS[19]="/etc/vsftpd/vsftpd.conf 600"
+FILE_PERMS[20]="/etc/sysconfig/rhn/systemid 600"
+FILE_PERMS[21]="/etc/multipath.conf 600"
+FILE_PERMS[22]="/etc/iscsi/iscsid.conf 600"
+FILE_PERMS[23]="/etc/tgt/targets.conf 600"
+FILE_PERMS[24]="/etc/auto.cifs 660"
+FILE_PERMS[25]="/etc/credentials 660"
+FILE_PERMS[26]="/etc/yum.conf 600"
+FILE_PERMS[27]="/root/.shosts 600"
+FILE_PERMS[28]="/etc/yum.conf.ar 600"
+
+# The CORRECT_PERMISSIONS function is used to correct file permissions on predefined files
+#########################################################################
+CORRECT_PERMISSIONS () {
+	#set -x
+
+	# Set PERM_LOOP to 0
+	PERM_LOOP=0
+
+	# Go through the files in the array FILE_PERMS comparing /${CUSTOM_FILE}
+	# to the  file names held in the first field of each value. Then set the 
+	# permissions of that file to the value in the second field
+	while [ "${FILE_PERMS[${PERM_LOOP}]}" ]
+ 	do
+
+		# Set FILE_PERM
+		FILE_PERM=""
+		FILE_PERM=`echo ${FILE_PERMS[${PERM_LOOP}]} | awk '{print $1}'`
+
+		# Confirm $FILE_PERM is set
+		if [ "${FILE_PERM}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable \"FILE_PERM\" is not set  on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+
+		# Set PERM
+		PERM=""
+		PERM=`echo ${FILE_PERMS[${PERM_LOOP}]} | awk '{print $2}'`
+
+		# Confirm $PERM is set
+		if [ "${PERM}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable \"PERM\" is not set  on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+
+		# Increment $PERM_LOOP
+		let PERM_LOOP=${PERM_LOOP}+1
+
+		# Determine if ${FILE_PERM} is the same as ${CUSTOM_FILE}
+		[ "/${CUSTOM_FILE}" != ${FILE_PERM} ] && continue
+
+		# Confirm ${FILE_PERM} exists
+		if [ -f ${FILE_PERM} ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE=" Note: Setting permissions on \"/${FILE_PERM}\" to \"${PERM}\", ${DATE_TIME}\n"
+
+			# Display message to interactice users 
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${MESSAGE}" >> ${LOG}
+			fi
+			chmod ${PERM} ${FILE_PERM}
+		fi
+	done
+}
+
+# The CHECK_DEPENDENCIES function is used to confirm the file/link replacement is safe
+#########################################################################
+CHECK_DEPENDENCIES () {
+	#set -x
+
+	# If OS_TYPE is RedHat if confirm ${CUSTOM_FILE} is /etc/yum.repos.d/AR-REDHAT.repo
+	if [ ${CUSTOM_FILE} = etc/yum.repos.d/PWR-CentOS.repo -a ${OS_TYPE} = REDHAT ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE=" Note: \"/${CUSTOM_FILE}\" should only be added to CentOS systems, ${HOST} is RedHat.\n Not adding \"/${CUSTOM_FILE}\" to ${HOST}, ${DATE_TIME}.\n"
+
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		# Set SAFE=NO
+		SAFE=NO
+
+	# If OS_TYPE is CENTOS if confirm ${CUSTOM_FILE} is /etc/yum.repos.d/PWR-CentOS.repo
+	elif [ ${CUSTOM_FILE} = etc/yum.repos.d/AR-REDHAT.repo -a ${OS_TYPE} = CENTOS ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE=" Note: \"/${CUSTOM_FILE}\" should only be added to RedHat systems, ${HOST} is CentOS.\n Not adding \"/${CUSTOM_FILE}\" to ${HOST}, ${DATE_TIME}.\n"
+
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		# Set SAFE=NO
+		SAFE=NO
+
+	# If ${CUSTOM_FILE} is etc/nsswitch.conf determine if it has passwd set to compat
+	# or not. Then confirm the /etc/passwd file is correct for the compat setting
+	elif [ ${CUSTOM_FILE} = etc/nsswitch.conf ];then
+
+		# Determine if ${KICK_DIR}/${CUSTOM_FILE} has passwd set to compat
+		if [ `grep '^passwd:' ${KICK_DIR}/${CUSTOM_FILE} | grep -c compat` -ge 1 ];then
+
+			# Confirm the /etc/passwd file has netgroup entries
+			if [ `grep -c '^\+\@.*' /etc/passwd` -eq 0 ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: \"${KICK_DIR}/${CUSTOM_FILE}\" is configured to support restricted logins, using \"passwd: compat\". But ${HOST} is not using netgroup entries in /etc/passwd.\n Not adding \"/${CUSTOM_FILE}\" to ${HOST}.\n"
+
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}" >> ${LOG}
+				fi
+
+				# Set SAFE=NO
+				SAFE=NO
+			else
+				# Set SAFE=YES
+				SAFE=YES
+			fi
+		else
+
+			# Confirm the /etc/passwd file does not have netgroup entries
+			if [ `grep -c '^\+\@.*' /etc/passwd` -ge 1 ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: \"${KICK_DIR}/${CUSTOM_FILE}\" is not configured to support restricted logins, not using \"passwd: compat\". But ${HOST} is using netgroup entries in /etc/passwd.\n Not adding \"/${CUSTOM_FILE}\" to ${HOST}.\n"
+
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}" >> ${LOG}
+				fi
+
+				# Set SAFE=NO
+				SAFE=NO
+			else
+				# Set SAFE=YES
+				SAFE=YES
+			fi
+		fi
+	else
+		# Set SAFE=YES
+		SAFE=YES
+	fi
+}
+
+# The CONFIRM function is used to interactively confirm the replacement
+# of a local files with the kickstart copy of the file
+#########################################################################
+CONFIRM () {
+	#set -x
+		
+
+	# Ask Interactive user to confirm
+	if [ ${INTERACTIVE} = YES ];then
+
+		# Comfirm operation
+ 		ANSWER=""
+ 		echo ""
+ 		until [ -n "${ANSWER}" ]
+ 		do
+			if [ ${SYMLINK} = YES ];then
+				echo -n "Change \"/${CUSTOM_FILE}\" to be a sym link Y/N > "
+			elif [ ${SYMLINK} = NO ];then
+				echo -n "Replace \"/${CUSTOM_FILE}\" Y/N > "
+			elif [ ${EXISTING_SERVICE} = NO ];then
+				echo -n "Disable and Stop the service \"${COLLECT_SERVICE}\" Y/N > "
+			fi
+			read ANSWER
+	
+			case ${ANSWER} in
+			
+				"") # Do Nothing
+				;;
+	
+				N|n|NO|no|No)  # No
+				ANSWER=NO
+				;;
+	
+				Y|y|YES|yes|Yes) # Yes
+				ANSWER=YES
+				;;
+	
+				q|Q) # Exit Now
+				ANSWER=NO
+				exit
+				;;
+	
+				*) # Invalid Answer
+				echo -e "\n Invalid selection ${ANSWER}\n"
+				ANSWER=""
+				sleep 2
+				;;
+			esac
+		done
+	else
+		# Non Interactive answer always NO
+		ANSWER=NO
+	fi
+}
+
+# The START_SERVICE function is used to restart all services
+#########################################################################
+START_SERVICE () {
+	#set -x
+
+	# Start the services listed in $SERVICES as needed
+	for SERVICE in `echo ${SERVICES} | sed 's/|/ /g'`
+	do
+
+		# Determine if $SERVICE is running
+		if [ `chkconfig --list ${SERVICE} 2>/dev/null | grep -c on` -eq 1 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nStarting the service \"${SERVICE}\", ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${MESSAGE}" >> ${LOG}
+			fi
+			
+			# Rebuild /etc/mail/sendmail.cf as needed
+			if [ "${SERVICE}" = sendmail ];then
+
+				if [ `grep -c "${HOST}" /etc/mail/sendmail.cf` -eq 0 -a \
+				`grep -c "^DSmailhost" /etc/mail/sendmail.cf` -eq 0 ];then
+
+					if [ `grep mailhost /etc/mail/sendmail.mc 2>/dev/null | grep -c SMART_HOST` -eq 1 ];then
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="\nBuilding new /etc/mail/sendmail.cf file, ${DATE_TIME}"
+						if [ ${INTERACTIVE} = YES ];then
+							echo -e "${MESSAGE}" | tee -a ${LOG}
+						else
+							echo -e "${MESSAGE}" >> ${LOG}
+						fi
+
+						cp /etc/mail/sendmail.cf /etc/mail/sendmail.cf.${PROG}.${DATE}
+						m4 /etc/mail/sendmail.mc > /etc/mail/sendmail.cf
+
+						if [ `grep -c "${HOST}" /etc/mail/sendmail.cf` -eq 0 -o \
+						`grep -c "^DSmailhost" /etc/mail/sendmail.cf` -eq 0 ];then
+							DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+							MESSAGE="\nError: The new /etc/mail/sendmail.cf file was not created properly, ${DATE_TIME}"
+							if [ ${INTERACTIVE} = YES ];then
+								echo -e "${MESSAGE}" | tee -a ${LOG}
+							else
+								echo -e "${MESSAGE}" >> ${LOG}
+							fi
+						fi
+					else
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="\nError: The required /etc/mail/sendmail.mc file does not exist or is not configured properly, ${DATE_TIME}"
+						if [ ${INTERACTIVE} = YES ];then
+							echo -e "${MESSAGE}" | tee -a ${LOG}
+						else
+							echo -e "${MESSAGE}" >> ${LOG}
+						fi
+					fi
+				fi
+			fi
+
+			# Start $SERVICE
+			/etc/init.d/${SERVICE} start 2>&1 | tee -a ${LOG}
+		fi
+	done
+}
+
+# The RESTART_SERVICE function is used to  restart a service as needed
+#########################################################################
+RESTART_SERVICE () {
+	# set -x
+
+	# Restart service as needed
+
+	# ssh service section
+	if [ ${CUSTOM_FILE} = "etc/ssh/sshd_config" ];then
+		if [ ${INTERACTIVE} = YES ];then 
+			/etc/init.d/sshd restart 2>&1 | tee -a ${LOG}
+		else
+			/etc/init.d/sshd restart >> ${LOG} 2>&1
+		fi
+
+	# ntp service section
+	elif [ ${CUSTOM_FILE} = "etc/ntp.conf" -o ${CUSTOM_FILE} = "etc/ntp/step-tickers" ];then
+		if [ ${INTERACTIVE} = YES ];then 
+			/etc/init.d/ntpd restart 2>&1 | tee -a ${LOG}
+		else
+			/etc/init.d/ntpd restart >> ${LOG} 2>&1
+		fi
+
+	# sendmail service section
+	elif [ ${CUSTOM_FILE} = "etc/mail/sendmail.cf" ];then
+		if [ ${INTERACTIVE} = YES ];then 
+			/etc/init.d/sendmail restart 2>&1 | tee -a ${LOG}
+		else
+			/etc/init.d/sendmail restart >> ${LOG} 2>&1
+		fi
+
+	# Autmounter service section
+	elif [ ${CUSTOM_FILE} = "etc/auto.master" ];then
+		if [ ${INTERACTIVE} = YES ];then 
+			/etc/init.d/autofs reload 2>&1 | tee -a ${LOG}
+		else
+			/etc/init.d/autofs reload >> ${LOG} 2>&1
+			/etc/init.d/autofs start >> ${LOG} 2>&1
+		fi
+	fi
+}
+
+# The COLLECT_SERVICES function is used to collect the list of services that are on
+#########################################################################
+COLLECT_SERVICES () {
+	# set -x
+
+	# Set FUNC to the 1st argument to this function
+	FUNC=$1
+
+	# Confirm $FUNC is set
+	if [ "${FUNC}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FUNC\" is not set  on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+
+	if [ ${FUNC} = BEFORE ];then
+
+		# Pre set SERVICE_LOOP to 0
+		SERVICE_LOOP=0
+
+		# Clear all old entrys in ON_SERVICES
+		unset ON_SERVICES[*]
+
+		# Add all the services set to on to the array $COLLECT_SERVICE
+		for COLLECT_SERVICE in `chkconfig --list | grep '[0,1,2,3,4,5]:on' | awk '{print $1}'`
+		do
+
+			# Skip any blank lines
+			[ "${COLLECT_SERVICE}" = "" ] && continue
+
+			# Add $COLLECT_SERVICE to the array $ON_SERVICES
+			ON_SERVICES[${SERVICE_LOOP}]=${COLLECT_SERVICE}
+
+			# Increment $SERVICE_LOOP
+			let SERVICE_LOOP=${SERVICE_LOOP}+1
+		done
+
+	elif [ ${FUNC} = AFTER ];then
+		
+		# Compare services currently set to on to those listed in the array $ON_SERVICES
+		for COLLECT_SERVICE in `chkconfig --list | grep '[0,1,2,3,4,5]:on' | awk '{print $1}'`
+		do
+
+			# Skip any blank lines
+			[ "${COLLECT_SERVICE}" = "" ] && continue
+
+			# Pre set SERVICE_LOOP to 0
+			SERVICE_LOOP=0
+
+			# Set EXISTING_SERVICE to NO
+			EXISTING_SERVICE=NO
+
+			while [ "${ON_SERVICES[${SERVICE_LOOP}]}" ]
+ 			do
+
+				# Set ON_SERVICE to the value in ${ON_SERVICES[${SERVICE_LOOP}]}
+				ON_SERVICE=${ON_SERVICES[${SERVICE_LOOP}]}
+	
+				# Increment $SERVICE_LOOP
+				let SERVICE_LOOP=${SERVICE_LOOP}+1
+
+				# Confirm $ON_SERVICE is set
+				if [ "${ON_SERVICE}" = "" ];then
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The required variable \"ON_SERVICE\" is not set properly on ${HOST}, ${DATE_TIME}"
+					if [ ${INTERACTIVE} = YES ];then
+						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				fi
+
+				# Set EXISTING_SERVICE to YES if $ON_SERVICE is the same as $COLLECT_SERVICE
+				if [ ${ON_SERVICE} = ${COLLECT_SERVICE} ];then
+					export EXISTING_SERVICE=YES
+
+					# Break out of while loop
+					break
+				fi
+			done
+
+			# Confirm $SERVICE_LOOP is not set to 0
+			if [ "${SERVICE_LOOP}" = 0 ];then
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="\nError: Unexpected found the variable \"${SERVICE_LOOP}\" set to \"0\" on ${HOST}, ${DATE_TIME}"
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+			fi
+
+			# Determine if $COLLECT_SERVICE should be disabled and stopped
+			if [ ${EXISTING_SERVICE} = NO ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nNote: The service \"${COLLECT_SERVICE}\" is now set to \"on\" as defined by chkconfig. But was not on before the upgrade was started on ${HOST}, ${DATE_TIME}"
+				
+				# Determine if $COLLECT_SERVICE should be disabled and stopped
+				if [ ${INTERACTIVE} = YES -a ${KICKSTART} = NO ];then
+					echo -e "${MESSAGE}" | tee -a ${LOG}
+					SYMLINK=FALSE
+					CONFIRM
+				else
+					echo -e "${MESSAGE}" >> ${LOG}
+					ANSWER=YES
+				fi
+					
+
+				# Turn off $COLLECT_SERVICE as needed
+				if [ ${ANSWER} = YES ];then
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					MESSAGE="\nDisabling and stopping \"${COLLECT_SERVICE}\" on ${HOST}, ${DATE_TIME}"
+					if [ ${INTERACTIVE} = YES ];then
+						echo -e "${MESSAGE}" | tee -a ${LOG}
+					else
+						echo -e "${MESSAGE}" >> ${LOG}
+					fi
+
+					# Disable $COLLECT_SERVICE
+					chkconfig ${COLLECT_SERVICE} off 2>&1 | tee -a ${LOG}
+
+					# Stop $COLLECT_SERVICE
+					/etc/init.d/${COLLECT_SERVICE} stop 2>&1 | tee -a ${LOG}
+				else
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					MESSAGE="\nLeaving the service \"${COLLECT_SERVICE}\" on and running on ${HOST}, ${DATE_TIME}"
+					[ ${INTERACTIVE} = NO ] && echo -e "${MESSAGE}" >> ${LOG}
+				fi
+			fi
+		done
+	else
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="\nError: The required variable \"FUNC\" is not set properly on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${ERROR_MESSAGE}" >> ${LOG}
+			echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+		fi
+		exit
+	fi
+}
+
+# The RESTORE function is used to replace and or test for any standard 
+# custom OS files that have changed or are just differnt from the 
+# kickstart version of the same file
+#########################################################################
+RESTORE () {
+	# set -x
+
+	# Pre-Set LOOP to 0
+	LOOP=0
+
+	# Pre Set BREAK to YES
+	BREAK=YES
+
+	# Loop through each DIR in ${KICK_DIRS}
+	for KICK_DIR in ${KICK_DIRS}
+	do
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Kickstart directory used, \"${KICK_DIR}\", ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e "${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}\n" >> ${LOG}
+		fi
+
+	# Go through the files in the array CUSTOM_FILES looking comparing
+	# the kickstart version of the file to the local file.
+	while [ "${CUSTOM_FILES[${LOOP}]}" ]
+ 	do
+
+		# Set CUSTOM_FILE
+		CUSTOM_FILE=""
+		CUSTOM_FILE=${CUSTOM_FILES[${LOOP}]}
+
+		# Confirm $CUSTOM_FILE is set
+		if [ "${CUSTOM_FILE}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="\nError: The required variable \"CUSTOM_FILE\" is not set  on ${HOST}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${ERROR_MESSAGE}" >> ${LOG}
+				echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+			fi
+			exit
+		fi
+
+		# Confirm ${KICK_DIR}/${CUSTOM_FILE} exists
+		if [ ! -f ${KICK_DIR}/${CUSTOM_FILE} -a ! -h ${KICK_DIR}/${CUSTOM_FILE} ];then
+			BREAK=NO
+			break
+		fi
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+
+		# Display Update message
+		MESSAGE="Checking /$CUSTOM_FILE"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		# Determine if $KICK_DIR/$CUSTOM_FILE is a file or a link
+		if [ -h ${KICK_DIR}/${CUSTOM_FILE} ];then
+			SYMLINK=YES
+
+			# Set KICK_LINK_PATH to what ever ${KICK_DIR}/${CUSTOM_FILE} points to
+			KICK_LINK_PATH=""
+			KICK_LINK_PATH=`ls -l ${KICK_DIR}/${CUSTOM_FILE} 2>/dev/null | awk '{print $NF}'`
+
+			# Confirm $KICK_LINK_PATH is set
+			if [ "${KICK_LINK_PATH}" = "" ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="\nError: The required variable \"KICK_LINK_PATH\" is not set  on ${HOST}, ${DATE_TIME}"
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${ERROR_MESSAGE}" >> ${LOG}
+					echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+				fi
+				exit
+			fi
+		else
+			SYMLINK=NO
+		fi
+
+		# Compare $KICK_DIR/$CUSTOM_FILE to /$CUSTOM_FILE
+		if [ ${SYMLINK} = YES ];then
+
+			# Add base dir of ${CUSTOM_FILE} to ${KICK_LINK_PATH} if
+			# ${KICK_LINK_PATH} does not start with a slash
+			if [ `echo ${KICK_LINK_PATH} | egrep -c '^/'` -eq 0 ];then
+
+				# Pre pend the base dir of $CUSTOM_FILE to $KICK_LINK_PATH
+				KICK_LINK_PATH="/`dirname ${CUSTOM_FILE}`/${KICK_LINK_PATH}"
+			fi
+
+			# Confirm that what the linked file point to exists
+			if [ ! -f ${KICK_LINK_PATH} -a ! -d ${KICK_LINK_PATH} ];then
+				EXISTS=NO
+				FIX=NO
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: The kickstart linked file \"${KICK_DIR}/${CUSTOM_FILE}\" points to  \"${KICK_LINK_PATH}\", but does not exist on ${HOST}, ${DATE_TIME}"
+
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}\n" >> ${LOG}
+				fi
+	
+				FIX=NO
+
+			# Confirm /${CUSTOM_FILE} exists
+			elif [ ! -f /${CUSTOM_FILE} -a ! -h /${CUSTOM_FILE} ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: The kickstart linked file \"${KICK_DIR}/${CUSTOM_FILE}\" does not exist on ${HOST}, ${DATE_TIME}"
+	
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}\n" >> ${LOG}
+				fi
+	
+				# Set FIX to YES if $RESTORE is set to YES
+				if [ ${RESTORE} = YES ];then 
+					FIX=YES
+					EXISTS=NO
+				else
+					FIX=NO
+				fi
+		
+			# Determine if /${CUSTOM_FILE} is a sym link
+			elif [ -h /${CUSTOM_FILE} ];then
+
+				# Set LINK_PATH to what ever /${CUSTOM_FILE} points to
+				LINK_PATH=""
+				LINK_PATH=`ls -l /${CUSTOM_FILE} 2>/dev/null | awk '{print $NF}'`
+
+				# Confirm $LINK_PATH is set
+				if [ "${LINK_PATH}" = "" ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="\nError: The required variable \"LINK_PATH\" is not set  on ${HOST}, ${DATE_TIME}"
+					if [ ${INTERACTIVE} = YES ];then
+						echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+					else
+						echo -e "${ERROR_MESSAGE}" >> ${LOG}
+						echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+					fi
+					exit
+				else
+	
+					# Set EXISTS to YES
+					EXISTS=YES
+				fi
+
+				# Add base dir of ${CUSTOM_FILE} to ${LINK_PATH} if
+				# ${LINK_PATH} does not start with a slash
+				if [ `echo ${LINK_PATH} | egrep -c '^/'` -eq 0 ];then
+	
+					# Pre pend the base dir of $CUSTOM_FILE to $LINK_PATH
+					LINK_PATH="/`dirname ${CUSTOM_FILE}`/${LINK_PATH}"
+				fi
+
+				# Compare $KICK_LINK_PATH to $LINK_PATH
+				if [ ${KICK_LINK_PATH} != ${LINK_PATH} ];then
+
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					MESSAGE=" Note: The kickstart linked file \"${KICK_DIR}/${CUSTOM_FILE}\" points to a different file on ${HOST}, ${DATE_TIME}"
+
+					if [ ${INTERACTIVE} = YES ];then
+						echo -e "${MESSAGE}\n" | tee -a ${LOG}
+					else
+						echo -e "${MESSAGE}\n" >> ${LOG}
+					fi
+
+					# Set FIX to YES if $RESTORE is set to YES
+					if [ ${RESTORE} = YES ];then 
+						FIX=YES
+					else
+						FIX=NO
+					fi
+				else
+					FIX=NO
+				fi
+			else
+
+				# Set EXISTS to YES
+				EXISTS=YES
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: The local file \"/${CUSTOM_FILE}\" is a real file and not a linked file on ${HOST}, ${DATE_TIME}"
+
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}\n" >> ${LOG}
+				fi
+
+				# Set FIX to YES if $RESTORE is set to YES
+				if [ ${RESTORE} = YES ];then 
+					FIX=YES
+				else
+					FIX=NO
+				fi
+			fi
+
+		else # Normal non-linked files
+
+			# Confirm /${CUSTOM_FILE} exists
+			if [ ! -f /${CUSTOM_FILE} ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: The local file \"/${CUSTOM_FILE}\" does not exist on ${HOST}, ${DATE_TIME}"
+	
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}\n" >> ${LOG}
+				fi
+	
+				# Set FIX to YES if $RESTORE is set to YES
+				if [ ${RESTORE} = YES ];then 
+					FIX=YES
+					EXISTS=NO
+				else
+					FIX=NO
+				fi
+
+			# Compare ${KICK_DIR}/${CUSTOM_FILE} to /${CUSTOM_FILE}
+			elif [ `diff ${KICK_DIR}/${CUSTOM_FILE} /${CUSTOM_FILE} | wc -l` -ge 1 ];then
+
+				# Set EXISTS to YES
+				EXISTS=YES
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE=" Note: The local file \"/${CUSTOM_FILE}\" is different than \"${KICK_DIR}/${CUSTOM_FILE}\" on ${HOST}, ${DATE_TIME}"
+
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}\n" >> ${LOG}
+				fi
+
+				# Set FIX to YES if $RESTORE is set to YES
+				if [ ${RESTORE} = YES ];then 
+					FIX=YES
+				else
+					FIX=NO
+				fi
+			else
+				FIX=NO
+			fi
+		fi
+
+		# Correct /${CUSTOM_FILE} as needed
+		if [ ${FIX} = YES ];then
+			if [ ${SYMLINK} = YES ];then
+
+				# Check Dependencies
+				CHECK_DEPENDENCIES
+
+				# If it is safe to replace the link do so
+				if [ ${SAFE} = YES ];then
+
+					# Confirm the file needs to be replaced as needed
+					[ ${PRE_CONFIRM} = NO ] && CONFIRM
+	
+					if [ "${ANSWER}" = YES -o ${PRE_CONFIRM} = YES ];then
+	
+						# Create subdirs as needed
+						if [ ! -d `dirname /${CUSTOM_FILE}` ];then 
+
+							DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+							MESSAGE="Creating required directory \"`dirname /${CUSTOM_FILE}`\" for the link \"/${CUSTOM_FILE}\" on ${HOST}, ${DATE_TIME}"
+	
+							if [ ${INTERACTIVE} = YES ];then
+								echo -e "\n${MESSAGE}" | tee -a ${LOG}
+								mkdir -p `dirname /${CUSTOM_FILE}` 2>&1 | tee -a ${LOG}
+							else
+								echo -e "${MESSAGE}" >> ${LOG}
+								mkdir -p `dirname /${CUSTOM_FILE}` >> ${LOG} 2>&1
+							fi
+						fi
+
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="Changing the local file \"/${CUSTOM_FILE}\" to be a sym link pointing to \"${KICK_LINK_PATH}\" on ${HOST}, ${DATE_TIME}"
+		
+						if [ ${INTERACTIVE} = YES ];then
+							echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+						else
+							echo -e "${MESSAGE}\n" >> ${LOG}
+						fi
+	
+						# Make backup of /${CUST_FILE} as needed
+						[ "${EXISTS}" = YES -a ! -h /${CUST_FILE}.${PROG}.${DATE} ] && mv /${CUSTOM_FILE} /${CUSTOM_FILE}.${PROG}.${DATE}
+	
+						# Correct /${CUSTOM_FILE}
+						ln -s ${KICK_LINK_PATH} /${CUSTOM_FILE} 2>&1 | tee -a ${LOG}
+	
+						# Determine if ${CUSTOM_FILE} is a service, 
+						# restart select services as needed
+						RESTART_SERVICE
+					fi
+				fi
+			else
+
+				# Check Dependencies
+				CHECK_DEPENDENCIES
+
+				# If it is safe to replace the file do so
+				if [ ${SAFE} = YES ];then
+
+					# Confirm the file needs to be replaced as needed
+					[ ${PRE_CONFIRM} = NO ] && CONFIRM
+	
+					if [ "${ANSWER}" = YES -o ${PRE_CONFIRM} = YES ];then
+	
+						# Create subdirs as needed
+						if [ ! -d `dirname /${CUSTOM_FILE}` ];then 
+
+							DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+							MESSAGE="Creating required directory \"`dirname /${CUSTOM_FILE}`\" for the file \"/${CUSTOM_FILE}\" on ${HOST}, ${DATE_TIME}"
+	
+							if [ ${INTERACTIVE} = YES ];then
+								echo -e "\n${MESSAGE}" | tee -a ${LOG}
+								mkdir -p `dirname /${CUSTOM_FILE}` 2>&1 | tee -a ${LOG}
+							else
+								echo -e "${MESSAGE}" >> ${LOG}
+								mkdir -p `dirname /${CUSTOM_FILE}` 2>&1 | tee -a ${LOG}
+							fi
+						fi
+
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="Replacing the local file \"/${CUSTOM_FILE}\" with \"${KICK_DIR}/${CUSTOM_FILE}\" on ${HOST}, ${DATE_TIME}"
+	
+						if [ ${INTERACTIVE} = YES ];then
+							echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+						else
+							echo -e "${MESSAGE}\n" >> ${LOG}
+						fi
+		
+						# Make backup of /${CUST_FILE} as needed
+						[ "${EXISTS}" = YES -a ! -f /${CUST_FILE}.${PROG}.${DATE} ] && mv /${CUSTOM_FILE} /${CUSTOM_FILE}.${PROG}.${DATE}
+						
+						# Correct /${CUSTOM_FILE}
+						cp ${KICK_DIR}/${CUSTOM_FILE} /${CUSTOM_FILE} 2>&1 | tee -a ${LOG}
+
+						STATUS=$?
+
+						# Confirm $STATUS is 0
+						if [ ${STATUS} != 0 ];then
+							DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+							ERROR_MESSAGE="\nError: The copy of ${KICK_DIR}/${CUSTOM_FILE} to /${CUSTOM_FILE} did not complete succesfully on ${HOST}, ${DATE_TIME}"
+							if [ ${INTERACTIVE} = YES ];then
+								echo -e "${ERROR_MESSAGE}" | tee -a ${LOG}
+							else
+								echo -e "${ERROR_MESSAGE}" >> ${LOG}
+								echo -e "${ERROR_MESSAGE}" | mailx -s "${PROG} error on ${HOST}" ${EMAIL_LIST}
+							fi
+							continue
+						fi
+
+						# Correct permissions on /${CUSTOM_FILE} as needed
+						CORRECT_PERMISSIONS
+	
+						# Determine if ${CUSTOM_FILE} is a service, 
+						# restart select services as needed
+						RESTART_SERVICE
+					fi
+				fi
+			fi
+		fi
+
+		# Move onto next $KICK_DIR if $LOOP is equal to $NEW_LOOP
+		if [ ${LOOP} -ge ${NEW_LOOP} -a ${BREAK} = YES ] ;then
+			BREAK=NO	
+			break
+		fi
+	done
+	done
+}
+
+# Perform requested task
+#########################################################################
+if [ ${UPDATE} = YES ];then
+
+	# Clear cache data
+	yum clean all | tee -a ${LOG}
+
+	# Stop the services listed in $SERVICES as needed
+	for SERVICE in `echo ${SERVICES} | sed 's/|/ /g'`
+	do
+
+		# Determine if $SERVICE is running
+		if [ `chkconfig --list ${SERVICE} 2>/dev/null | grep -c on` -eq 1 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nStopping the service \"${SERVICE}\", ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "${MESSAGE}" | tee -a ${LOG}
+			else
+				echo -e "${MESSAGE}" >> ${LOG}
+			fi
+
+			# Stop $SERVICE
+			/etc/init.d/${SERVICE} stop 2>&1 | tee -a ${LOG}
+		fi
+	done
+
+	# Build the array ON_SERVICES
+	COLLECT_SERVICES BEFORE
+
+	# Trap to restart services if "Ctrl C" is used to crash the script
+	trap 'START_SERVICE; exit 1' 1 2 3 6 15
+
+	# Create /etc/redhat-release.${PROG}.orig as needed
+	[ ! -f /etc/redhat-release.${PROG}.orig ] && cp /etc/redhat-release /etc/redhat-release.${PROG}.orig
+
+	if [ -d ${ROLLBACK_DIR} ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="\nRemoving old rollback directories on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then 
+			echo -e "\n${MESSAGE}" | tee -a ${LOG}
+			rm -r ${ROLLBACK_DIR}* 2>&1 | tee -a ${LOG}
+			mkdir -p ${ROLLBACK_DIR} 2>&1 | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}" >> ${LOG}
+			rm -r ${ROLLBACK_DIR}* >> ${LOG} 2>&1
+			mkdir -p ${ROLLBACK_DIR} >> ${LOG} 2>&1
+		fi
+	fi
+
+	START_DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nNote: OS updated started on ${HOST}: ${START_DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		${UPGRADE} 2>&1 | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		${UPGRADE} >> ${LOG} 2>&1
+	fi
+
+	# Remove DNSSEC internic update cron entry
+	rm -f /etc/cron.d/unbound-anchor
+
+	# Create links to the most recent shared libraries
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nCreating links to the most recent shared libraries, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+	ldconfig  -v >> ${LOG} 2>&1
+
+	# Check for custom files that are different from KICK_DIR, and replace as needed
+	[ ${RESTORE} = YES ] && RESTORE
+
+	STOP_DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nNote: OS updated completed on ${HOST}: ${STOP_DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+
+	# Rename default repository files as needed
+	if [ ${OS_TYPE} = CENTOS -a ${CURRENT_VERSION} != 3 ];then
+		for REPO_FILE in `ls /etc/yum.repos.d/* | egrep -v 'AR|PWR|\.off' 2>/dev/null`
+		do
+			if [ `echo ${REPO_FILE} | egrep -ci 'centos|rhel'` -eq 1 ];then
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nMoving ${REPO_FILE} to ${REPO_FILE}.off, ${DATE_TIME}"
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}" >> ${LOG}
+				fi
+
+				# Rename ${REPO_FILE}
+				mv ${REPO_FILE} ${REPO_FILE}.off
+			fi
+		done
+	fi
+
+	# Set REBOOT_PACKAGES to the list of pacakages if installed require reboot
+	REBOOT_PACKAGES="kernel"
+	REBOOT=NO
+
+	# Determine if any of the new packages installed require reboot, 
+	# and if so, set REBOOT to YES
+	for PACKAGE in ${REBOOT_PACKAGES}
+	do
+
+		# Determine if $PACKAGE was installed today
+		if [ `rpm -qi ${PACKAGE} 2>/dev/null | grep -c "Install Date:"` -ge 2 -a \
+			`rpm -qi ${PACKAGE} 2>/dev/null | grep "Install Date:" | tail -1 | 
+			grep -c "Date: ${RPM_DATE}"` -eq 1 ];then
+
+			START_DAY=`echo ${START_DATE_TIME} | awk '{print $1}' | 
+			awk -F- '{print $2}'`
+
+			INSTALL_DAY=`rpm -qi ${PACKAGE} 2>/dev/null | grep "Install Date:" | 
+			tail -1 | awk '{print $4}'`
+
+			# Confirm $START_DAY & $INSTALL_DAY are set
+			if [ "${START_DAY}" = "" -o "${INSTALL_DAY}" = "" ];then
+				REBOOT=YES
+				break
+			fi
+
+			# Confirm the Update time is before the install time
+			if [ "${START_DAY}" = "${INSTALL_DAY}" ];then
+
+				START_HOUR=`echo ${START_DATE_TIME} | awk '{print $2}' | 
+				awk -F: '{print $1}'`
+
+				INSTALL_HOUR=`rpm -qi ${PACKAGE} 2>/dev/null | 
+				grep "Install Date:" | tail -1 | awk '{print $7}' | 
+				awk -F: '{print $1}'`
+
+				# Confirm $START_HOUR & $INSTALL_HOUR are set
+				if [ "${START_DAY}" = "" -o "${INSTALL_DAY}" = "" ];then
+					REBOOT=YES
+					break
+				fi
+
+				# Add 12 to INSTALL_HOUR if RPM install time is PM
+				if [ `rpm -qi ${PACKAGE} 2>/dev/null | grep "Install Date:" | 
+					tail -1 | grep -wc PM` -eq 1 ];then
+					
+					# Add 12 to INSTALL_HOUR
+					let INSTALL_HOUR=${INSTALL_HOUR}+12
+				fi
+
+				if [ "${START_HOUR}" -eq "${INSTALL_HOUR}" ];then
+
+					START_MIN=`echo ${START_DATE_TIME} | awk '{print $2}' | 
+					awk -F: '{print $2}'`
+
+					INSTALL_MIN=`rpm -qi ${PACKAGE} 2>/dev/null | 
+					grep "Install Date:" | tail -1 | awk '{print $7}' | 
+					awk -F: '{print $2}'`
+					
+					# Confirm $START_MIN & $INSTALL_MIN are set
+					if [ "${START_MIN}" = "" -o "${INSTALL_MIN}" = "" ];then
+						REBOOT=YES
+						break
+					fi
+
+					if [ "${START_MIN}" -le "${INSTALL_MIN}" ];then
+
+						REBOOT=YES
+						break
+					fi
+
+				elif [ "${START_HOUR}" -lt "${INSTALL_HOUR}" ];then
+
+					REBOOT=YES
+					break
+				fi
+			fi
+		fi
+	done
+
+	# Double check, Determine if any of the new packages 
+	# installed require reboot, and if so, set REBOOT to YES
+	if [ ${REBOOT} = NO ];then
+
+		# Determine if any of the new packages installed require reboot, 
+		# and if so, set REBOOT to YES
+		REBOOT_PACKAGES="kernel"
+		for PACKAGE in ${REBOOT_PACKAGES}
+		do
+	
+			# Reset RPM_DATE to current date
+			# It's possible that the original $RPM_DATE was yesterday
+			RPM_DATE=`date '+%a %d %b %Y'`
+	
+			# Determine if $PACKAGE was installed today
+			if [ `rpm -qi ${PACKAGE} 2>/dev/null | grep -c "Install Date:"` -ge 2 -a \
+				`rpm -qi ${PACKAGE} 2>/dev/null | grep "Install Date:" | tail -1 | 
+				grep -c "Date: ${RPM_DATE}"` -eq 1 ];then
+	
+				START_DAY=`echo ${START_DATE_TIME} | awk '{print $1}' | 
+				awk -F- '{print $2}'`
+	
+				INSTALL_DAY=`rpm -qi ${PACKAGE} 2>/dev/null | 
+				grep "Install Date:" | tail -1 | awk '{print $4}'`
+
+				# Confirm $START_DAY & $INSTALL_DAY are set
+				if [ "${START_DAY}" = "" -o "${INSTALL_DAY}" = "" ];then
+					REBOOT=YES
+					break
+				fi
+	
+				# Confirm the Update time is before the install time
+				if [ "${START_DAY}" = "${INSTALL_DAY}" ];then
+	
+					START_HOUR=`echo ${START_DATE_TIME} | awk '{print $2}' | 
+					awk -F: '{print $1}'`
+	
+					INSTALL_HOUR=`rpm -qi ${PACKAGE} 2>/dev/null | 
+					grep "Install Date:" | tail -1 | awk '{print $7}' | 
+					awk -F: '{print $1}'`
+
+					# Confirm $START_HOUR & $INSTALL_HOUR are set
+					if [ "${START_DAY}" = "" -o "${INSTALL_DAY}" = "" ];then
+						REBOOT=YES
+						break
+					fi
+	
+					START_MIN=`echo ${START_DATE_TIME} | 
+					awk '{print $2}' | awk -F: '{print $2}'`
+
+					INSTALL_MIN=`rpm -qi ${PACKAGE} 2>/dev/null | 
+					grep "Install Date:" | tail -1 | awk '{print $7}' | 
+					awk -F: '{print $2}'`
+					
+					# Confirm $START_MIN & $INSTALL_MIN are set
+					if [ "${START_MIN}" = "" -o "${INSTALL_MIN}" = "" ];then
+						REBOOT=YES
+						break
+					fi
+
+					# Add 12 to INSTALL_HOUR if RPM install time is PM
+					if [ `rpm -qi ${PACKAGE} 2>/dev/null | grep "Install Date:" | 
+						tail -1 | grep -wc PM` -eq 1 ];then
+					
+						# Add 12 to INSTALL_HOUR
+						let INSTALL_HOUR=${INSTALL_HOUR}+12
+					fi
+	
+					if [ "${START_HOUR}" -eq "${INSTALL_HOUR}" ];then
+	
+						if [ "${START_MIN}" -le "${INSTALL_MIN}" ];then
+	
+							REBOOT=YES
+							break
+						fi
+	
+					elif [ "${START_HOUR}" -lt "${INSTALL_HOUR}" ];then
+	
+						REBOOT=YES
+						break
+					else
+						DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="\n${PACKAGE} was installed before ${START_DATE_TIME}, no reboot required. It was installed at ${INSTALL_HOUR}:${INSTALL_MIN}, ${DATE_TIME}"
+						if [ ${INTERACTIVE} = YES ];then
+        						echo -e "${MESSAGE}" | tee -a ${LOG}
+						else
+        						echo -e "${MESSAGE}" >> ${LOG}
+						fi
+					fi
+				else
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+						MESSAGE="\n${PACKAGE} was installed before ${START_DATE_TIME}, no reboot required. It was installed on ${START_DAY}, ${DATE_TIME}"
+					if [ ${INTERACTIVE} = YES ];then
+        					echo -e "${MESSAGE}" | tee -a ${LOG}
+					else
+        					echo -e "${MESSAGE}" >> ${LOG}
+					fi
+				fi
+			fi
+		done
+	fi
+	
+	# Update Java and Flash pluggins as needed
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nRunning ${MANAGE_PLUGINS}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+        	echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+        	echo -e "${MESSAGE}" >> ${LOG}
+	fi
+	${MANAGE_PLUGINS} 2>&1 | tee -a ${LOG}	
+
+	# Disable virbr0 network on EL6 systems as needed
+	if [ ${CURRENT_VERSION} = 6 ];then
+		if [ `ifconfig -a | grep virbr0 | grep -c inet` -ge 1 ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="\nDisabling virbr0 Virtual network, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+        			echo -e "${MESSAGE}" | tee -a ${LOG}
+			else
+        			echo -e "${MESSAGE}" >> ${LOG}
+			fi
+			virsh net-destroy default 2>&1 | tee -a ${LOG}
+			virsh net-undefine default 2>&1 | tee -a ${LOG}
+			service libvirtd restart 2>&1 | tee -a ${LOG}
+		fi
+	fi
+
+	# Run $KERNEL_CHECKS as needed
+	if [ `egrep -c '^exclude=kernel|^pkgSkipList=kernel' ${AR_YUM_CONF}` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nRunning ${KERNEL_CHECKS}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+		${KERNEL_CHECKS} 2>&1 | tee -a ${LOG}
+	fi
+
+	# Add /etc/cron.daily/prelink to /etc/rc.d/rc.local	startup script as needed
+	if [ -x /etc/cron.daily/prelink -a -f /etc/rc.d/rc.local ];then
+		if [ `grep -c /etc/cron.daily/prelink /etc/rc.d/rc.local` -eq 0 ];then
+			echo "/etc/cron.daily/prelink" >> /etc/rc.d/rc.local
+		fi
+	fi
+
+	# Confirm no new services were started by updates
+	COLLECT_SERVICES AFTER
+
+	# Clear cache data
+    	rm -fr /var/cache/yum/*
+	yum clean all
+
+# Display yum/config resoistory/config info
+elif [ ${DISPLAY} = YES ];then
+
+	# Set KERNEL_EXCLUDE, based on whether kernel updates are excluded or not
+	if [ `egrep -c '^exclude=kernel|^pkgSkipList=kernel' ${AR_YUM_CONF}` -eq 1 ];then
+		KERNEL_EXCLUDE=YES
+	else
+		KERNEL_EXCLUDE=NO
+	fi
+
+	# Clear cache data
+	yum clean all | tee -a ${LOG}
+
+	# Correct file permissions
+	CORRECT_PERMISSIONS
+
+	if [ ${OS_TYPE} = CENTOS ];then
+			
+		if [ ${CURRENT_VERSION} = 4 ];then
+			echo -e "\nChannel Name(s)"
+			up2date --show-channels
+		else
+			if [ "${ALTERNATE_CONFIG}" = YES ];then
+				yum -c ${AR_YUM_CONF} repolist
+			else
+				yum repolist
+			fi
+		fi
+	else # RedHat
+		if [ ${CURRENT_VERSION} = 4 ];then
+			echo -e "\nChannel Name(s)"
+			up2date --show-channels
+		else
+			if [ "${ALTERNATE_CONFIG}" = YES ];then
+				yum -c ${AR_YUM_CONF} repolist
+			else
+				yum repolist
+			fi
+		fi
+	fi
+
+	# Display Kernel update status
+	if [ ${KERNEL_EXCLUDE} = NO ];then
+		echo -e "\nNote: Kernel subject to being updated\n"
+	else
+		echo -e "\nNote: Kernel Not subject to being updated\n"
+	fi
+
+	# Remove DNSSEC internic update cron entry
+	rm -f /etc/cron.d/unbound-anchor
+
+else	# RESTORE = YES
+
+	# Rename default repository files as needed
+	if [ ${OS_TYPE} = CENTOS -a ${CURRENT_VERSION} != 3 ];then
+		for REPO_FILE in `ls /etc/yum.repos.d/* | egrep -v 'AR|PWR|\.off' 2>/dev/null`
+		do
+			if [ `echo ${REPO_FILE} | egrep -ci 'centos|rhel'` -eq 1 ];then
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="\nMoving ${REPO_FILE} to ${REPO_FILE}.off, ${DATE_TIME}"
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "${MESSAGE}" | tee -a ${LOG}
+				else
+					echo -e "${MESSAGE}" >> ${LOG}
+				fi
+
+				# Rename ${REPO_FILE}
+				mv ${REPO_FILE} ${REPO_FILE}.off
+			fi
+		done
+	fi
+
+	# Check for custom files  that are different from KICK_DIR, and replace as needed
+	RESTORE
+
+	# Correct permissions on /${CUSTOM_FILE} as needed
+	CORRECT_PERMISSIONS
+fi
+
+# Rename the file /lib/udev/write_net_rules to /lib/udev/write_net_rules.off as needed
+[ ${CURRENT_VERSION} = 6 -a -f /lib/udev/write_net_rules -a -f /etc/sysconfig/network-scripts/ifcfg-bond0 ] && mv /lib/udev/write_net_rules /lib/udev/write_net_rules.off
+
+# Rename default repository files as needed
+for REPO_FILE in `ls /etc/yum.repos.d/* | egrep -v 'AR|PWR|\.off' 2>/dev/null`
+do
+	if [ `echo ${REPO_FILE} | egrep -ci 'centos|rhel'` -eq 1 ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nMoving ${REPO_FILE} to ${REPO_FILE}.off, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		# Rename ${REPO_FILE}
+		mv ${REPO_FILE} ${REPO_FILE}.off 2>&1 | tee -a ${LOG}
+	fi
+done
+
+# Reboot system as needed
+if [ "${REBOOT}" = YES ];then
+
+	# Upgrade OMSA, system firmware and BIOS's as needed
+	if [ "${UPDATE_BIOS}" = YES ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nStarting OMSA, firmware and BIOS updating: ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		/stds/admin/bin/upgrade_system
+	fi
+
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nReboot required, rebooting ${HOST} now: ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		sleep 10
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+
+	# Reboot without calling shutdown, avoid possible shutdown issues
+	/usr/local/bin/muptime 2>/dev/null
+	/sbin/reboot -f
+
+elif [ ${UPDATE} = YES ];then
+
+	# Upgrade OMSA, system firmware and BIOS's as needed
+	if [ "${UPDATE_BIOS}" = YES ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="\nStarting OMSA, firmware and BIOS updating: ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "${MESSAGE}" | tee -a ${LOG}
+		else
+			echo -e "${MESSAGE}" >> ${LOG}
+		fi
+
+		/stds/admin/bin/upgrade_system
+	fi
+
+	# Start the services listed in $SERVICES as needed
+	START_SERVICE
+else
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	MESSAGE="\nNo Updates run on ${HOST}: ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+fi

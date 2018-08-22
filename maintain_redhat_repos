@@ -1,0 +1,448 @@
+#!/bin/bash
+# maintain_redhat_repos
+# Purpose: This scripts job is to maintain the RedHat EL6 repositories.
+
+HOST=`uname -n`
+PROG=`basename $0`
+LOG=/var/log/${PROG}.log
+#EMAIL_LIST=jsswift
+EMAIL_LIST=linux_admin@pwrutc.com
+CREATEREPO=/usr/bin/createrepo
+REPO_PARENT_DIR=/data/redhat_repo
+REPOSYNC_SERVERS="arlaplnfs03|arlaplnfs04|pwrlmail"
+PROXY_SERVER=http://sappipxp01.corp.aerojet.com:3128
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+# Written By: Jon Swift 06/13
+# Updated 12/13, Added support for EL5
+# Update 11-18-14, Added -d option to createrepo command
+# Updated 06-22-15, Adding logic to control logging based in $INTERACTIVE
+# Updated 06-21-16, Changed REPOSYNC_SERVERS
+
+# Determine if this script is being run interactively
+#########################################################################
+tty -s
+if [ $? = 0 ];then
+	INTERACTIVE=YES
+else
+	INTERACTIVE=NO
+fi
+
+# Confirm this script is run as root
+#########################################################################
+if [ `whoami` != root ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: ${PROG} must be run as root\n"
+	else
+		echo -e "\nError: ${PROG} must be run as root\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm this script is being on $REPOSYNC_SERVER
+#########################################################################
+if [ `echo ${REPOSYNC_SERVERS} | egrep -c ${HOST}` -eq 0 ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: ${PROG} may not run on ${HOST}\n"
+	else
+		echo -e "\nError: ${PROG} may not run on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm the $CREATEREPO command is installed
+#########################################################################
+if [ ! -x ${CREATEREPO} ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: The required command \"${CREATEREPO}\" not installed on ${HOST}\n"
+	else
+		echo -e "\nError: The required command \"${CREATEREPO}\" not installed on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Confirm that the required repo directory is mounted localy
+#########################################################################
+if [ ! -d ${REPO_PARENT_DIR} ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nError: The required repository directory \"${REPO_PARENT_DIR}\" does mounted on ${HOST}\n"
+	else
+		echo -e "\nError: The required repository directory \"${REPO_PARENT_DIR}\" does mounted on ${HOST}\n" >> ${LOG}
+	fi
+	exit
+fi
+
+# Set EL_VERSION to the EL version installed on this system
+#########################################################################
+if [ `grep -c "release 5" /etc/redhat-release` -eq 1 ];then
+	EL_VERSION=5
+elif [ `grep -c "release 6" /etc/redhat-release` -eq 1 ];then
+	EL_VERSION=6
+else
+	echo -e "\nError: ${PROG} only supported on EL 5 & 6"
+	exit
+fi
+
+# The USAGE function is used to display usage options
+#########################################################################
+USAGE () {
+
+	[ ${INTERACTIVE} = NO ] && exit
+
+	echo -e "\n\n${PROG} Usage:\n"
+	echo -e "\t\t**********************"
+	echo -e "\t\t* Function Arguments *"
+	echo -e "\t\t**********************\n"
+	echo -e " -D\tDownload latest RedHat updates to the local repoistory."
+	echo -e " -U\tUpdate local repoistory repodata files."
+	echo -e " -C\tClone local RedHat repoistory."
+	echo -e " -R\tRemove local RedHat repoistory.\n"
+	echo -e "\t\t***************************"
+	echo -e "\t\t* Clarification Arguments *"
+	echo -e "\t\t***************************\n"
+	echo -e " -d\tDefines function applies to \"development\" repository."
+	echo -e " -p\tDefines function applies to \"production\" repository."
+	echo -e " -v #\tDefines the RedHat EL version (5 or 6).\n\n"
+	echo -e " Example: Download latest RedHat updates to the production EL5 respository."
+	echo -e "\t${PROG} -D -p -v 5\n"
+	echo -e " Example: Download latest RedHat 6 updates to the development EL6"
+	echo " respository, and update the local EL6 development repodata files."
+	echo -e "\t${PROG} -Dd -U -v 6\n"
+	echo -e " Example: Clone the local EL6 development repo to the local EL6 production repo."
+	echo -e "\t${PROG} -Cdv6\n"
+	echo -e " Required: One \"Function Argument\" is always needed."
+	echo -e " Note: The -C and -R arguments can only be used by themselves.\n"
+	echo -e " Required: Either the -d or -p argument is always needed."
+	echo -e " Note: The -d and -p arguments are mutually exclusive.\n"
+	echo -e " Required: The -v \"Ver. #\" argument is always needed."
+	exit
+}
+
+# Confirm syntax is correct
+#########################################################################
+[ $# -eq 0 ] && USAGE
+
+# Set OPTERR to 0, turns off getops error reporting
+OPTERR=0
+
+# Pre Set several variables
+DOWNLOAD=""
+UPDATE=""
+CLONE=""
+REMOVE=""
+PRO_DEV=""
+VER=""
+
+# Parse command line options
+#########################################################################
+while getopts "DUCRdpv:" OPT
+do
+	case ${OPT} in
+
+		D) # Download latest RedHat updates to the local repoistory
+		DOWNLOAD=YES
+		
+		# Confirm that only $DOWNLOAD and or $$UPDATE are set
+		if [ "${CLONE}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		U) # Update local repoistory repodata files
+		UPDATE=YES
+		
+		# Confirm that only $UPDATE and or $DOWNLOAD are set
+		if [ "${CLONE}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		C) # Clone local repository
+		CLONE=YES
+		
+		# Confirm that only $CLONE is set
+		if [ "${UPDATE}" != "" -o "${DOWNLOAD}" != "" -o "${REMOVE}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		R) # Remove local repository
+		REMOVE=YES
+		
+		# Confirm that only $REMOVE is set
+		if [ "${UPDATE}" != "" -o "${CLONE}" != "" -o "${DOWNLOAD}" != "" ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+		;;
+
+		d) # Defines that udates apply to "development" repository
+		# Confirm that $PRO_DEV is not already set
+		if [ "${PRO_DEV}" = "" ];then
+			PRO_DEV=dev
+			DEV_PRO=pro
+		else
+			USAGE
+		fi
+		;;
+
+		p) # Defines that udates apply to "production" repository
+		# Confirm that $PRO_DEV is not already set
+		if [ "${PRO_DEV}" = "" ];then
+			PRO_DEV=pro
+			DEV_PRO=dev
+		else
+			USAGE
+		fi
+		;;
+
+		v) # Defines the RedHat version to update
+		VER=${OPTARG}
+		
+		# Confirm $VER is set to a 4, 5 or 6
+		if [ "${VER}" != 6 -a "${VER}" != 5 ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nInvalid syntax"
+			else
+				echo -e "\nInvalid syntax" >> ${LOG}
+			fi
+			sleep 2
+			USAGE
+		fi
+
+		# Confirm EL_VERSION matches $VER
+		if [ ${VER} != ${EL_VERSION} ];then
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\nError: The EL version selected must match the OS version on this system"
+			else
+				echo -e "\nError: The EL version selected must match the OS version on this system" >> ${LOG}
+			fi
+			exit
+		fi
+
+		# Set VER to Channel name assigned to this host
+		if [ "${VER}" = 5 ];then
+
+			VER=rhel-5-server-rpms
+		else
+			VER=rhel-6-server-rpms
+		fi
+		;;
+
+		*) # Error
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\nInvalid syntax"
+		else
+			echo -e "\nInvalid syntax" >> ${LOG}
+		fi
+		sleep 2
+		USAGE
+		;;
+	esac
+done
+
+# Confirm that $PRO_DEV is set
+#########################################################################
+if [ "${PRO_DEV}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Confirm that $VER is set
+#########################################################################
+if [ "${VER}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Confirm that $DOWNLOAD and or $UPDATE are set
+#########################################################################
+if [ "${DOWNLOAD}" = "" -a "${UPDATE}" = "" -a "${CLONE}" = "" -a "${REMOVE}" = "" ];then
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\nInvalid syntax"
+	else
+		echo -e "\nInvalid syntax" >> ${LOG}
+	fi
+	sleep 2
+	USAGE
+fi
+
+# Set REPO based on $PRO_DEV
+#########################################################################
+REPO=${REPO_PARENT_DIR}/${PRO_DEV}
+
+# Set CLONE_TARGET, base on ${REPO_PARENT_DIR} ${DEV_PRO} ${VER}
+#########################################################################
+CLONE_TARGET_REPO=${REPO_PARENT_DIR}/${DEV_PRO}/${VER}
+
+#  The CONFIRM function is used to interactively confirm the clonning/removal operations
+#########################################################################
+CONFIRM () {
+	# set -x
+
+	# Confirm operation
+	ANSWER=""
+	echo -e "\n\t*********************"
+	echo -e "\t* Confirm Operation *"
+	echo -e "\t*********************\n"
+	until [ -n "${ANSWER}" ]
+	do
+		if [ "${CLONE}" = YES ];then
+
+			echo -n " Clone \"${REPO}/${VER}\" to \"${CLONE_TARGET_REPO}\" Y/N > "
+		else
+			echo -n " Remove \"${REPO}/${VER}\" Y/N > "
+		fi
+		read ANSWER
+
+		case ${ANSWER} in
+
+			"") # Do Nothing
+			echo ""
+			;;
+
+			q|Q|N|n|NO|no|No)  # No
+			ANSWER=NO
+			exit
+			;;
+
+			Y|y|YES|yes|Yes) # Yes
+			ANSWER=YES
+			;;
+
+			*) # Invalid Answer
+			echo -e "\n Invalid selection ${ANSWER}\n"
+			ANSWER=""
+			sleep 1
+			;;
+		esac
+	done
+}
+
+# Download the latest updates from the external RedHat site using reposync
+#########################################################################
+if [ "${DOWNLOAD}" = YES ];then
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nStarting reposync from External RedHat site to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+
+	#export http_proxy=pwrutc\\jsswift:@${PROXY_SERVER}
+
+	# Download repo data from external RedHat repository using reposync
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		if [ -d ${REPO}/${VER}/repodata ];then
+			reposync -p ${REPO} --repoid=${VER} -l -n 2>&1 | tee -a ${LOG}
+		else
+			reposync -p ${REPO} --repoid=${VER} -l 2>&1 | tee -a ${LOG}
+		fi
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		if [ -d ${REPO}/${VER}/repodata ];then
+			reposync -p ${REPO} --repoid=${VER} -l -n 1>> ${LOG} 2>&1
+		else
+			reposync -p ${REPO} --repoid=${VER} -l 1>> ${LOG} 2>&1
+		fi
+	fi
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nCompleted reposync from External RedHat site to ${REPO} on ${HOST} at ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+fi
+
+# Update the local repoistory repodata files as needed
+#########################################################################
+if [ "${UPDATE}" = YES ];then
+
+	# Define CREATEREPO based on the existance of ${REPO}/repodata/
+	if [ -d ${REPO}/${VER}/repodata ];then
+		CREATEREPO="createrepo --update -d --verbose ${REPO}/${VER}"
+	else
+		CREATEREPO="createrepo --verbose -d ${REPO}/${VER}"
+	fi
+
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nStarting repotdata update of ${REPO}/${VER} on ${HOST} at ${DATE_TIME}\n"
+
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+		${CREATEREPO} 2>&1 | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+		${CREATEREPO} 1>> ${LOG} 2>&1
+	fi
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="\nCompleted repodata update of ${REPO}/${VER} on ${HOST} at ${DATE_TIME}\n"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "${MESSAGE}" | tee -a ${LOG}
+	else
+		echo -e "${MESSAGE}" >> ${LOG}
+	fi
+
+# Clone local repoistory files as needed
+#########################################################################
+elif [ "${CLONE}" = YES ];then
+	[ ${INTERACTIVE} = NO ] && exit
+
+	# Confirm clonning operation
+	CONFIRM
+
+	# Create $CLONE_TARGET_REPO as needed
+	[ ! -d ${CLONE_TARGET_REPO} ] && mkdir -p ${CLONE_TARGET_REPO}
+
+	#  Report activity
+	echo -e "\n Clonning \"${REPO}/${VER}\" to \"${CLONE_TARGET_REPO}\"\n"
+
+	# rsync $REPO to $CLONE_TARGET_REPO
+	rsync -a --progress --delete ${REPO}/${VER}/ ${CLONE_TARGET_REPO}
+
+# Remove local repoistory repodata files as needed
+#########################################################################
+elif [ "${REMOVE}" = YES ];then
+	[ ${INTERACTIVE} = NO ] && exit
+
+	# Confirm removal operation
+	CONFIRM
+
+	#  Report activity
+	echo -e "\n Removing ${REPO}/${VER}\n"
+
+	# Remove $REPO
+	rm -f ${REPO}/${VER}
+fi

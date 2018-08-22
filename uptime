@@ -1,0 +1,160 @@
+# The UPTIME function is used to set UPTIME_MINS to the 
+# total number of minutes the system has been up
+################################################################################
+UPTIME () {
+	#set -x
+
+	# Set UPTIME to the output of the uptime command
+	UPTIME=`uptime`
+
+	# Set DAYS to the total number of days, HOURS to the total number of hours, and MINS
+	# to the total number of minutes this system has been up.
+	if [ `echo ${UPTIME} | egrep -c 'day.s.,|days,|day,'` -eq 1 ];then
+
+		# Set DAYS, to the number of days uptime
+		DAYS=`echo ${UPTIME} | awk '{print $3}'`
+
+		# min(s) was changed to min.s. to reduce problems
+		if [ `echo ${UPTIME} | egrep -c 'hr.s.|hrs,'` -eq 1 ];then
+			HOURS=`echo ${UPTIME} | awk '{print $5}' | sed 's/,//'`
+			HOURS=`echo "${HOURS}*60" | bc`
+			MINS=0
+
+		# min(s) was changed to min.s. to reduce problems
+		elif [ `echo ${UPTIME} | egrep -c 'min.s.|mins,|min,'` -eq 1 ];then
+			MINS=`echo ${UPTIME} | awk '{print $5}'`
+			HOURS=0
+			
+		elif [ `echo ${UPTIME} | awk '{print $5}' | egrep -c '[0-9]+:[0-9[0-9]'` -eq 1 ];then
+			HOURS=`echo ${UPTIME}| awk '{print $5}' | awk -F: '{print $1}'`
+			HOURS=`echo "${HOURS}*60" | bc`
+			MINS=`echo ${UPTIME} | awk '{print $5}' | awk -F: '{print $2}' | sed 's/,//'`
+
+		elif [ `echo ${UPTIME} | egrep -c 'user.s.|users,|user,'` -eq 1 ];then
+			HOURS=0
+			MINS=0
+		else 
+			DATE_TIME=`date '+%m-%d-%y %H:%M'`
+			MESSAGE="Error: The output of the uptime command on ${HOST} at ${DATE_TIME} unsupported, UPTIME = ${UPTIME}"
+			[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+			echo "${MESSAGE}" >> ${LOG}
+			SEND_MAIL
+		fi
+	
+	# hrs(s) was changed to hrs.s. to reduce problems
+	elif [ `echo ${UPTIME} | egrep -c 'hr.s.|hrs,'` -eq 1 ];then
+
+		HOURS=`echo ${UPTIME} | awk '{print $3}'`
+		HOURS=`echo "${HOURS}*60" | bc`
+		MINS=0
+		DAYS=0
+	
+	# min(s) was changed to min.s. to reduce problems
+	elif [ `echo ${UPTIME} | egrep -c 'min.s.|mins,|min,'` -eq 1 ];then
+	
+		MINS=`echo ${UPTIME} | awk '{print $3}'`
+		HOURS=0
+		DAYS=0
+
+	elif [ `echo ${UPTIME} | awk '{print $3}' | egrep -c '[0-9]+:[0-9[0-9]'` -eq 1 ];then
+		HOURS=`echo ${UPTIME} | awk '{print $3}' | awk -F: '{print $1}'`
+		HOURS=`echo "${HOURS}*60" | bc`
+       		MINS=`echo ${UPTIME} |  awk '{print $3}' | awk -F: '{print $2}' | sed 's/,//'`
+		DAYS=0
+
+	elif [ `echo ${UPTIME} | egrep -c 'user.s.|users,|user,'` -eq 1 ];then
+		HOURS=1
+       		MINS=0
+		DAYS=0
+	else
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The output of the uptime command on ${HOST} at ${DATE_TIME} unsupported, UPTIME = ${UPTIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+	
+	# Confirm $HOURS is set properly
+	if [ "${HOURS}" = "" -o `echo ${HOURS} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"HOURS\", \"${HOURS}\" not set properly on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	elif [ `echo ${HOURS} | egrep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"HOURS\", \"${HOURS}\" not set to just a number on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+	
+	# Confirm $MINS is set properly
+	if [ "${MINS}" = "" -o `echo ${MINS} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"MINS\", \"${MINS}\" not set properly on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+
+	elif [ `echo ${MINS} | egrep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"MINS\", \"${MINS}\" not set to just a number on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+	
+	# Confirm $DAYS is set properly
+	if [ "${DAYS}" = "" -o `echo ${DAYS} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"DAYS\", \"${DAYS}\" not set properly on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+
+	elif [ `echo ${DAYS} | egrep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"DAYS\", \"${DAYS}\" not set to just a number on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+
+	# Set MONTHS based on $DAYS
+	if [ ${DAYS} -lt 30 ];then
+		MONTHS=0
+	else
+		# $MONTHS -ge 30
+		let MONTHS=${DAYS}/30
+	fi
+
+	# Confirm $MONTHS is set properly
+	if [ "${MONTHS}" = "" -o `echo ${MONTHS} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"MONTHS\", \"${MONTHS}\" not set properly on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+	
+       	# Set UPTIME_MINS to ${DAYS}+${HOURS}+${MINS}
+	################################################################################
+       	UPTIME_MINS=`echo "${DAYS}+${HOURS}+${MINS}" | bc`
+	
+	# Confirm $UPTIME_MINS is set properly
+	if [ "${UPTIME_MINS}" = "" -o `echo ${UPTIME_MINS} | egrep -c '[0-9]+'` -eq 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"UPTIME_MINS\", \"${UPTIME_MINS}\" not set properly on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+
+	elif [ `echo ${UPTIME_MINS} | egrep -c '[^0-9]'` -eq 1 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M'`
+		MESSAGE="Error: The required variable \"UPTIME_MINS\", \"${UPTIME_MINS}\" not set to just a number on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+		echo "${MESSAGE}" >> ${LOG}
+		SEND_MAIL
+	fi
+}

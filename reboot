@@ -1,0 +1,290 @@
+#!/bin/sh
+# reboot/halt/poweroff
+# Purpose: This is a wrapper script for the reboot, halt and poweroff commands.
+# It's job is to ask for confirmation prior to executing the real commands.
+# This script is intended to be installed in /usr/local/bin and requires
+# that the PATH for root include /usr/local/bin first to work properly.
+#
+# Version 1.1
+#
+# Written by Jon Swift 01-05
+##############################################################################
+# Updated 07/07, Added additional features stop CRS, 
+#	umount OCFS2 and warning of manage_sessions cron job
+# Updated 06/09, Add the new feature to support updating $UPTIME_LOG 
+#	for planned outages, and combined the 3 unique reboot, halt, 
+#	powweroff wrapper scripts into 1.
+# Updated 02/11, Add Support for SuSE
+##############################################################################
+
+OS=`uname -s`
+FUNCTION=`basename ${0}`
+HOST=`uname -n`
+ARG=$*
+
+# Make sure this is run only on supported platforms
+###############################################################################
+if [ ${OS} = Linux ];then
+
+	REBOOT=/sbin/reboot
+	HALT=/sbin/halt
+	POWEROFF=/sbin/poweroff
+	ECHO="/bin/echo"
+	WHOAMI=/usr/bin/whoami
+	SETCOLOR_RED="${ECHO} -en \\033[1;31m"
+	SETCOLOR_NORMAL="${ECHO} -en \\033[0;39m"
+	MTAB=/etc/mtab
+	UPTIME_LOG=/var/log/muptime.log
+	CROND=crond
+	if [ -f /etc/redhat-release ];then
+		CRON=/var/spool/cron/root
+	elif [ -f /etc/SuSE-release ];then
+		CRON=/var/spool/cron/tabs/root
+	else
+		CRON=/dev/null
+	fi
+
+elif [ ${OS} = SunOS ];then
+
+	REBOOT=/usr/sbin/reboot
+	HALT=/usr/sbin/halt
+	POWEROFF=${HALT}
+	ECHO="/usr/ucb/echo"
+	WHOAMI=/usr/ucb/whoami
+	SETCOLOR_RED="echo \\033[1;31m\c"
+	SETCOLOR_NORMAL="echo \\033[0;39m\c"
+	MTAB=/etc/mnttab
+	CRON=/var/spool/cron/crontabs/root
+	UPTIME_LOG=/var/adm/muptime.log
+	CROND=cron
+else
+	echo "Ths wrapper script for ${FUNCTION} is not supported on ${OS}"
+	exit 1
+fi
+
+# Make sure this script is run by root
+###############################################################################
+if [ `${WHOAMI}` != root ];then
+        echo ""
+        echo "Error: must be root to execute ${FUNCTION}"
+        echo ""
+        exit 1
+fi
+
+# The CRS function will be used on Oracle RAC systems only
+###############################################################################
+CRS () {
+	
+	# Check to see if this system has OCFS2 file systems mounted
+	# And if it does, try to umount all ocfs2 file systems
+	if [ `grep -wc ocfs2 ${MTAB}` -ge 1 -a -f /etc/ocfs2/cluster.conf -a "${ARG}" = "" ];then
+
+		# Stop CRS if it is running
+		if [ `grep -c /export/apps/crs /etc/mtab` -eq 1 -a `ps -aef | grep -c crs` -gt 1 ];then 
+
+			# Stop CRS
+			echo ""
+			echo "Stopping CRS"
+			echo "Please be patient...."
+			crsctl stop crs
+			sleep 45
+
+			# Forcefully kill any CRS process 
+			# that may still be running
+			pkill -9 evmd 1>/dev/null 2>&1
+			pkill -9 init.crsd 1>/dev/null 2>&1
+			pkill -9 crsd.bin 1>/dev/null 2>&1
+			pkill -9 evmd.bin 1>/dev/null 2>&1
+			pkill -9 oclsomon 1>/dev/null 2>&1
+			pkill -9 oclsomon.bin 1>/dev/null 2>&1
+			pkill -9 ocssd.bin 1>/dev/null 2>&1
+		fi
+
+		# Set CLUSTER to the cluster name used for OCFS2 cluster
+		CLUSTER=`grep cluster /etc/ocfs2/cluster.conf | 
+			grep -v '^#' | tail -1 | awk '{print $NF}'`
+
+		echo ""
+		echo "Umounting all mounted ocfs2 file systems"
+		echo "Please be patient, this could take several minutes...."
+		# Umount all OCFS2 file systems, 
+		# including the special /dlm file system
+		for OCFS2_FS in `grep ocfs2 /etc/mtab | grep -v ocfs2_dlmfs | awk '{print $2}'`
+		do
+			fuser -k ${OCFS2_FS} 1> /dev/null 2>&1
+		done
+		umount -at ocfs2
+		umount /dlm
+
+		# Turn off OCFS2 cluster services
+		echo ""
+		echo "Turning off OCFS2 cluster services"
+		/etc/init.d/o2cb force-offline ${CLUSTER}
+					
+		echo ""
+		echo "Done umounting all ocfs2 file systems"
+		echo ""
+	fi
+}
+
+# On Compute nodes only determine if $ARG includes '-P', which indicates "planned"
+###############################################################################
+if [ `echo ${HOST} | egrep -c '^node[1-9][1-9]'` -eq 1 -a `echo "${ARG}" | egrep -c -- 'P'` -eq 1 ];then
+	
+	# Stop/kill crond
+	pkill -9 ${CROND}
+	
+	# Set DATE_TIME
+	DATE_TIME=`date '+%m-%d-%y %H:%M'`
+	
+	# Add time of planned outage to $UPTIME_LOG
+	echo "#####################################################" >> ${UPTIME_LOG}
+	echo "Planned outage, ${DATE_TIME}" >> ${UPTIME_LOG}
+	echo "#####################################################" >> ${UPTIME_LOG}
+
+	# Remove -P from $ARG
+	ARG=`echo $ARG | sed 's/P//; s/^-$//'`
+
+	# Perform function reboot/halt/poweroff
+	if [ ${FUNCTION} = reboot ];then
+		${REBOOT} ${ARG}
+		exit
+
+	elif [ ${FUNCTION} = halt ];then
+		${HALT} ${ARG}
+		exit
+
+	elif [ ${FUNCTION} = poweroff ];then
+		${POWEROFF} ${ARG}
+		exit
+
+	else
+		echo "Unexpected command, only halt, reboot, and poweroff supported"
+		exit 1
+	fi
+fi
+
+# All systems, including Compute nodes
+###############################################################################
+
+VALID=""
+until [ "${VALID}" != "" ]
+do
+
+	# Display manage_sessions cron job warning if this systems is running the manage_sessions cron job
+	if [ `grep -w manage_sessions ${CRON} | grep -v '^#' | wc -l` -ge 1 ];then
+		echo ""
+		echo "Be aware that this system, \"${HOST}\" runs the manage_sessions cron job"
+		echo ""
+	# Display mount_sessions cron job warning if this systems is running the mount_sessions cron job
+	elif [ `grep -w mount_sessions ${CRON} | grep -v '^#' | wc -l` -ge 1 ];then
+		echo ""
+		echo "Be aware that this system, \"${HOST}\" runs the mount_sessions cron job"
+		echo ""
+	fi
+
+	# Confirm operation, should we really reboot/halt/poweroff this system
+	echo ""
+	answer=""
+	until [ "${answer}" != "" ]
+	do
+		${ECHO} -n "Do you really want to ${FUNCTION} "
+		$SETCOLOR_RED
+	 	${ECHO} -n "${HOST} " 
+		$SETCOLOR_NORMAL	
+		${ECHO} -n "Y/N > "
+		read answer
+	done
+	case ${answer} in
+		y|Y|YES|yes|Yes|OK|ok)
+			VALID=TRUE
+
+			# Collect system name
+			HOST_NAME=""
+			echo ""
+			until [ -n "${HOST_NAME}" ]
+			do
+        			${ECHO} -n "Enter hostname of this system > "
+        			read HOST_NAME
+			done
+
+			# Confirm ${HOST_NAME} is the same as $HOST
+			if [ "${HOST_NAME}" != "${HOST}" ];then
+			
+        			echo ""
+        			echo "Error: The hostname entered \"${HOST_NAME}\", does not match the real hostname \"${HOST}\""
+        			echo "Unable to ${FUNCTION} ${HOST}"
+        			echo ""
+        			exit
+			fi
+
+			VALID2=""
+			until [ "${VALID2}" != "" ]
+			do
+
+				# Ask if this is a planned outage
+				echo ""
+				PLANNED=""
+				until [ "${PLANNED}" != "" ]
+				do
+					${ECHO} -n "Is this a planned outage, Y/N > "
+					read PLANNED
+				done
+
+				case ${PLANNED} in
+				y|Y|YES|yes|Yes|OK|ok)
+					VALID2=TRUE
+	
+					# Stop/kill crond
+					pkill -9 ${CROND}
+	
+					# Set DATE_TIME
+					DATE_TIME=`date '+%m-%d-%y %H:%M'`
+	
+					# Add time of planned outage to $UPTIME_LOG
+					echo "#####################################################" >> ${UPTIME_LOG}
+					echo "Planned outage, ${DATE_TIME}" >> ${UPTIME_LOG}
+					echo "#####################################################" >> ${UPTIME_LOG}
+				;;
+
+				n|N|no|NO|nope|Nope)
+				VALID2=TRUE
+				;;
+
+				*)
+					echo ""
+					echo "Invalid Response ${PLANNED}"
+					;;
+				esac
+			done
+
+			# Run the Function CRS as needed
+			[ `echo ${HOST} | egrep -c 'ractst|racdev|racpro'` -eq 1 ] && CRS
+
+			# Perform function reboot/halt/poweroff
+			if [ ${FUNCTION} = reboot ];then
+				${REBOOT} ${ARG}
+
+			elif [ ${FUNCTION} = halt ];then
+				${HALT} ${ARG}
+
+			elif [ ${FUNCTION} = poweroff ];then
+				${POWEROFF} ${ARG}
+
+			else
+				echo "Unexpected command, only halt, reboot, and poweroff supported"
+				exit 1
+			fi
+			;;
+
+		n|N|no|NO|nope|Nope)
+			VALID=TRUE
+			exit 0
+			;;
+
+		*)
+		echo ""
+		echo "Invalid Response ${answer}"
+		;;
+	esac
+done

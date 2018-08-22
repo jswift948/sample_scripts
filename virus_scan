@@ -1,0 +1,626 @@
+#!/bin/bash 
+# virus_scan
+# Purpose: This scripts job is to run or update the Solaris & Linux McAfee software,
+
+# Written By: Jon Swift 03-04
+# Updated 05-05, Changed PDM data areas for svr014 Jon Swift
+# Updated 12-05, Changed update section to use local dat files
+# Updated 06-10, Converted script to use new standard dat file name.
+# Updated 06-14, Converted to bash shell
+# Updated 04-16, Made required changes to support new NFS servers arlaplnfs03 &04.
+
+
+# Set Misc variables
+SMBCLIENT=/usr/local/samba/bin/smbclient
+HOST=`uname -n`
+PROG=`basename ${0}`
+DATA_DIR=""
+CATIA_MODEL_HOST=goliath-new
+PDM_DATA_HOSTS="svr014 xena helen"
+NFS_SERVERS="arlaplnfs03 arlaplnfs04"
+SCAN_TEAM=scan_team
+PDM_TEAM=pdm
+OS=`uname -s`
+WPB_IP=10.11
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/ucb
+IP=`ifconfig -a | grep inet | grep -v 127.0 | head -1 | awk '{print $2}' | sed 's/addr://'`
+
+# Data Areas
+DATA=/export/data
+HOME=/export/home
+SCRATCH=/export/scratch
+
+if [ ${OS} = SunOS ];then
+	UVSCAN=/apps/uvscan/uvscan
+	LOG_DIR=/apps/uvscan/log
+	DEPOT_DIR=/apps/uvscan/depot
+	DAT_DIR=/apps/uvscan/dat
+	UVSCAN_DIR=uvscan
+	FIND=/apps/gnu/bin/find
+elif [ ${OS} = Linux ];then
+	UVSCAN=/apps/luvscan/uvscan
+	LOG_DIR=/apps/luvscan/log
+	DEPOT_DIR=/apps/luvscan/depot
+	DAT_DIR=/apps/luvscan/dat
+	UVSCAN_DIR=luvscan
+        if [ `uname -r | grep -c el6` -eq 1 ];then
+          FIND=/bin/find
+        else
+	  FIND=/usr/bin/find
+        fi
+else
+	echo -e "\nError: ${PROG} only supported on Solaris and Linux"
+	exit
+fi
+
+
+# Catia Model Areas
+if [ ${HOST} = arlaplnfs03 -o ${HOST} = arlaplnfs04 ];then
+	CATIA="/export/data/data15/catrel /export/data/data15/catrel1 /export/data/data15/catrel2 /export/data/data15/catrel3"
+	CATIA="${CATIA} /export/data/data15/catia_models_3 /export/data/data15/catia_models_4 /export/data/data15/catia_models_5" 
+fi
+
+# Set ALL to the names of all the data areas to check
+ALL="${CATIA} ${DATA} ${HOME} ${SCRATCH}"
+
+# Usage function
+USAGE () {
+
+	echo -e "\nUsage: ${PROG}"
+	echo "${PROG} -A 					Scan all common areas"
+	echo "${PROG} -C					Scan Catia Model areas"
+	echo "${PROG} -D					Scan Data areas"
+	echo "${PROG} -H					Scan Home directories"
+	echo "${PROG} -P					Scan PDM directories"
+	echo "${PROG} -S					Scan Scratch areas"
+	echo "${PROG} -d /data_area			Scan one directory"
+	echo "${PROG} -d /data_area_1 /data_area_2		Scan multiple directories, sequentially"
+	echo "${PROG} -l					List all known viruses"
+	echo "${PROG} -u					Update DAT files"
+	echo "${PROG} -v					Display uvscan version info"
+	echo "${PROG} -L					Display log files"
+	echo -e "\n${PROG} is a wrapper script for the McAfee uvscan tool for Unix\n"
+	exit 0
+}
+
+# Make sure that ${UVSCAN} is installed on this system
+if [ ! -s ${UVSCAN} ];then
+
+	echo -e "\nError: ${UVSCAN}, note installed on this system"
+	echo -e "Aborting ${PROG}\n"
+        exit 1
+fi
+
+# Make sure that this scripts is being run as root
+if [ `whoami` != root ];then
+
+	echo -e "\nMust be root to execute ${PROG}"
+	exit 1
+fi
+
+# Confirm syntax is correct
+[ $# -eq 0 ] && USAGE
+
+# Determine if this script is being run from the command
+# line or from a non interactive environment like cron
+# Set INTERACTIVE, to either YES or NO
+tty -s
+if [ $? = 0 ];then
+        INTERACTIVE=YES
+else
+        INTERACTIVE=NO
+fi
+
+# Set CURRENT_DAT, to the dat directory with the highest number
+CURRENT_DAT=`ls -1 ${DAT_DIR} | sort +0 -1n | tail -1`
+
+# Create LOG_DIR as needed
+[ ! -d ${LOG_DIR} ] && mkdir ${LOG_DIR}
+
+# Set DATE
+DATE=`date '+%m%d%y'`
+
+# Set Time
+TIME=`date '+%H:%M:%S'`
+
+# Parse command line options
+while getopts "ACDHLPSd:luv" OPT
+do
+	case ${OPT} in
+
+		A ) # Scan all data areas
+
+			# Set DATA_DIR to $ALL
+	   		DATA_DIR=${ALL}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_all_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this is being run on one of the systems is NFS_SERVERS
+			if [ `echo ${NFS_SERVERS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n"
+				echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n" >> ${LOG}
+				exit 1
+			fi
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		C ) # Catia scan Area
+
+			# Set DATA_DIR to $CATIA
+	   		DATA_DIR=${CATIA}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_catia_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this is being run on one of the systems is NFS_SERVERS
+			if [ `echo ${NFS_SERVERS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n"
+				echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n" >> ${LOG}
+				exit 1
+			fi
+			;;
+
+		D ) # DATA scan Area
+
+			# Set DATA_DIR to $DATA
+	   		DATA_DIR=${DATA}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_data_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this is being run on one of the systems is NFS_SERVERS
+			if [ `echo ${NFS_SERVERS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n"
+				echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n" >> ${LOG}
+				exit 1
+			fi
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		H ) # HOME scan Area
+
+			# Set DATA_DIR to $HOME
+	   		DATA_DIR=${HOME}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_home_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this is being run on one of the systems is NFS_SERVERS
+			if [ `echo ${NFS_SERVERS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n"
+				echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n" >> ${LOG}
+				exit 1
+			fi
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		P ) # PDM scan Area
+
+			# SET PDM to the data areas for PDM based on $HOST
+			if [ ${HOST} = xena ];then
+
+				PDM_NON_RESTRICTED="/export/data/pdmvault1 /export/data/pdmvault1_1 /export/data/pdmvault1_2 /export/data/pdmvault1_4"
+
+				PDM_RESTRICTED="/local/xena/data/pdmvault2 /local/data/pdmvault3 /local/data/pdmvault4 /local/data/pdmvault5"
+				PDM="${PDM_NON_RESTRICTED} ${PDM_RESTRICTED}"
+			elif [ ${HOST} = helen ];then
+
+				PDM_NON_RESTRICTED="/export/data/pdmvault1 /export/data/pdmvault1_1 /export/data/pdmvault1_2 /export/data/pdmvault1_4"
+
+				PDM_RESTRICTED="/local/data/pdmvault2 /local/data/pdmvault3 /local/data/pdmvault4 /local/data/pdmvault5"
+				PDM="${PDM_NON_RESTRICTED} ${PDM_RESTRICTED}"
+			else # svr014
+				
+				PDM="/export/data/ilnk34ts"
+				#PDM="/data/30test001 /data/30test002 /data/30test003 /data/30test004 /data/30test005"
+			fi
+
+			# Append the PDM_TEAM email address to SCAN_TEAM
+			SCAN_TEAM="${SCAN_TEAM}, ${PDM_TEAM}"
+
+			# Set DATA_DIR to $PDM
+	   		DATA_DIR=${PDM}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_pdm_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this section is used only on $PDM_DATA_HOSTS
+			if [ `echo ${PDM_DATA_HOSTS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} is only supported on ${PDM_DATA_HOSTS}\n"
+				echo -e "\nError: This option of ${PROG} is only supported on ${PDM_DATA_HOSTS}\n" >> ${LOG}
+				exit 1
+			fi
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		S ) # SCRATCH scan Area
+
+			# Set DATA_DIR to $SCRATCH
+	   		DATA_DIR=${SCRATCH}
+
+			# Set RUN_SCAN 
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_scratch_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Make sure this is being run on one of the systems is NFS_SERVERS
+			if [ `echo ${NFS_SERVERS} | grep -wc ${HOST}` = 0 ];then
+				[ ${INTERACTIVE} = YES ] && echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n"
+				echo -e "\nError: This option of ${PROG} can only be used on ${NFS_SERVERS}\n" >> ${LOG}
+				exit 1
+			fi
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		d) # Scan certain data area(s)
+
+			# Set DATA_DIR to the argument(s) of -d
+			if [ "${DATA_DIR}" = "" ];then
+	
+	   			DATA_DIR=${OPTARG}
+			else
+				DATA_DIR="${DATA_DIR} ${OPTARG}"
+			fi
+
+			# Set RUN_SCAN  flag to YES
+	   		RUN_SCAN=YES
+
+			# Set LOG to the name of the scan log file
+			LOG=${LOG_DIR}/${HOST}_scan_log.${DATE}_${TIME}
+
+			# Remove LOG file if it already exists
+			rm -f ${LOG}
+
+			# Confirm that directory to check exist
+			for DIR in ${DATA_DIR}
+			do
+				if [ ! -d ${DIR} ];then
+			
+					# Display Error Message
+					[ ${INTERACTIVE} = YES ] && echo -e "\nError: The directory ${DIR} does not exist on ${HOST}"
+					[ ${INTERACTIVE} = YES ] && echo "Aborting ${PROG}\n"
+					echo -e "\nError: The directory ${DIR} does not exist on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+					# Set the BAD_DIR flag to YES
+					BAD_DIR=YES
+
+					# Exit this loop now
+					break
+				fi
+			done
+			;;
+
+		l) # List all Know Viruses
+
+			[ ${INTERACTIVE} = YES ] && clear
+			[ ${INTERACTIVE} = YES ] && echo -e "\n"
+			${UVSCAN} -d ${DAT_DIR}/${CURRENT_DAT} --virus-list
+			exit 0
+			;;
+
+		L) # Report on log files
+			
+			# Display log file info
+			echo -e "\nAll log files can be found in ${LOG_DIR}"
+
+			# Set CURRENT_SCAN_LOG to most current scan log file name
+			CURRENT_SCAN_LOG=`ls -t ${LOG_DIR}/${HOST}_*_scan_log* ${LOG_DIR}/${HOST}_scan_log* | 
+				grep -v '\.txt' | head -1 | sed "s{$LOG_DIR/{{"`
+
+			# Set CURRENT_UPDATE_LOG to most current update log file name
+			CURRENT_UPADTE_LOG=`ls -t ${LOG_DIR}/dat_file_update_log* | head -1 | sed "s{$LOG_DIR/{{"`
+
+			# Set CURRENT_RETRIEVAL_LOG to most current dat_retrieval log file name
+			CURRENT_RETRIEVAL_LOG=`ls -t ${LOG_DIR}/dat_retrieval_log* | head -1 | sed "s{$LOG_DIR/{{"`
+
+			# Display current log file names
+			echo "The most current scan log file for ${HOST} is ${CURRENT_SCAN_LOG}"
+			echo "The most current dat file update log file is ${CURRENT_UPADTE_LOG}"
+			echo "The most current dat file retrieval log file is ${CURRENT_RETRIEVAL_LOG}"
+
+			# Do you want to view the logs
+			echo -e "\nWould you like to view these logs ?"
+
+			YES_NO=""
+			while [ "${YES_NO}" = "" ]
+			do
+				echo -n "Yes/No > "
+				read YES_NO
+		
+				# Parse YES_NO
+				case $YES_NO in
+
+					YES|yes|Yes|Y|y )	# Yes Responce
+					clear 
+					less ${LOG_DIR}/${CURRENT_SCAN_LOG} ${LOG_DIR}/${CURRENT_UPADTE_LOG} ${LOG_DIR}/${CURRENT_RETRIEVAL_LOG}
+					echo -e "\nExiting ${PROG}\n"
+					;;
+			
+					NO|no|No|N|n )		# No Responce
+					echo -e "\nExiting ${PROG}\n"
+					;;
+
+					*)			# Invalid Answer
+					YES_NO=""
+					;;
+				esac
+			done
+			
+			exit 0
+			;;
+
+		u) # Update dat files
+
+			# Set RUN_SCAN  flag to NO
+	   		RUN_SCAN=NO
+
+			# Do not bother to proccess any additional arguments
+			break
+			;;
+
+		v) # Display uvscan version info
+
+			clear
+			echo -e "\n"
+			${UVSCAN} -d ${DAT_DIR}/${CURRENT_DAT} --version
+			exit 0
+			;;
+		
+		*) # Error
+
+	   		echo -e "\nError: Invalid syntax"
+	  		USAGE 
+			;;
+	esac
+done
+
+
+#########################################################################
+# 			SCAN DATA AREAS 				#
+#########################################################################
+if [ ${RUN_SCAN} = YES ];then
+
+	# If BAD_DIR is set to YES, just update LOG and exit
+	if [ "${BAD_DIR}" = YES ];then
+
+		# Set DATE
+		DATE=`date '+%m-%d-%y'`
+
+		# Set Time
+		TIME=`date '+%H:%M:%S'`
+
+		# Update LOG file
+		echo -e "\nError: The directory ${DIR} does not exist on ${HOST}, ${DATE} ${TIME}" >> $LOG}
+		echo -e "Aborting ${PROG} on ${HOST}\n" >> ${LOG}
+        	exit 1
+	fi
+	
+	# Scan each directory listed in DATA_DIR
+	for DIR in ${DATA_DIR}
+	do
+
+		# Set DATE
+		DATE=`date '+%m-%d-%y'`
+
+		# Set Time
+		TIME=`date '+%H:%M:%S'`
+
+		# Confirm that directory to check exist
+		if [ ! -d ${DIR} ];then
+			
+			# Display Error Message
+			[ ${INTERACTIVE} = YES ] && echo -e "\nError: The directory ${DIR} does not exist on ${HOST}"
+			echo -e "\nError: The directory ${DIR} does not exist on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+			# Exit this loop now
+			break
+		fi
+
+		# Start Scan
+		[ ${INTERACTIVE} = YES ] && echo -e "\nScanning ${DIR} on ${HOST}, ${DATE} ${TIME}"
+		echo -e "\nScanning ${DIR} on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+		# Set ARGS to the standard argument suppilied to uvscan
+		ARGS="-d ${DAT_DIR}/${CURRENT_DAT} -c --mailbox --mime --ignore-links --program --summary"
+
+		# Confirm that there is at least one subdirectory
+		if [ `${FIND} ${DIR} -maxdepth 1 -type d -print 2>/dev/null | wc -l` -gt 1 ];then
+
+			# Has sub directories
+			${UVSCAN} --recursive ${ARGS} ${DIR} 1>> ${LOG} 2>&1
+		else
+
+			# No sub directories
+			${UVSCAN} ${ARGS} ${DIR} 1>> ${LOG} 2>&1
+		fi
+
+		# Set DATE
+		DATE=`date '+%m-%d-%y'`
+
+		# Set Time
+		TIME=`date '+%H:%M:%S'`
+
+		# Insert completed message in LOG
+		[ ${INTERACTIVE} = YES ] && echo -e "Completed scan of ${DIR} on ${HOST}, ${DATE} ${TIME}\n"
+		echo -e "Completed scan of ${DIR} on ${HOST}, ${DATE} ${TIME}\n" >> ${LOG}
+	done
+
+	# Set WINLOG, to the file name needed for reading the log in windows
+	WINLOG="`echo ${LOG} | sed 's{:{{g;s:\.:_:'`.txt"
+
+	# Send email stated that the scan has completed
+	if [ ${OS} = SunOS ];then
+
+		# Convert log file into DOS txt file
+		unix2dos ${LOG} > ${WINLOG} 2>/dev/null
+
+		# Set LINK to the UNC Path to ${WINLOG}
+		WINLOG=`basename ${WINLOG}`
+		LINK="\\\apps\\$UVSCAN_DIR\\log\\$WINLOG"
+
+		# Send email if not in WPB
+		if [ `echo ${IP} | grep -c "^${WPB_IP}"` -eq 0 ];then
+
+			echo -e "\nThe virus scan on ${HOST} has completed, ${DATE} ${TIME}. See log file\n
+file://X:${LINK}\n
+Or you can access the log from any Unix system using\n
+# more ${LOG}" | 
+			mailx -s "Virus scan log file info, ${HOST}" ${SCAN_TEAM}
+		fi
+	else
+
+		# Convert log file into DOS txt file
+		cp ${LOG} ${WINLOG}
+		unix2dos ${WINLOG} 2>/dev/null
+
+		# Set LINK to the UNC Path to ${WINLOG}
+		WINLOG=`basename ${WINLOG}`
+		LINK="\\\apps\\${UVSCAN_DIR}\\log\\\\${WINLOG}"
+
+		# Send email if not in WPB
+		if [ `echo ${IP} | grep -c "^${WPB_IP}"` -eq 0 ];then
+
+			echo -e "\nThe virus scan on ${HOST} has completed, ${DATE} ${TIME}. See log file\n
+file://X:${LINK}\n
+Or you can access the log from any Unix system using\n
+# more ${LOG}" | 
+			mail -s "Virus scan log file info, ${HOST}" ${SCAN_TEAM}
+		fi
+
+	fi
+
+else
+
+#########################################################################
+# 			UPDATE DAT FILES 				#
+#########################################################################
+
+	# Set YEAR to the 4 digit year
+	YEAR=`date '+%Y'`
+
+	# Set DATE
+	DATE=`date '+%m-%d-%y'`
+
+	# Set Time
+	TIME=`date '+%H:%M:%S'`
+
+	# Set LOG to the name of the update dat log file
+	LOG=${LOG_DIR}/dat_file_update_log.${YEAR}
+
+	# Confirm that there is at least one avvdat-XXXX.zip file in ${DAT_DIR}
+	if [ `ls ${DEPOT_DIR}/avvdat-????.zip | wc -l` -eq 0 ];then
+
+		# Display Error Message & Update LOG file
+		[ ${INTERACTIVE} = YES ] && echo -e "\nError: There are no new dat files in ${DEPOT_DIR}"
+		[ ${INTERACTIVE} = YES ] && echo -e "Unable to update dat files on ${HOST}, ${DATE} ${TIME}"
+		echo -e "\nError: There are no new dat files in ${DEPOT_DIR}" >> ${LOG}
+		echo "Unable to update dat files on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+		# Exit this script
+		exit 1
+	else
+		# Set NEW_DAT_NUMBER, to the number (XXXX) contained in the avvdat-XXXX.zip file with the highest number
+		NEW_DAT_NUMBER=`ls -1 ${DEPOT_DIR}/avvdat-????.zip | sed "s{$DEPOT_DIR/{{;s/avvdat-//;s/\.zip//" | sort +0 -1n | tail -1`
+
+		# Confirm that NEW_DAT_NUMBER is set and is a 4 digit number
+		if [ "${NEW_DAT_NUMBER}" = "" -o `echo "${NEW_DAT_NUMBER}" | egrep -c '[1-9][0-9][0-9][0-9]'` -eq 0 ];then
+
+			# Display Error Message & Update LOG file
+			[ ${INTERACTIVE} = YES ] && echo -e "\nError: Unable to determine the dat version number of the new dat file"
+			[ ${INTERACTIVE} = YES ] && echo -e "Unable to update dat files on ${HOST}, ${DATE} ${TIME}"
+
+			echo -e "\nError: Unable to determine the dat version number of the new dat file" >> ${LOG}
+			echo "Unable to update dat files on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+			# Exit this script
+			exit 1
+		fi
+	fi
+	
+	[ "${CURRENT_DAT}" = "" ] && CURRENT_DAT=0	
+
+	# Confirm that the new DAT file is really newer
+	if [ ${NEW_DAT_NUMBER} -gt ${CURRENT_DAT} ];then
+
+		# Unzip ${DAT_DIR}/${NEW_DAT_NUMBER}
+		[ ${INTERACTIVE} = YES ] && echo -e "\nInstalling the new dat file version ${NEW_DAT_NUMBER} on ${HOST}, ${DATE} ${TIME}"
+		echo -e "\nInstalling the new dat file version ${NEW_DAT_NUMBER} on ${HOST}, ${DATE} ${TIME}" >> ${LOG}
+
+		# Create the directory to install the new dat files
+		mkdir ${DAT_DIR}/${NEW_DAT_NUMBER}
+
+		# Move ${DEPOT_DIR}/dat-${NEW_DAT_NUMBER}.zip to ${DAT_DIR}/${NEW_DAT_NUMBER/dat-${NEW_DAT_NUMBER}.zip
+		mv ${DEPOT_DIR}/avvdat-${NEW_DAT_NUMBER}.zip ${DAT_DIR}/${NEW_DAT_NUMBER}/avvdat-${NEW_DAT_NUMBER}.zip
+
+		# Cd to the new directory
+		cd ${DAT_DIR}/${NEW_DAT_NUMBER}
+
+		# Install / unzip the new dat files
+		unzip avvdat-${NEW_DAT_NUMBER}.zip >> ${LOG}
+
+		[ ${INTERACTIVE} = YES ] && echo -e "\nThe dat files for uvscan, version ${NEW_DAT_NUMBER} have been installed, ${DATE} ${TIME}\n"
+		echo -e "\nThe dat files for uvscan version, ${NEW_DAT_NUMBER} have been installed, ${DATE} ${TIME}" >> ${LOG}
+
+		# Update SunOS based DAT files
+		if [ ${OS} = Linux ];then
+			cd /apps/uvscan/dat
+			ln -s ${DAT_DIR}/${NEW_DAT_NUMBER}
+		fi
+	else
+
+		# Display upto date message
+		[ ${INTERACTIVE} = YES ] && echo -e "\nThe uvscan dat files are already upto date, ${DATE} ${TIME}"
+		echo -e "\nThe uvscan dat files are already upto date, ${DATE} ${TIME}" >> ${LOG}
+
+		# Exit this script
+		exit 1
+	fi
+
+	# Remove any old, out of date avvdat-XXXX.zip file(s) that may be there
+	#rm -f ${DEPOT_DIR}/avvdat-????.zip
+fi

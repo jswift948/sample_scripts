@@ -1,0 +1,3496 @@
+#!/bin/bash
+# manage_sessions
+# Purpose: This scripts job is to start and stop the snapshots sessions to be used to backup 
+# the Oracle 10g databases on the primary/DB servers. A different script will manage the sessions
+# on the seconadry/backup server. There are two seperate file systems that will require snapshots 
+# per DB. The first file system is /export/data/DB, the second is /export/data/DB_archive. 
+
+# Written By: Jon Swift 05/07
+# Updated 01/18/08 to support creating new sessions with the DB down.
+# Updated 08/25/08 to support changes in output of the powermt command in PowerPath v5.1
+# Updated 03/05/09 to provide a method to exclude starting/creating new 
+# 		snapshot sessions for specific DB file systems
+# Updated 08/09, added logic to check for DB_archive file systems being 100% full before
+#		creating snapshot of DB.
+# Updated 09/09, Removed logic forcing check of export dump file only on higher numbered node.
+#		This change allows the script to check both nodes for the export 
+#		dump file before sending warning email.
+# Updated 05/10, Converted script to use ssh, from rsh
+
+
+HOST=`uname -n`
+CLUSTER=`echo ${HOST} | cut -c 1-6`
+CLUSTER1=`echo ${HOST} | cut -c 1-7`
+PROG=`basename $0`
+NAVICLI=/opt/Navisphere/bin/navicli
+POWERMT=/sbin/powermt
+SKIP_FILE=SKIP_SNAPSHOT
+YEAR=`date '+%Y'`
+Year=`date '+%g'`
+Day=`date '+%d'`
+Month=`date '+%m'`
+LOG=/var/log/${PROG}.${YEAR}.log
+TODAY=`date '+%a'`
+OS=`uname -s`
+USER=`whoami`
+ORACLE_SCRIPTS_DIR=/export/home/oracle/10grac_scripts
+FIRST_ARG=`echo $1 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+SECOND_ARG=`echo $2 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+THIRD_ARG=`echo $3 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+FOURTH_ARG=`echo $4 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+FITH_ARG=`echo $5 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+SIXTH_ARG=`echo $6 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+SEVENTH_ARG=`echo $7 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+EIGHTH_ARG=`echo $8 | sed 's/-//' | tr '[A-Z]' '[a-z]'`
+SAN=clariion2
+MAX_NUM_OF_SESSIONS=2
+SLEEP_SECONDS=15
+ERROR_EMAIL_LIST=linux_admin
+export ORACLE_BASE=/export/apps/oracle
+export NLS_LANG=AMERICAN_AMERICA.UTF8
+
+# Determine if this script is being run interactively
+###########################################################################
+tty -s
+if [ $? != 0 ];then
+        INTERACTIVE=NO
+else
+        INTERACTIVE=YES
+fi
+
+# Confirm this system is running RedHat Linux
+###########################################################################
+if [ ${OS} != Linux -o ! -f /etc/redhat-release ];then
+	ERROR_MESSAGE="Error: ${PROG} must be running RedHat Linux"
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${ERROR_MESSAGE}"
+	exit
+fi
+
+# Make the log file R/W for everyone
+###########################################################################
+if [ ! -f ${LOG} -a ${USER} = root ];then
+	touch ${LOG}
+	chmod 666 ${LOG}
+fi
+
+# Confirm this script is run as root or oracle
+###########################################################################
+if [ ${USER} != root -a ${USER} != oracle ];then
+	ERROR_MESSAGE="Error: ${PROG} must be run as root or oracle"
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${ERROR_MESSAGE}"
+	echo ${ERROR_MESSAGE} >> ${LOG}
+	exit
+fi
+
+# Confirm that $NAVICLI is installed and configured properly
+###########################################################################
+if [ ! -x ${NAVICLI} ];then
+	ERROR_MESSAGE="Error: navicli not installed on ${HOST}"
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${ERROR_MESSAGE}"
+	echo ${ERROR_MESSAGE} >> ${LOG}
+	exit
+fi
+
+# Confirm that $POWERMT is installed and configured properly
+###########################################################################
+if [ ! -x ${POWERMT} ];then
+	ERROR_MESSAGE="Error: powermt not installed on ${HOST}"
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${ERROR_MESSAGE}"
+	echo ${ERROR_MESSAGE} >> ${LOG}
+	exit
+
+elif [ ! -u ${POWERMT} -a ${USER} = oracle ];then
+	ERROR_MESSAGE="Error: powermt does not have the UID bit set on ${HOST}"
+	[ ${INTERACTIVE} = YES ] && echo -e "\n${ERROR_MESSAGE}"
+	echo ${ERROR_MESSAGE} >> ${LOG}
+	exit
+fi
+
+# Set ORA_CRS_HOME based on host name
+######################################################
+if [ `echo ${HOST} | grep -c ractst` -eq 1 ];then
+	export ORA_CRS_HOME=/export/apps/crs/product/crs
+	export ORACLE_HOME=${ORACLE_BASE}/10.2.0/db
+else
+	export ORA_CRS_HOME=/export/apps/crs
+	export ORACLE_HOME=${ORACLE_BASE}/10.2.0
+fi
+
+# Set and export $LD_LIBRARY_PATH
+###########################################################################
+export LD_LIBRARY_PATH=/lib64:/usr/lib64:/lib:/usr/lib:${ORACLE_HOME}/lib:${ORA_CRS_HOME}/lib
+
+# Set and export $PATH
+###########################################################################
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin:/opt/Navisphere/bin:/usr/local/bin:/usr/local/sbin:${ORA_CRS_HOME}/bin:${ORACLE_HOME}/bin
+
+
+# Define the following commands
+###########################################################################
+export SQLPLUS=${ORACLE_HOME}/bin/sqlplus
+export SRVCTL=${ORA_CRS_HOME}/bin/srvctl
+export CRSCTL=${ORA_CRS_HOME}/bin/crsctl
+export CRS_STAT=${ORA_CRS_HOME}/bin/crs_stat
+
+# Confirm that $SRVCTL is installed
+###########################################################################
+if [ ! -x ${SRVCTL} ];then
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "Error: srvctl not installed on ${HOST}"
+	exit
+fi
+
+# Confirm CRS is working properly on this node
+###########################################################################
+if [ `${CRSCTL} check crs | grep -c 'healthy'` -ne 3 ];then
+	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+	ERROR_MESSAGE="Error: CRS is not working properly on ${HOST}, Unable to ${FIRST_ARG} snapshot sessions for any DB, ${DATE_TIME}"
+
+
+	echo ${ERROR_MESSAGE} >> ${LOG}
+	if [ ${INTERACTIVE} = YES ];then  
+		echo -e "\n${ERROR_MESSAGE}"
+	else
+
+ 		# Send Email
+		echo "${ERROR_MESSAGE}" |
+		mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+	fi
+
+	# Skip to the next DB
+	exit
+fi
+
+# The function GET_DB_NAMES, adds the Database Names to the Array DB_NAMES
+###########################################################################
+GET_DB_NAMES ()
+{
+        # set -x
+
+	# Clear all entry's from the array DB_NAMES
+	unset DB_NAMES[*]
+
+        # Add Database Names to the Array DB_NAMES
+        ###########################################################################
+        LOOP=1
+        for DB_NAME in `${CRS_STAT} -v | grep NAME | egrep '.+\.db$' | awk -F= '{print $2}' | sort`
+     	do
+                # Confirm DB_NAME is set properly
+		if [ "${DB_NAME}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: CRS is not working properly on ${HOST}, no database names found using crs_stst. Unable to ${ACTION} snapshot session for any DB on ${HOST}, ${DATE_TIME}"
+
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+
+	 			# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Exit Now
+        		exit
+		fi
+
+ 		# Strip off ora and db
+ 		# ora.srp.db
+ 		DB_NAME=`echo ${DB_NAME} | awk -F. '{print $2}'`
+
+		# Build the array DB_NAME, Add DB_NAME, STATE and HOST_NAME
+ 		DB_NAMES[${LOOP}]="${DB_NAME}"
+
+		# Increment LOOP
+ 		let LOOP=${LOOP}+1
+	done
+
+	# Confirm LOOP is not still set to 1, if it is, no Database names were set
+        ###########################################################################
+	if [ ${LOOP} -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: CRS is not working properly on ${HOST}, no database names found using crs_stst. Unable to ${ACTION} snapshot session for any DB on ${HOST}, ${DATE_TIME}"
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Exit Now
+        	exit
+	fi
+}
+	
+# Function to determine which mode the DB is in Hot-Backup/Normal
+###########################################################################
+STATUS_DB_MODE () {
+
+	# set -x
+
+	# Set EXCLUDE_LINES to key words in the lines to exclude
+	######################################################
+	EXCLUDE_LINES='SQL.Plus:|^$|Connected to|Copyright|Oracle Database 10g|Real Application Clusters|stty:'
+	
+	# Set MODE_NUMBER to the number returned by external sql script
+	MODE_NUMBER=""
+	
+	# Run sqlplus comand to status DB as the user oracle
+	######################################################
+	if [ ${REMOTE_HOST} = ${HOST} -a ${USER} = root ];then
+	
+		MODE_NUMBER=`su oracle -c "echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/status_db_mode.sql" | egrep -v "${EXCLUDE_LINES}" | awk '{print $1}'` 1> /dev/null 2>&1
+	
+	elif [ ${REMOTE_HOST} = ${HOST} -a ${USER} = oracle ];then
+
+		MODE_NUMBER=`echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/status_db_mode.sql | egrep -v "${EXCLUDE_LINES}" | awk '{print $1}'` 1> /dev/null 2>&1
+
+	elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = root ];then
+	
+		MODE_NUMBER=`su oracle -c "ssh -nq ${REMOTE_HOST} \"export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba  @${ORACLE_SCRIPTS_DIR}/status_db_mode.sql\"" 2>&1 | egrep -v "${EXCLUDE_LINES}" | awk '{print $1}'` 1> /dev/null 2>&1
+	
+	elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = oracle ];then
+
+		MODE_NUMBER=`ssh -nq ${REMOTE_HOST} "export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/status_db_mode.sql" 2>&1 | egrep -v "${EXCLUDE_LINES}" | awk '{print $1}'` 1> /dev/null 2>&1
+	fi
+	
+	# Confirm $MODE_NUMBER is set
+	######################################################
+	if [ "${MODE_NUMBER}" = "" -o `echo ${MODE_NUMBER} | egrep -c '[^0-9]'` -eq 1 ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"MODE_NUMBER\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+	
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+	
+		# Skip to the next DB
+		continue
+	fi
+}
+	
+# Function to put DB back into Normal mode (Out of Hot-backup Mode)
+###########################################################################
+RETURN_2_NORMAL () {
+
+        # set -x
+
+	# If Hot-Backup mode is required do the following steps
+	######################################################
+	if [ ${HOT_BACKUP_REQUIRED} = YES ];then
+
+		# Confirm $DB is in Hot-Backup Mode
+		STATUS_DB_MODE
+		# One or greater means DB is in Hot-Backup mode
+		if [ ${MODE_NUMBER} -ge 1 ];then
+
+			# Put Database into Normal Mode
+			######################################################
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Returning the DB \"${DB}\" to Normal-Mode on ${HOST}, ${DATE_TIME}"
+		
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+		
+			# Run sqlplus command to return DB to normal mose as the user oracle
+			######################################################
+			if [ ${REMOTE_HOST} = ${HOST} -a ${USER} = root ];then
+			
+				su oracle -c "echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_end_hot_backup.sql" 1> /dev/null 2>&1
+			elif [ ${REMOTE_HOST} = ${HOST} -a ${USER} = oracle ];then
+				echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_end_hot_backup.sql 1> /dev/null 2>&1
+			
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = root ];then
+		
+				su oracle -c "ssh -nq ${REMOTE_HOST} \"export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_end_hot_backup.sql\"" 2>&1 | grep -v stty 1> /dev/null 2>&1
+		
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = oracle ];then
+		
+				ssh -nq ${REMOTE_HOST} "export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_end_hot_backup.sql" 2>&1 | grep -v stty 1> /dev/null 2>&1
+			
+			fi
+				
+			sleep 1
+			rm -f /tmp/junk.sql
+	
+			# Confirm Database returned to Normal Mode
+			######################################################
+			STATUS_DB_MODE
+			# One or greater means DB is in Hot-Backup mode
+			if [ ${MODE_NUMBER} -ge 1 ];then
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The DB \"${DB}\" failed to returned to Normal Mode on ${HOST}, ${DATE_TIME}. Correct this problem before running ${PROG} again."
+					
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+			else
+				# End trap
+				trap 1 2 3 6 15
+			fi
+		fi
+	fi
+}
+	
+# Function to determine if $REMOTE_HOST is up or down
+###########################################################################
+UP_DOWN () {
+
+        # set -x
+
+	# Set UP_DOWN_HOST based on optional argument to this function
+	######################################################
+	if [ "$1" = "" ];then 
+		UP_DOWN_HOST=${REMOTE_HOST}
+	else
+		UP_DOWN_HOST=$1
+	fi
+
+	# Set UP_DOWN to UP if ${UP_DOWN_HOST} is up, or to DOWN if it is down
+	######################################################
+	UP_DOWN=""
+
+	# If ${HOST} = ${UP_DOWN_HOST} there is nothing to check
+	######################################################
+	if [ ${HOST} = ${UP_DOWN_HOST} ];then
+        	UP_DOWN=UP
+	
+	# Determine if $REMOTE_HOST is up using ping
+	######################################################
+	elif [ `ping -f -i .3 -w 1 ic-${UP_DOWN_HOST} | grep -c '100% packet loss'` -eq 0 ];then
+
+		# Double check $UP_DOWN_HOST is up using rup
+		#################################################
+		RUP_DATA=`rup ic-${UP_DOWN_HOST} 2>&1`
+
+		if [ `echo ${RUP_DATA} | egrep -c ''[0-9]':|day,|days,'` -eq 1 ];then
+        			UP_DOWN=UP
+ 		elif [ `echo ${RUP_DATA} | egrep -c ' '[1-3]' mins'` -eq 1 ];then
+        			UP_DOWN=DOWN
+		elif [ `echo ${RUP_DATA} | grep -c 'RPC:'` -eq 1 ];then
+        			UP_DOWN=DOWN
+ 		else
+        			UP_DOWN=UP
+ 		fi
+	else
+        	UP_DOWN=DOWN
+	fi
+}
+
+# Function to determine which nodes run the DB, $DB
+# Add the node names running $DB to the array REMOTE_HOSTS
+###########################################################################
+GET_DB_NODES () {
+
+        # set -x
+
+	# Clear all entry's from the array REMOTE_HOSTS
+	unset REMOTE_HOSTS[*]
+
+        # Add Database Names to the Array DB_NAMES
+	######################################################
+        HOST_LOOP=1
+        for INST in `${CRS_STAT} | grep "NAME=ora.${DB}.${DB}[1-4].inst" | awk -F= '{print $2}' |
+		awk -F. '{print $3}'`
+     	do
+                # Confirm INST is set properly
+		if [ "${INST}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"INST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+			echo -e "\n${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+
+			# Move on to next DB
+        		continue
+		fi
+
+		# Set REMOTE_HOST_NUM to the node num used by $INST
+		######################################################
+		REMOTE_HOST_NUM=""
+		REMOTE_HOST_NUM=`echo ${INST} | sed 's/\(.*\)\([1-9]$\)/\2/'`
+
+                # Confirm REMOTE_HOST_NUM is set properly
+		# Confirm that the ${REMOTE_HOST_NUM} is set to a single digit number 
+		######################################################
+		if [ "${REMOTE_HOST_NUM}" = "" -o `echo ${REMOTE_HOST_NUM} | egrep -c '[^1-9]'` -eq 1 ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST_NUM\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+			echo -e "\n${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+
+			# Move on to next DB
+        		continue
+		else
+
+			REMOTE_HOST=""
+			REMOTE_HOST="${CLUSTER1}${REMOTE_HOST_NUM}"
+		fi
+
+                # Confirm REMOTE_HOST is set properly
+		######################################################
+		if [ "${REMOTE_HOST}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+			echo -e "\n${ERROR_MESSAGE}"
+			echo "${ERROR_MESSAGE}" >> ${LOG}
+
+			# Move on to next DB
+        		continue
+		fi
+
+		# Build the array REMOTE_HOSTS, Add REMOTE_HOST
+		######################################################
+ 		REMOTE_HOSTS[${HOST_LOOP}]="${REMOTE_HOST}"
+
+		# Increment HOST_LOOP
+ 		let HOST_LOOP=${HOST_LOOP}+1
+	done
+
+	# Confirm HOST_LOOP is not still set to 1, if it is, no Database names were set
+	######################################################
+	if [ ${HOST_LOOP} -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: No host names defined for the DB \"${DB}\", suspect all nodes running this DB are down. Unable to ${ACTION} snapshot session for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+
+		echo "${ERROR_MESSAGE}" >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move on to next DB
+        	continue
+	fi
+}
+
+# Function to Set Database Name
+###########################################################################
+SET_DB_NAME () {
+
+        # set -x
+
+	# Display the dynamic menu to select database name 	
+	######################################################
+        LOOP=1
+        echo ""
+        echo " ****************************************${BANNER}"
+        echo " * Select Database Name to ${ACTION} session *"
+        echo " ****************************************${BANNER}"
+        echo ""
+        while [ "${DB_NAMES[${LOOP}]}" ]
+        do
+                SINGLE_DB_NAME=`echo ${DB_NAMES[${LOOP}]} | awk '{print $1}'`
+                echo " ${LOOP} > ${SINGLE_DB_NAME}"
+
+                # Increment LOOP
+                let LOOP=${LOOP}+1
+        done
+
+	SINGLE_DB_NAME=""
+ 	echo ""
+
+	# Confirm the selection
+        ###########################################################################
+	until [ -n "${SINGLE_DB_NAME}" ]
+	do
+        	echo -n " Select Database Name > "
+        	read SINGLE_DB_NAME
+
+		# Confirm SINGLE_DB_NAME is set
+		if [ "${SINGLE_DB_NAME}" = "" ];then
+			true
+
+    		# Confirm SINGLE_DB_NAME is not quit
+        	elif [ `echo ${SINGLE_DB_NAME} | egrep -c 'q|Q|Quit|QUIT'` -eq 1 ];then
+                	exit 0
+
+    		# Confirm SINGLE_DB_NAME is Number
+        	elif [ `echo ${SINGLE_DB_NAME} | egrep -c "[^0-9]"` -eq 1 ] ;then
+
+                	echo " Invalid selection, ${SINGLE_DB_NAME}"
+                	SINGLE_DB_NAME=""
+                	sleep 1
+                	echo ""
+
+        	# Confirm SINGLE_DB_NAME is a valid Number, a number lower than $LOOP
+        	elif [ ${SINGLE_DB_NAME} -ge ${LOOP} -o ${SINGLE_DB_NAME} -eq 0 ] ;then
+
+                	echo " Invalid selection, ${SINGLE_DB_NAME}"
+                	SINGLE_DB_NAME=""
+                	sleep 1
+                	echo ""
+       		else
+                	VALID=TRUE
+                	SINGLE_DB_NAME=`echo ${DB_NAMES[${SINGLE_DB_NAME}]} | awk '{print $1}'`
+
+                	# Confirm SINGLE_DB_NAME is set properly
+                	if [ "${SINGLE_DB_NAME}" = "" ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"SINGLE_DB_NAME\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Exit Now
+        			exit
+           		fi
+        	fi
+	done
+}
+
+# Function to manually set TODAY
+###########################################################################
+SELECT_TODAY () {
+
+	# set -x
+
+	# Confirm that $PROG is being used interactively
+	######################################################
+	if [ ${INTERACTIVE} = YES ];then
+
+		TODAY=""
+        	echo ""
+        	echo " ******************************${BANNER}"
+        	echo " * Select Day to ${ACTION} session *"
+        	echo " ******************************${BANNER}"
+        	echo ""
+		echo " 1 > Monday"
+		echo " 2 > Tuesday"
+		echo " 3 > Wednesday"
+		echo " 4 > Thursday"
+		echo " 5 > Friday"
+		echo " 6 > Saturday"
+		echo " 7 > Sunday"
+        	echo ""
+	
+		# Confirm the selection
+        	###########################################################################
+		until [ -n "${TODAY}" ]
+		do
+        		echo -n " Select Day of Week > "
+        		read TODAY
+	
+			case ${TODAY} in
+	
+				"")  true
+				;;
+	
+				1) TODAY=monday
+				ODD_EVEN=1
+				;;
+				2) TODAY=tuesday
+				ODD_EVEN=2
+				;;
+				3) TODAY=wednesday
+				ODD_EVEN=1
+				;;
+				4) TODAY=thursday
+				ODD_EVEN=2
+				;;
+				5) TODAY=friday
+				ODD_EVEN=1
+				;;
+				6) TODAY=saturday
+				ODD_EVEN=2
+				;;
+				7) TODAY=sunday
+				ODD_EVEN=1
+				;;
+				q|Q) # Exit now
+				exit
+				;;
+
+				*) # Invalid Answer
+				echo ""
+				echo " Invalid selection ${TODAY}"
+				echo ""
+				TODAY=""
+				sleep 1
+				;;
+			esac
+		done
+		echo ""
+
+	else
+		exit
+	fi
+}
+
+# Function at automaticaly set TODAY
+###########################################################################
+SET_TODAY () {
+
+	# Set -x
+
+	# Set OPT to the optional first argument to this function
+	OPT=$1
+
+	# Set TODAY, YESTERDAY and DAY_BEFORE_YESTERDAY based on ${TODAY}
+	######################################################
+	case ${TODAY} in
+	
+        	mon|Mon|MON|monday|MONDAY|Monday)
+        	TODAY=monday
+		YESTERDAY=sunday
+		DAY_BEFORE_YESTERDAY=saturday
+		ODD_EVEN=1
+        	;;
+	
+        	tue|Tue|TUE|tuesday|TUESDAY|Tuesday)
+        	TODAY=tuesday
+		YESTERDAY=monday
+		DAY_BEFORE_YESTERDAY=sunday
+		ODD_EVEN=2
+        	;;
+	
+        	wed|Wed|WED|wednesday|WEDNESDAY|Wednesday)
+        	TODAY=wednesday
+		YESTERDAY=tuesday
+		DAY_BEFORE_YESTERDAY=monday
+		ODD_EVEN=1
+		;;
+	
+        	thu|Thu|THU|thursday|THURSDAY|Thursday)
+        	TODAY=thursday
+		YESTERDAY=wednesday
+		DAY_BEFORE_YESTERDAY=tuesday
+		ODD_EVEN=2
+        	;;
+	
+        	fri|Fri|FRI|friday|FRIDAY|Friday)
+        	TODAY=friday
+		YESTERDAY=thursday
+		DAY_BEFORE_YESTERDAY=wednesday
+		ODD_EVEN=1
+        	;;
+	
+        	sat|Sat|SAT|saturday|SATURDAY|Saturday)
+        	TODAY=saturday
+		YESTERDAY=friday
+		DAY_BEFORE_YESTERDAY=thursday
+		ODD_EVEN=2
+        	;;
+	
+        	sun|Sun|SUN|sunday|SUNDAY|Sunday)
+        	TODAY=sunday
+		YESTERDAY=saturday
+		DAY_BEFORE_YESTERDAY=friday
+		ODD_EVEN=1
+        	;;
+
+		""|*) # Invalid Answer
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: Invalid week day option, ${TODAY}. Unable to ${ACTION} snapshot session for any DB on ${HOST}, ${DATE_TIME}"
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Exit Now
+		exit
+		;;
+	esac
+
+	# If the optional argument is set to YESTERDAY, set TODAY to $YESTERDAY
+	######################################################
+	if [ "${OPT}" = YESTERDAY ];then
+		TODAY=${YESTERDAY}
+	
+	# If the optional argument is set to DAY_BEFORE_YESTERDAY, set TODAY to $DAY_BEFORE_YESTERDAY
+	elif [ "${OPT}" = DAY_BEFORE_YESTERDAY ];then
+		TODAY=${DAY_BEFORE_YESTERDAY}
+	fi
+}
+	
+# Function to check for valid DB name
+###########################################################################
+CHECK_DB_NAME () {
+
+	# set -x
+
+	# Pre Set MATCH to NO
+	MATCH=NO
+
+	# Set LOOP to 1
+	LOOP=1
+
+	# Loop through each DB Name in the array DB_NAMES setting DB
+	while [ "${DB_NAMES[${LOOP}]}" ]
+	do
+
+		# Set DB to the Database Name defined by $LOOP
+		DB=${DB_NAMES[${LOOP}]}
+	
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+	
+		# Confirm $DB is set
+		######################################################
+		if [ "${DB}" = "" ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"DB\" not set on ${HOST}. Unable to ${ACTION} snapshot session for this DB on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+	 			# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+	
+			# Skip to the next DB
+			continue
+		fi
+	
+		# Check to see if $DB Matches ${SINGLE_DB_NAME}
+		######################################################
+		if [ "${DB}" = "${SINGLE_DB_NAME}" ];then
+	
+			MATCH=YES
+
+			# Exit LOOP
+			break
+		fi
+	done
+	
+	# Confirm Match is found
+	######################################################
+	if [ ${MATCH} = NO ];then
+	
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The supplied DB name, \"${SINGLE_DB_NAME}\" is not valid. Unable to ${ACTION} snapshot session for this DB on ${HOST}, ${DATE_TIME}"
+	
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+	
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+	
+		# Exit Now
+		exit
+	fi
+}
+	
+# Function to place $DB info Hot-Backup mode as needed
+###########################################################################
+START_HOT_BACKUP () {
+
+	# set -x
+
+	# Confirm Database is in normal mode
+	######################################################
+	if [ ${HOT_BACKUP_REQUIRED} = YES ];then  
+
+		STATUS_DB_MODE
+		# Zero means DB is in Normal Mode
+		if [ ${MODE_NUMBER} -eq 0 ];then
+		
+			# Put Database into Hot Backup Mode
+			######################################################
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Putting the DB \"${DB}\" into Hot-Backup Mode on ${HOST}, ${DATE_TIME}"
+
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+
+			# Run sqlplus to put DB into Hot-Backup mode as the user oracle
+			######################################################
+			if [ ${REMOTE_HOST} = ${HOST} -a ${USER} = root ];then
+	
+				su oracle -c "echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_begin_hot_backup.sql" 1>/dev/null 2>&1
+			elif [ ${REMOTE_HOST} = ${HOST} -a ${USER} = oracle ];then
+				echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_begin_hot_backup.sql 1> /dev/null 2>&1
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = root ];then
+
+				su oracle -c "ssh -nq ${REMOTE_HOST} \"export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_begin_hot_backup.sql\"" 2>&1 | grep -v stty 1> /dev/null 2>&1
+	
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = oracle ];then
+				ssh -nq ${REMOTE_HOST} "export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "/r/r/r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/ora_begin_hot_backup.sql" 2>&1 | grep -v stty 1> /dev/null 2>&1
+	
+			fi
+
+			sleep 1
+			rm -f /tmp/junk.sql
+
+			# Confirm Database is in Hot-Backup mode
+			######################################################
+			STATUS_DB_MODE
+			# Zero means DB is in Normal Mode
+			if [ ${MODE_NUMBER} -eq 0 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The DB \"${DB}\" failed to enter Hot-Backup mode on ${HOST}, ${DATE_TIME}. Unable to create new datafile sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+				
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Do Not start this datafiles session
+				START_DATAFILES_SESSION=NO
+			else
+				# Set Trap to run RETURN_2_NORMAL if someone hits ctrl C (^C)
+				trap 'RETURN_2_NORMAL;exit 1' 1 2 3 6 15
+			fi
+	
+		else
+			# One or greater means DB is in Hot-Backup Mode
+			# DB is already in Hot-Backup Mode
+			######################################################
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: Before starting the session for the DB \"${DB}\", the DB was found to already be in Hot-Backup mode on ${HOST}, ${DATE_TIME}"
+			
+			echo ${MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+		fi
+	fi
+}
+	
+# Function to confirm that sessions for $TODAY already exist
+###########################################################################
+CHECK_4_TODAY_SESSIONS () {
+
+	# set -x
+
+	# Set SPA_SESSIONS and SPB_SESSIONS based on $SESSIONS setting
+	if [ ${SESSIONS} = SINGLE ];then
+
+		# Set SPA_SESSIONS to the number of sessions active for today for this cluster
+		SPA_SESSIONS=`${NAVICLI} -h ${SAN}-spa snapview -listsessions |
+			grep -c "session\..*\.${SINGLE_DB_NAME}\.${CLUSTER}\.${TODAY}\."`
+
+
+		# Set SPB_SESSIONS to the number of sessions active for today for this cluster
+		SPB_SESSIONS=`${NAVICLI} -h ${SAN}-spb snapview -listsessions |
+			grep -c "session\..*\.${SINGLE_DB_NAME}\.${CLUSTER}\.${TODAY}\."`
+
+		# Set Error message just in case
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: There are No \"${TODAY}\" sessions for the DB \"${SINGLE_DB_NAME}\" to stop, Unable to stop \"${SINGLE_DB_NAME}\" snapshot session on ${HOST}, ${DATE_TIME}"
+	else
+
+		# Set SPA_SESSIONS to the number of sessions active for today for this cluster
+		SPA_SESSIONS=`${NAVICLI} -h ${SAN}-spa snapview -listsessions |
+			egrep -c "session\..+\..+\.${CLUSTER}\.${TODAY}\."`
+
+
+		# Set SPB_SESSIONS to the number of sessions active for today for this cluster
+		SPB_SESSIONS=`${NAVICLI} -h ${SAN}-spb snapview -listsessions |
+			egrep -c "session\..+\..+\.${CLUSTER}\.${TODAY}\."`
+
+		# Set Error message just in case
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: There are No \"${TODAY}\" sessions to stop. Unable to stop snapshot sessions for any DB on ${HOST}, ${DATE_TIME}"
+	fi
+	
+	# Confirm there session for $TODAY to stop
+	if [ "${SPA_SESSIONS}" -eq 0 -a "${SPB_SESSIONS}" -eq 0 ];then
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Exit Now
+		exit
+	fi
+}
+	
+# Function to display command usage
+###########################################################################
+USAGE () {
+
+	# set -x
+	clear
+
+	# Display USAGE to interactive users only
+	######################################################
+	if [ ${INTERACTIVE} = YES ];then
+		SET_TODAY
+		echo ""
+		echo "${PROG}: Is used to start and stop EMC SnapView snapshot sessions"
+		echo "of Oracle 10g datafile and archive file systems."
+		echo ""
+		echo "${PROG}: Usage"
+		echo ""
+		echo "	Start Today \"${TODAY}\" Sessions"
+		echo "${PROG} -start -at, Start \"all\" for today"
+		echo "${PROG} -start -st, Start \"single\" for today  *"
+		echo "${PROG} -start -st -db XXX, Start \"single\" DB XXX for today"
+		echo ""
+		echo "	Start Yesterday \"${YESTERDAY}\" Sessions"
+		echo "${PROG} -start -ay, Start \"all\" for yesterday  +"
+		echo "${PROG} -start -sy, Start \"single\" for yesterday  *  +"
+		echo "${PROG} -start -sy -db XXX, Start \"single\" DB XXX for yesterday  +"
+		echo ""
+		echo "	Stop Today \"${TODAY}\" Sessions"
+		echo "${PROG} -stop -at,         Stop \"all\" for today"
+		echo "${PROG} -stop -st,         Stop \"single\" for today  *"
+		echo "${PROG} -stop -st -db XXX, Stop \"single\" DB XXX for today  *"
+		echo ""
+		echo "	Stop Yesterday \"${YESTERDAY}\" Sessions"
+		echo "${PROG} -stop -ay,          Stop \"all\" for yesterday"
+		echo "${PROG} -stop -sy,          Stop \"single\" for yesterday  *"
+		echo "${PROG} -stop -sy -db XXX,  Stop \"single\" for yesterday"
+		echo ""
+		echo "	Stop Day Before Yesterday \"${DAY_BEFORE_YESTERDAY}\" Sessions"
+		echo "${PROG} -stop -adby,         Stop \"all\" for the day before yesterday"
+		echo "${PROG} -stop -sdby,         Stop \"single\" for the day before yesterday  *"
+		echo "${PROG} -stop -sdby -db XXX, Stop \"single\" DB XXX for the day before yesterday"
+		echo ""
+		echo "	Stop \"Other Day\" Sessions"
+		echo "${PROG} -stop -ao,                     Stop \"all\" for other day  *"
+		echo "${PROG} -stop -so,                     Stop \"all\" for a other day  *"
+		echo "${PROG} -stop -so -db XXX -wd Mon-Sun, Stop \"single\" DB XXX for the other day WeekDay Mon-Sun"
+		echo ""
+		echo ""
+		echo "*****************************************************************************"
+		echo ""
+		echo " The \"-start\" argument is used to create new sessions."
+		echo " The \"-stop\" argument is used to remove existing sessions."
+		echo ""
+		echo ""
+		echo "  +    Indicates options that should not be used normally."
+		echo "  *    Indicates options that must be used interactively, default mode is"
+		echo "		non-interactive. Interactively you can select DB Name from a menu."
+		echo ""
+		echo ""
+		echo " The optional argument \"-force-restart\" can be used as the last or second to"
+		echo " last argument with any valid \"-start\" syntax. It can be used to force the" 
+		echo " restart of any TODAY session already running. The default is not to restart" 
+		echo " a TODAY session that is already running."
+		echo ""
+		echo " The optional argument \"-force-remove\" can be used as the last or second to"
+		echo " last  argument with any valid \"-stop\" syntax. It can be used to force the" 
+		echo " removal of the last session running on a reserve LUN. The default is not to" 
+		echo " remove the last session running on a reserve LUN."
+		echo ""
+		echo " The optional argument \"-datafiles-only\" can be used as the last or second to"
+		echo " last argument with any valid syntax. It can be used to create or remove"
+		echo " \"just\" the datafiles session(s). The default is manage both the datafiles"
+		echo " and archive session(s)."
+		echo ""
+		echo " The optional argument \"-archive-only\" can be used as the last or second to" 
+		echo " last argument with any valid syntax. It can be used to create or remove"
+		echo " \"just\" the archive session(s). The default is manage both the datafiles"
+		echo " and archive session(s)."
+		echo ""
+		echo " To prevent a new datafile session from starting, create the optional"
+		echo " file \"/export/data/DB/${SKIP_FILE}\"."
+		echo ""
+		echo " To prevent a new archive session from starting, create the optional"
+		echo " file \"/export/data/DB_archive/${SKIP_FILE}\"."
+		echo ""
+		echo "*****************************************************************************"
+	fi
+	exit
+}
+
+# Check for proper command syntax
+###########################################################################
+if [ $# -lt 2 ];then
+	USAGE
+
+elif [ "${FIRST_ARG}" != start -a "${FIRST_ARG}" != stop ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+
+elif [ `echo "${SECOND_ARG}" | egrep -wc 'at|st|ay|sy|adby|sdby|ao|so'` -eq 0 ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+
+elif [ "${THIRD_ARG}" != "" -a "${THIRD_ARG}" != 'db' -a `echo "${THIRD_ARG}" |
+		egrep -wc 'force-restart|force-remove|datafiles-only|archive-only'` -eq 0 ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+
+elif [ "${THIRD_ARG}" = "db" -a "${FITH_ARG}" != '' -a `echo "${FITH_ARG}" |
+		egrep -wc 'wd|force-restart|force-remove|datafiles-only|archive-only'` -eq 0 ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+
+elif [ "${THIRD_ARG}" = "db" -a "${FITH_ARG}" = "wd" -a "${SEVENTH_ARG}" != '' -a `echo "${SEVENTH_ARG}" |
+		egrep -wc 'force-restart|force-remove|datafiles-only|archive-only'` -eq 0 ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+
+elif [ "${THIRD_ARG}" = "db" -a "${FITH_ARG}" = "wd" -a "${EIGHTH_ARG}" != '' -a `echo "${EIGHTH_ARG}" |
+		egrep -wc 'force-restart|force-remove|datafiles-only|archive-only'` -eq 0 ];then
+	echo -e "\nInvalid syntax\n"
+	sleep 1
+	USAGE
+fi
+
+# Start session
+###########################################################################
+if [ ${FIRST_ARG} = start ];then
+
+	# Determine if the "force-restart" option has been used
+	######################################################
+	if [ "${THIRD_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		THIRD_ARG=""
+
+	elif [ "${FOURTH_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		FOURTH_ARG=""
+
+	elif [ "${FITH_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		FITH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		SIXTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		SEVENTH_ARG=""
+
+	elif [ "${EIGHTH_ARG}" = force-restart ];then
+		OPT_ARG=force-restart
+		EIGHTH_ARG=""
+	else
+		OPT_ARG=""
+	fi
+
+	# Determine if the optional "datafiles-only"
+	# or archive-only option has been used
+	######################################################
+	if [ "${THIRD_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		THIRD_ARG=""
+
+	elif [ "${THIRD_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		THIRD_ARG=""
+
+	elif [ "${FOURTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		FOURTH_ARG=""
+
+	elif [ "${FOURTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		FOURTH_ARG=""
+
+	elif [ "${FITH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		FITH_ARG=""
+
+	elif [ "${FITH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		FITH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		SIXTH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		SIXTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		SEVENTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		SEVENTH_ARG=""
+
+	elif [ "${EIGHTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		EIGHTH_ARG=""
+	else
+		SESSION_TYPE=BOTH
+	fi
+
+	######################################################
+     	ACTION=Start
+	GET_DB_NAMES
+
+	# Start All today
+	######################################################
+	if [ "${SECOND_ARG}" = at -a "${THIRD_ARG}" = "" ];then
+     		SESSIONS=ALL
+		SET_TODAY
+
+	# Start single today, select DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = st -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+     			SESSIONS=SINGLE
+			BANNER='*'
+			SET_DB_NAME
+			SET_TODAY
+		else
+			exit
+		fi
+
+	# Start single today, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = st -a "${THIRD_ARG}" = db -a "${FITH_ARG}" = "" ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=""
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		SET_TODAY
+
+	# Start All today
+	######################################################
+	elif [ "${SECOND_ARG}" = ay -a "${THIRD_ARG}" = "" ];then
+     		SESSIONS=ALL
+		SET_TODAY YESTERDAY
+
+	# Start single yesterday, select DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sy -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+     			SESSIONS=SINGLE
+			BANNER='*'
+			SET_DB_NAME
+			SET_TODAY YESTERDAY
+		else
+			exit
+		fi
+
+	# Start single yesterday, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sy -a "${THIRD_ARG}" = db -a "${FITH_ARG}" = "" ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=""
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		SET_TODAY YESTERDAY
+
+	else
+		# Invalid Responce
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The ${ACTION} option(s) to ${PROG}, are not valid. Unable to ${ACTION} snapshot session for this DB on ${HOST}, ${DATE_TIME}"
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+			sleep 1
+     			USAGE
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		
+			# Exit Now
+			exit
+		fi
+	fi
+	
+# Stop session
+######################################################
+elif [ ${FIRST_ARG} = stop ];then
+
+	# Determine if the "force-remove" option has been used
+	######################################################
+	if [ "${THIRD_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		THIRD_ARG=""
+
+	elif [ "${FOURTH_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		THIRD_ARG=""
+
+	elif [ "${FITH_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		FITH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		SIXTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		SEVENTH_ARG=""
+
+	elif [ "${EIGHTH_ARG}" = force-remove ];then
+		OPT_ARG=force-remove
+		EIGHTH_ARG=""
+	else
+		OPT_ARG=""
+	fi
+
+	# Determine if the optional "datafiles-only"
+	# or archive-only option has been used
+	######################################################
+	if [ "${THIRD_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		THIRD_ARG=""
+
+	elif [ "${THIRD_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		THIRD_ARG=""
+
+	elif [ "${FOURTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		FOURTH_ARG=""
+
+	elif [ "${FOURTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		FOURTH_ARG=""
+
+	elif [ "${FITH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		FITH_ARG=""
+
+	elif [ "${FITH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		FITH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		SIXTH_ARG=""
+
+	elif [ "${SIXTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		SIXTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		SEVENTH_ARG=""
+
+	elif [ "${SEVENTH_ARG}" = archive-only ];then
+		SESSION_TYPE=ARCHIVE
+		SEVENTH_ARG=""
+
+	elif [ "${EIGHTH_ARG}" = datafiles-only ];then
+		SESSION_TYPE=DATAFILES
+		EIGHTH_ARG=""
+	else
+		SESSION_TYPE=BOTH
+	fi
+
+	######################################################
+     	ACTION=Stop
+	GET_DB_NAMES
+
+	###################################
+	##	Stop TODAY Section       ##
+	###################################
+
+	# Stop All today
+	######################################################
+	if [ "${SECOND_ARG}" = at -a "${THIRD_ARG}" = "" ];then
+     		SESSIONS=ALL
+		SET_TODAY
+		CHECK_4_TODAY_SESSIONS
+
+	# Stop Single today, select DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = st -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+			BANNER=''
+     			SESSIONS=SINGLE
+			SET_DB_NAME
+			SET_TODAY
+			CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+		else
+			exit
+		fi
+
+	# Stop Single today, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = st -a "${THIRD_ARG}" = "db" -a "${FITH_ARG}" = "" ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=""
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		SET_TODAY
+		CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+
+	###################################
+	##     Stop YESTERDAY Section    ##
+	###################################
+
+	# Stop All yesterday
+	######################################################
+	elif [ "${SECOND_ARG}" = ay -a "${THIRD_ARG}" = "" ];then
+     		SESSIONS=ALL
+		SET_TODAY YESTERDAY
+		CHECK_4_TODAY_SESSIONS
+
+	# Stop Single yesterday, select DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sy -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+			BANNER=''
+     			SESSIONS=SINGLE
+			SET_DB_NAME
+			SET_TODAY YESTERDAY
+			CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+		else
+			exit
+		fi
+
+	# Stop Single yesterday, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sy -a "${THIRD_ARG}" = "db" -a "${FITH_ARG}" = "" ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=""
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		SET_TODAY YESTERDAY
+		CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+
+	############################################
+	##     Stop DAY_BEFORE_YESTERDAY Section  ##
+	############################################
+
+	# Stop All day before yesterday
+	######################################################
+	elif [ "${SECOND_ARG}" = adby -a "${THIRD_ARG}" = "" ];then
+     		SESSIONS=ALL
+		SET_TODAY DAY_BEFORE_YESTERDAY
+		CHECK_4_TODAY_SESSIONS
+
+	# Stop Single day before yesterday, select DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sdby -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+			BANNER=''
+     			SESSIONS=SINGLE
+			SET_DB_NAME
+			SET_TODAY DAY_BEFORE_YESTERDAY
+			CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+		else
+			exit
+		fi
+
+	# Stop Single day before yesterday, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = sdby -a "${THIRD_ARG}" = "db" -a "${FITH_ARG}" = "" ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=""
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		SET_TODAY DAY_BEFORE_YESTERDAY
+		CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+
+	##################################
+	##     Stop OTHER DAY Section   ##
+	##################################
+
+	# Stop All other day, Select $TODAY
+	######################################################
+	elif [ "${SECOND_ARG}" = ao -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+			BANNER=''
+     			SESSIONS=ALL
+			SELECT_TODAY
+			CHECK_4_TODAY_SESSIONS
+		else
+			exit
+		fi
+
+	# Stop Single other day, select DB name, Select $TODAY
+	######################################################
+	elif [ "${SECOND_ARG}" = so -a "${THIRD_ARG}" = "" ];then
+
+		# Confirm ${INTERACTIVE} is set to YES
+		if [ ${INTERACTIVE} = YES ];then
+			BANNER=''
+     			SESSIONS=SINGLE
+			SET_DB_NAME
+			SELECT_TODAY
+			CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+		else
+			exit
+		fi
+
+	# Stop Single, other day, provide weekday, provide DB name
+	######################################################
+	elif [ "${SECOND_ARG}" = so -a "${THIRD_ARG}" = db -a "${FITH_ARG}" = wd  ];then
+     		SESSIONS=SINGLE
+		SINGLE_DB_NAME=${FOURTH_ARG}
+		CHECK_DB_NAME
+		TODAY=""
+		TODAY=${SIXTH_ARG}
+		SET_TODAY
+		CHECK_4_TODAY_SESSIONS ${SINGLE_DB_NAME}
+
+	else
+		# Invalid Responce
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The ${ACTION} option(s) to ${PROG}, are not valid. Unable to ${ACTION} snapshot session for this DB on ${HOST}, ${DATE_TIME}"
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+			sleep 1
+			USAGE
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+
+			# Exit Now
+			exit
+		fi
+	fi
+fi
+
+# For each DB, either start or stop the both the datafile and archive sessions
+######################################################
+LOOP=1
+while [ "${DB_NAMES[${LOOP}]}" ]
+do
+
+	# Set DB 
+	######################################################
+	DB=`echo ${DB_NAMES[${LOOP}]} | awk '{print $1}'`
+
+	# Pre Set DUMP_FILE to a null
+	######################################################
+	DUMP_FILE=""
+
+	# Increment $LOOP
+	######################################################
+	let LOOP=${LOOP}+1
+
+	# Confirm $DB is set
+	######################################################
+	if [ "${DB}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB\" not set on ${HOST}. Unable to ${ACTION} snapshot session for this DB on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# If $SESSIONS is set to SINGLE, confirm $DB matches $SINGLE_DB_NAME
+	######################################################
+	if [ ${SESSIONS} = SINGLE ];then
+
+		# Confirm $DB matches $SINGLE_DB_NAME
+		[ ${DB} != ${SINGLE_DB_NAME} ] && continue
+	fi
+
+	# Set DATA_DB_DIR 
+	######################################################
+	DATA_DB_DIR=/export/data/${DB}
+
+	# Set ARCHIVE_DB_DIR 
+	######################################################
+	ARCHIVE_DB_DIR=/export/data/${DB}_archive
+		
+	# Set HOT_BACKUP_REQUIRED to YES
+	######################################################
+	HOT_BACKUP_REQUIRED=YES
+
+	# Build the array REMOTE_HOSTS
+	# The array REMOTE_HOSTS has all the host names of systems running an instance of $DB
+	######################################################
+	GET_DB_NODES
+
+	# Determine if any of the remote hosts in the array $REMOTE_HOSTS are this host
+	######################################################
+	REMOTE_HOST=""
+	HOST_LOOP=1
+	while [ "${REMOTE_HOSTS[${HOST_LOOP}]}" ]
+	do
+
+        	# Set REMOTE_HOST to the host name for $DB
+		REMOTE_HOST=""
+        	REMOTE_HOST=${REMOTE_HOSTS[${HOST_LOOP}]}
+
+		# Increment HOST_LOOP
+		let HOST_LOOP=${HOST_LOOP}+1
+		
+		# Confirm that the ${REMOTE_HOST} is set
+		######################################################
+		if [ "${REMOTE_HOST}" = "" ];then
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Move onto next REMOTE_HOST name
+			continue
+		fi
+
+		# If ${HOST} = "${REMOTE_HOST}" is means that the local host is running an instance of $DB
+		######################################################
+		if [ ${HOST} = "${REMOTE_HOST}" ];then
+
+			# Set REMOTE_HOST_NUM to the last digit of $REMOTE_HOST_NUM
+			REMOTE_HOST_NUM=""
+			REMOTE_HOST_NUM=`echo ${REMOTE_HOST} | sed 's/\(.*\)\([1-9]$\)/\2/'`
+	
+			# Confirm that the ${REMOTE_HOST_NUM} is set to a single digit number 
+			######################################################
+			if [ `echo ${REMOTE_HOST_NUM} | egrep -c '[^1-9]'` -eq 1 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST_NUM\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+		
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Move onto next REMOTE_HOST name
+				continue
+			fi
+	
+			# Set ORACLE_SID to the first node running $DB that is up
+			######################################################
+			ORACLE_SID=""
+			ORACLE_SID="${DB}${REMOTE_HOST_NUM}"
+	
+			# Confirm that the ${ORACLE_SID} is set and set properly
+			######################################################
+			if [ `echo ${ORACLE_SID} | egrep -c "${DB}[1-9]"` -eq 0 ];then
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"ORACLE_SID\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+		
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Move onto next REMOTE_HOST name
+				continue
+			else
+				export ORACLE_SID
+			fi
+
+			# Determine if the Instance is up
+			######################################################
+			if [ `${SRVCTL} status instance -d ${DB} -i ${ORACLE_SID} | 
+				grep -c "Instance ${ORACLE_SID} is running"` -eq 1 ];then
+
+				# Set DB_INSTANCE_UP_DOWN to UP
+				DB_INSTANCE_UP_DOWN=UP
+		
+				# Exit LOOP
+				break
+			else
+
+				# Reset REMOTE_HOST to a null
+				REMOTE_HOST=""
+
+				# Set DB_INSTANCE_UP_DOWN to DOWN
+				DB_INSTANCE_UP_DOWN=DOWN
+
+				# Exit LOOP
+				break
+			fi
+		else
+
+			# Reset REMOTE_HOST to a null
+			REMOTE_HOST=""
+
+			# Set DB_INSTANCE_UP_DOWN to UNKNOWN
+			DB_INSTANCE_UP_DOWN=UNKNOWN
+		fi
+	done
+			
+	# If REMOTE_HOST is set to a null it means that the local host
+	# is not running $DB. In this case set REMOTE_HOST to the first node 
+	# running $DB that is up
+	######################################################
+	if [ "${REMOTE_HOST}" = "" ];then
+
+		HOST_LOOP=1
+		while [ "${REMOTE_HOSTS[${HOST_LOOP}]}" ]
+		do
+	
+        		# Set REMOTE_HOST to the host name for $DB
+			REMOTE_HOST=""
+        		REMOTE_HOST=${REMOTE_HOSTS[${HOST_LOOP}]}
+	
+			# Increment HOST_LOOP
+			let HOST_LOOP=${HOST_LOOP}+1
+		
+			# Confirm that the ${REMOTE_HOST} is set
+			######################################################
+			if [ "${REMOTE_HOST}" = "" ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Move onto next REMOTE_HOST name
+				continue
+
+			# Skip the local host name, it has already been checked
+			######################################################
+			elif [ "${REMOTE_HOST}" = "${HOST}" ];then
+
+				# Reset REMOTE_HOST to a null
+				REMOTE_HOST=""
+
+				# Set DB_INSTANCE_UP_DOWN to DOWN
+				DB_INSTANCE_UP_DOWN=DOWN
+
+				# Move onto next REMOTE_HOST
+				continue
+			fi
+	
+			# Determine if $REMOTE_HOST is up
+			UP_DOWN
+	
+			# If {REMOTE_HOST} is up add the host name to the array REMOTE_HOSTS
+			######################################################
+			if [ ${UP_DOWN} = UP ];then
+
+				# Set REMOTE_HOST_NUM to the last digit of $REMOTE_HOST_NUM
+				REMOTE_HOST_NUM=""
+				REMOTE_HOST_NUM=`echo ${REMOTE_HOST} | sed 's/\(.*\)\([1-9]$\)/\2/'`
+
+				# Set REMOTE_HOST_DOWN to NO
+				REMOTE_HOST_DOWN=NO
+		
+				# Confirm that the ${REMOTE_HOST_NUM} is set to a single digit number 
+				######################################################
+				if [ `echo ${REMOTE_HOST_NUM} | egrep -c '[^1-9]'` -eq 1 ];then
+
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The required variable \"REMOTE_HOST_NUM\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+
+						# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+
+					# Move onto next REMOTE_HOST name
+					continue
+				fi
+
+				# Set ORACLE_SID to the first node running $DB that is up
+				######################################################
+				ORACLE_SID=
+				ORACLE_SID="${DB}${REMOTE_HOST_NUM}"
+
+				# Confirm that the ${ORACLE_SID} is set and set properly
+				######################################################
+				if [ `echo ${ORACLE_SID} | egrep -c "${DB}[1-9]"` -eq 0 ];then
+	
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The required variable \"ORACLE_SID\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+
+						# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+
+					# Move onto next REMOTE_HOST name
+					continue
+				else
+					export ORACLE_SID
+				fi
+
+				# Confirm Instance is up
+				######################################################
+				if [ `${SRVCTL} status instance -d ${DB} -i ${ORACLE_SID} | 
+					grep -c "Instance ${ORACLE_SID} is running"` -eq 1 ];then
+
+					# Set DB_INSTANCE_UP_DOWN to UP
+					DB_INSTANCE_UP_DOWN=UP
+	
+					# Exit LOOP
+					break 1
+				else
+
+					# Set DB_INSTANCE_UP_DOWN to DOWN
+					DB_INSTANCE_UP_DOWN=DOWN
+
+					# Move on to next REMOTE_HOST name
+					continue
+				fi
+			else
+
+				# Set REMOTE_HOST_DOWN to  YES
+				REMOTE_HOST_DOWN=YES
+
+				# Set DB_INSTANCE_UP_DOWN to UNKNOWN
+				DB_INSTANCE_UP_DOWN=UNKNOWN
+			fi
+		done
+	fi
+
+	# If $ACTION is set to Start confirm that the $ARCHIVE_DB_DIR file system is not 100% full.
+	# If $ARCHIVE_DB_DIR is 100% the oracle sql scripts used to check and set/unset Hot-Backup Mode
+	# will hang until the $ARCHIVE_DB_DIR is less than 100% full. So if it's full skip it
+	######################################################
+	if [ ${ACTION} = Start ];then
+	
+		# Pre Set PERCENT_USED
+		PERCENT_USED=""
+
+		# Confirm that $ARCHIVE_DB_DIR is first mounted and then not 100% full
+		######################################################
+		# Local $ARCHIVE_DB_DIR file system
+		if [ "${REMOTE_HOST}" = ${HOST} ];then
+			if [ `grep -c " ${ARCHIVE_DB_DIR} " /etc/mtab` -eq 1 ];then
+	
+				# Set PERCENT_USED to the percentage of the $ARCHIVE_DB_DIR file system used
+				PERCENT_USED=`df -k ${ARCHIVE_DB_DIR} | grep -v Filesystem | 
+					awk '{print $5}' | sed 's/%//'`
+			fi
+	
+		# Remote $ARCHIVE_DB_DIR file system
+		elif [ ${REMOTE_HOST_DOWN} = NO ];then
+			if [ `ssh -q ic-${REMOTE_HOST} grep -c \" ${ARCHIVE_DB_DIR} \" /etc/mtab` -eq 1 ];then
+	
+				# Set PERCENT_USED to the percentage of the $ARCHIVE_DB_DIR file system used
+				PERCENT_USED=`ssh -q ic-${REMOTE_HOST} df -k ${ARCHIVE_DB_DIR} | 
+					grep -v Filesystem | awk '{print $5}' | sed 's/%//'`
+			fi
+		fi
+
+		# Confirm that the ${PERCENT_USED} is set
+		######################################################
+		if [ "${PERCENT_USED}" = "" ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"PERCENT_USED\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+	
+			# Move onto next REMOTE_HOST name
+			continue
+	
+		# Confirm that the ${PERCENT_USED} is set properly
+		######################################################
+		elif [ `echo ${PERCENT_USED}  | egrep -c '[^0-9]'` -eq 1 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"PERCENT_USED\" is not set properly for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+	
+			# Move onto next REMOTE_HOST
+			continue
+		fi
+	
+		# Confirm that ${PERCENT_USED} is not set to 100
+		######################################################
+		if [ ${PERCENT_USED} = 100 ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The archive file system \"${ARCHIVE_DB_DIR}\" for the DB \"${DB}\" on ${REMOTE_HOST} is 100% full, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+	
+			# Move onto next REMOTE_HOST
+			continue
+		fi
+	fi
+	
+	# Pre Set SKIP_DATA and SKIP_ARCHIVE
+	######################################################
+	SKIP_DATA=""
+	SKIP_ARCHIVE=""
+
+	# Determine if this DB' data areas should be skipped
+	# Set SKIP_DATA and SKIP_ARCHIVE
+	######################################################
+	if [ ${ACTION} = Start ];then
+
+		# Determine if any of the remote hosts in the array $REMOTE_HOSTS contain 
+		# the skip file
+		######################################################
+		SKIP_HOST=""
+		SKIP_LOOP=1
+		while [ "${REMOTE_HOSTS[${SKIP_LOOP}]}" ]
+		do
+	
+        		# Set SKIP_HOST to the host name for $DB
+			SKIP_HOST=""
+        		SKIP_HOST=${REMOTE_HOSTS[${SKIP_LOOP}]}
+	
+			# Increment SKIP_LOOP
+			let SKIP_LOOP=${SKIP_LOOP}+1
+			
+			# Confirm that the ${SKIP_HOST} is set
+			######################################################
+			if [ "${SKIP_HOST}" = "" ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"SKIP_HOST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Move onto next SKIP_HOST name
+				continue
+			fi
+	
+			# If $SKIP_HOST is thae same as ${HOST} check for the SKIP_FILE file locally
+			######################################################
+			if [ "${SKIP_HOST}" = "${HOST}" ];then
+
+				# Confirm ${DATA_DB_DIR} and ${ARCHIVE_DB_DIR} are mounted
+				######################################################
+				if [ `egrep -c " ${DATA_DB_DIR} " /etc/mtab` -eq 1 -a \
+				`egrep -c " ${ARCHIVE_DB_DIR} " /etc/mtab` -eq 1 ];then
+
+					# Set SKIP_DATA as needed
+					######################################################
+					if [ -f ${DATA_DB_DIR}/${SKIP_FILE} ];then
+						SKIP_DATA=YES
+					else
+						SKIP_DATA=NO
+		
+					fi
+		
+					# Set SKIP_ARCHIVE as needed
+					######################################################
+					if [ -f ${ARCHIVE_DB_DIR}/${SKIP_FILE} ];then
+						SKIP_ARCHIVE=YES
+					else
+						SKIP_ARCHIVE=NO
+		
+					fi
+				fi
+			else
+		
+				# Determine if $SKIP_HOST is up
+				UP_DOWN ${SKIP_HOST}
+		
+				# If ${SKIP_HOST} is up look for the skip file on ${DUMP_FILE_HOST}
+				######################################################
+				if [ ${UP_DOWN} = UP ];then
+
+					# Confirm ${DATA_DB_DIR} and ${ARCHIVE_DB_DIR} are mounted
+					######################################################
+					if [ `ssh -q ic-${SKIP_HOST} egrep -c \" ${DATA_DB_DIR} \" /etc/mtab` -eq 1 -a \
+					`ssh -q ic-${SKIP_HOST} egrep -c \" ${ARCHIVE_DB_DIR} \" /etc/mtab` -eq 1 ];then
+	
+						# Set SKIP_DATA as needed
+						######################################################
+						if [ `ssh -q ic-${SKIP_HOST} "ls -1 ${DATA_DB_DIR}/${SKIP_FILE} 2>/dev/null" | wc -l` -eq 1 ];then
+							SKIP_DATA=YES
+						else
+							SKIP_DATA=NO
+			
+						fi
+
+	
+						# Set SKIP_ARCHIVE as needed
+						######################################################
+						if [ `ssh -q ic-${SKIP_HOST} "ls -1 ${ARCHIVE_DB_DIR}/${SKIP_FILE} 2>/dev/null" | wc -l` -eq 1 ];then
+							SKIP_ARCHIVE=YES
+						else
+							SKIP_ARCHIVE=NO
+			
+						fi
+					fi
+				fi
+			fi
+
+			# Exit this loop if both SKIP_DATA and SKIP_ARCHIVE are set
+			######################################################
+			[ "${SKIP_DATA}" != "" -a "${SKIP_ARCHIVE}" != "" ] && break
+		done
+	fi
+
+	# Note: If $SKIP_DATA and $SKIP_ARCHIVE are both set to a null it means that either
+	# both systems running $DB are down or that $DATA_DB_DIR is not mounted on either
+	######################################################
+
+	# If $ACTION is set to Start, and starting a new session for the archive FS
+	# Set the variable DUMP_FILE, and DUMP_FILE_EXISTS
+	######################################################
+	if [ ${ACTION} = Start -a ${SESSION_TYPE} != DATAFILES -a "${SKIP_ARCHIVE}" != YES ];then
+
+		# Set DUMP_FILE_EXISTS to NO
+		######################################################
+		DUMP_FILE_EXISTS=NO
+	
+		# Pre Set DUMP_FILE to a null
+		######################################################
+		DUMP_FILE=""
+
+		# Determine if any of the remote hosts in the array $REMOTE_HOSTS contains
+		# the export dump file for $DB
+		######################################################
+		DUMP_FILE_HOST=""
+		DUMP_FILE_HOST_LOOP=1
+		while [ "${REMOTE_HOSTS[${DUMP_FILE_HOST_LOOP}]}" ]
+		do
+	
+        		# Set DUMP_FILE_HOST to the host name for $DB
+			DUMP_FILE_HOST=""
+        		DUMP_FILE_HOST=${REMOTE_HOSTS[${DUMP_FILE_HOST_LOOP}]}
+	
+			# Increment DUMP_FILE_HOST_LOOP
+			let DUMP_FILE_HOST_LOOP=${DUMP_FILE_HOST_LOOP}+1
+			
+			# Confirm that the ${DUMP_FILE_HOST} is set
+			######################################################
+			if [ "${DUMP_FILE_HOST}" = "" ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"DUMP_FILE_HOST\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+	
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Move onto next REMOTE_HOST name
+				continue
+			fi
+	
+			# Set DUMP_REMOTE_HOST_NUM to the last digit of $REMOTE_HOST_NUM
+			DUMP_REMOTE_HOST_NUM=""
+			DUMP_REMOTE_HOST_NUM=`echo ${DUMP_FILE_HOST} | sed 's/\(.*\)\([1-9]$\)/\2/'`
+
+			# Set DUMP_ORACLE_SID to the first node running $DB that is up
+			######################################################
+			DUMP_ORACLE_SID=
+			DUMP_ORACLE_SID="${DB}${DUMP_REMOTE_HOST_NUM}"
+
+			# Confirm that the ${DUMP_ORACLE_SID} is set and set properly
+			######################################################
+			if [ `echo ${DUMP_ORACLE_SID} | egrep -c "${DB}[1-9]"` -eq 0 ];then
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"DUMP_ORACLE_SID\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for this DB. Correct this problem before you run ${PROG} again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Move onto next REMOTE_HOST name
+				continue
+			fi
+		
+			# Set DUMP_FILE_DIR to the name of the dump file
+			######################################################
+			DUMP_FILE_DIR=${ARCHIVE_DB_DIR}/exp_backup/${DUMP_ORACLE_SID}_${ODD_EVEN}
+	
+			# Set DUMP_FILE to the name of the dump file that should exist
+			######################################################
+			DUMP_FILE="${DUMP_FILE_DIR}/${DUMP_ORACLE_SID}${Year}${Month}${Day}.dmp.gz"
+	
+			# If $DUMP_FILE_HOST is thae same as ${HOST} check for the dump file locally
+			######################################################
+			if [ "${DUMP_FILE_HOST}" = "${HOST}" ];then
+	
+				# Determine if the Dump file directory exists 
+				# There is only one dump directory per DB, it's on the high numbered node
+				######################################################
+				if [ -d ${DUMP_FILE_DIR} ];then
+	
+					# Determine if the Dump file has been created
+					######################################################
+					if [ -f ${DUMP_FILE} ];then
+	
+						# Set DUMP_FILE_EXISTS to YES
+						DUMP_FILE_EXISTS=YES
+	
+						# Exit this loop
+						break 1
+					fi
+				fi
+			else
+		
+				# Determine if $DUMP_FILE_HOST is up
+				UP_DOWN ${DUMP_FILE_HOST}
+		
+				# If ${DUMP_FILE_HOST} is up look for the dump file on ${DUMP_FILE_HOST}
+				######################################################
+				if [ ${UP_DOWN} = UP ];then
+	
+					# Determine if the Dump file directory exists 
+					# There is only one dump directory per DB, it's on the high numbered node
+					######################################################
+					if [ `ssh -q ic-${DUMP_FILE_HOST} "ls -d ${DUMP_FILE_DIR} 2>/dev/null" | wc -l` -eq 1 ];then
+		
+						# Determine if the Dump file has been created
+						######################################################
+						if [ `ssh -q ic-${DUMP_FILE_HOST} "ls ${DUMP_FILE} 2>/dev/null" | wc -l` -eq 1 ];then
+		
+							# Set DUMP_FILE_EXISTS to YES
+							DUMP_FILE_EXISTS=YES
+	
+							# Exit this loop
+							break 1
+						fi
+					fi
+				fi
+			fi
+		done
+	fi
+
+	# Confirm that at least one of the REMOTE_HOST running $DB is up
+	######################################################
+	if [ "${REMOTE_HOST_DOWN}" = YES -a $"{DB_INSTANCE_UP_DOWN}" = UNKNOWN ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: All of the hosts running the DB \"${DB}\" are down as seen from ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+
+	# If all the instances of $DB are down, but at least one of the REMOTE_HOST's is up
+	# create new session without using Hot-Backup Mode (HOT_BACKUP_REQUIRED)
+	######################################################
+	elif [ ${ACTION} = Start -a "${REMOTE_HOST_DOWN}" = NO -a "${DB_INSTANCE_UP_DOWN}" = DOWN ];then
+
+		# Set HOT_BACKUP_REQUIRED to NO
+		HOT_BACKUP_REQUIRED=NO
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: All the instances of the DB \"${DB}\" are down, as seen from ${HOST}. Attempting to create new sessions for ${DB} without using Hot-Backup mode, ${DATE_TIME}."
+
+		echo ${MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${MESSAGE}"
+		else
+
+ 			# Send Email
+			echo "${MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+	fi
+
+	# If there is no dump file send email reporting problem, as needed
+	######################################################
+	if [ ${ACTION} = Start -a "${DUMP_FILE_EXISTS}" = NO -a ${TODAY} != sunday -a \
+		"${SKIP_ARCHIVE}" != YES -a ${SESSION_TYPE} != DATAFILES  ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: The backup export dump file \"${DUMP_FILE}\" for the DB \"${DB}\" not found on \"${DUMP_FILE_HOST}\" for today \"${TODAY}\", as seen from ${HOST}, ${DATE_TIME}."
+
+		echo ${MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${MESSAGE}"
+		else
+
+ 			# Send Email
+			echo "${MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+	fi
+
+	# Set DB_DATA_DEV_NAME to the device name for ${DATA_DB_DIR}
+	DB_DATA_DEV_NAME=""
+	######################################################
+	if [ ${HOST} = ${REMOTE_HOST} ];then
+		DB_DATA_DEV_NAME=`grep -P "\s${DATA_DB_DIR}\s" /etc/mtab | awk '{print $1}' | 
+			sed 's%/dev/%%;s%[1-9]%%'`
+	else
+		DB_DATA_DEV_NAME=`ssh -nq ic-${REMOTE_HOST} "grep -P \"\s${DATA_DB_DIR}\s\" \
+			/etc/mtab" 2>&1 | grep -v stty | awk '{print $1}' | sed 's%/dev/%%;s%[1-9]%%'`
+	fi
+
+	# Confirm $DB_DEV_NAME is set
+	######################################################
+	if [ "${DB_DATA_DEV_NAME}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_DATA_DEV_NAME\" not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+
+	# Confirm $DB_DATA_DEV_NAME is set properly
+	######################################################
+	elif [ `echo ${DB_DATA_DEV_NAME} | grep -c emcpower` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_DATA_DEV_NAME\" is not set properly for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Set DB_DATA_LUN_NUMBER to the LUN number for ${DB_DATA_DEV_NAME}
+	######################################################
+	DB_DATA_LUN_NUMBER=""
+	DB_DATA_LUN_NUMBER=`powermt display dev=${DB_DATA_DEV_NAME} | grep 'Logical device' | 
+		awk '{print $NF}' | sed 's/\]//'`
+
+	# Confirm $DB_DATA_LUN_NUMBER is set
+	######################################################
+	if [ "${DB_DATA_LUN_NUMBER}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_DATA_LUN_NUMBER\" not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+
+	# Confirm $DB_DATA_LUN_NUMBER is set properly
+	######################################################
+	elif [ `echo ${DB_DATA_LUN_NUMBER} | egrep -c '[^0-9]'` -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_DATA_LUN_NUMBER\" is not set properly for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+	
+	# Set DATA_CLARIION to the SP owner of DB_DATA_DEV_NAME
+	######################################################
+	DATA_CLARIION=""
+	DATA_CLARIION="clariion2-sp`powermt display dev=${DB_DATA_DEV_NAME} 2>/dev/null | 
+		grep 'current=SP' | awk '{print $5}' | tr '[A-Z]' '[a-z]'`"
+
+	# Confirm DATA_CLARIION is set
+	######################################################
+	if [ "${DATA_CLARIION}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DATA_CLARIION\" is not set properly for the DB \"${DB}\", device name ${DB_DATA_DEV_NAME} on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Confirm that the snapshot LUN lun${DB_DATA_LUN_NUMBER}snap exists
+	######################################################
+	if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsnapshots | 
+		grep -c "lun${DB_DATA_LUN_NUMBER}snap"` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required snapshot LUN \"lun${DB_DATA_LUN_NUMBER}snap\" does not exist for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Determine how many datafile sessions that are already running
+	# Set NUM_DATA_SESSIONS to the number of datafile sessions running for $DB
+	######################################################
+	NUM_DATA_SESSIONS=""
+	NUM_DATA_SESSIONS=`${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | 
+		egrep -c "session\.datafiles\.${DB}\.${CLUSTER}\..+\.lun${DB_DATA_LUN_NUMBER}snap"`
+
+	# Confirm NUM_DATA_SESSIONS is set and set properly
+	######################################################
+	if [ "${NUM_DATA_SESSIONS}" = "" -o `echo "${NUM_DATA_SESSIONS}" | egrep -c '[^0-9]'` -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"NUM_DATA_SESSIONS\" is not set properly for the DB \"${DB}\", device name ${DB_DATA_DEV_NAME} on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Set DB_ARCHIVE_DEV_NAME to the device name for ${ARCHIVE_DB_DIR}
+	DB_ARCHIVE_DEV_NAME=""
+	######################################################
+	if [ ${HOST} = ${REMOTE_HOST} ];then
+		DB_ARCHIVE_DEV_NAME=`grep -P "\s${ARCHIVE_DB_DIR}\s" /etc/mtab | awk '{print $1}' | 
+			sed 's%/dev/%%;s%[1-9]%%'`
+	else
+
+		DB_ARCHIVE_DEV_NAME=`ssh -q ic-${REMOTE_HOST} "grep -P \"\s${ARCHIVE_DB_DIR}\s\" \
+			/etc/mtab" 2>&1 | grep -v stty | awk '{print $1}' | sed 's%/dev/%%;s%[1-9]%%'`
+	fi
+
+	# Confirm $DB_ARCHIVE_DEV_NAME is set
+	######################################################
+	if [ "${DB_ARCHIVE_DEV_NAME}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_ARCHIVE_DEV_NAME\" not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+
+	# Confirm $DB_ARCHIVE_DEV_NAME is set properly
+	######################################################
+	elif [ `echo ${DB_ARCHIVE_DEV_NAME} | grep -c emcpower` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_ARCHIVE_DEV_NAME\" is not set properly for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}.  Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Set DB_ARCHIVE_LUN_NUMBER to the LUN number for ${DB_ARCHIVE_DEV_NAME}
+	######################################################
+	DB_ARCHIVE_LUN_NUMBER=""
+	DB_ARCHIVE_LUN_NUMBER=`powermt display dev=${DB_ARCHIVE_DEV_NAME} | grep 'Logical device' | 
+		awk '{print $NF}' | sed 's/\]//'`
+
+	# Confirm $DB_ARCHIVE_LUN_NUMBER is set
+	######################################################
+	if [ "${DB_ARCHIVE_LUN_NUMBER}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_ARCHIVE_LUN_NUMBER\" not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+
+	# Confirm $DB_ARCHIVE_LUN_NUMBER is set properly
+	######################################################
+	elif [ `echo ${DB_ARCHIVE_LUN_NUMBER} | egrep -c '[^0-9]'` -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"DB_ARCHIVE_LUN_NUMBER\" is not set properly for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	# Set ARCHIVE_CLARIION to the SP owner of DB_ARCHIVE_DEV_NAME
+	######################################################
+	ARCHIVE_CLARIION=""
+	ARCHIVE_CLARIION="clariion2-sp`powermt display dev=${DB_ARCHIVE_DEV_NAME} 2>/dev/null | 
+		grep 'current=SP' | awk '{print $5}' | tr '[A-Z]' '[a-z]'`"
+
+	# Confirm ARCHIVE_CLARIION is set
+	######################################################
+	if [ "${ARCHIVE_CLARIION}" = "" ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"ARCHIVE_CLARIION\" is not set properly for the DB \"${DB}\", device name ${DB_ARCHIVE_DEV_NAME}, Unable to ${ACTION} snapshot archive session for \"${DB}\" on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Return $DB to normal mode
+		RETURN_2_NORMAL
+
+		# Move on to Next DB
+		continue
+	fi
+
+	# Confirm that the snapshot LUN lun${DB_ARCHIVE_LUN_NUMBER}snap exists
+	######################################################
+	if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsnapshots | 
+		grep -c "lun${DB_DATA_LUN_NUMBER}snap"` -eq 0 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required snapshot LUN lun${DB_ARCHIVE_LUN_NUMBER}snap does not exist for the DB \"${DB}\", Unable to ${ACTION} snapshot session for \"${DB}\" on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Return $DB to normal mode
+		RETURN_2_NORMAL
+
+		# Move on to Next DB
+		continue
+	fi
+
+	# Determine how many archive sessions that are already running
+	# Set NUM_ARCHIVE_SESSIONS to the number of archive sessions running for $DB
+	######################################################
+	NUM_ARCHIVE_SESSIONS=""
+	NUM_ARCHIVE_SESSIONS=`${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | 
+		egrep -c "session\.archive\.${DB}\.${CLUSTER}\..+\.lun${DB_ARCHIVE_LUN_NUMBER}snap"`
+
+	# Confirm NUM_ARCHIVE_SESSIONS is set and set properly
+	######################################################
+	if [ "${NUM_ARCHIVE_SESSIONS}" = "" -o `echo "${NUM_ARCHIVE_SESSIONS}" | egrep -c '[^0-9]'` -eq 1 ];then
+
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"NUM_ARCHIVE_SESSIONS\" is not set properly for the DB \"${DB}\", device name ${DB_DATA_DEV_NAME} on ${HOST}, ${DATE_TIME}. Unable to ${ACTION} sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+
+		echo ${ERROR_MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${ERROR_MESSAGE}"
+		else
+
+	 		# Send Email
+ 			echo "${ERROR_MESSAGE}" |
+			mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Move onto next DB
+		continue
+	fi
+
+	######################################################
+	# DATAFILES SECTION
+	######################################################
+
+	# Start the datafile session
+	######################################################
+	if [ ${ACTION} = Start -a ${SESSION_TYPE} != ARCHIVE -a "${SKIP_DATA}" != YES ];then
+
+		# Set DB_HOTBACKUP_MODE_SUPPORT 
+		# DB_HOTBACKUP_MODE_SUPPORT defines if the DB supports Hot-Backup mode
+		######################################################
+		DB_HOTBACKUP_MODE_SUPPORT=""
+
+		# If Hot Backup Mode is required determine hot backup support for $DB
+		######################################################
+		if [ ${HOT_BACKUP_REQUIRED} = YES ];then
+	
+			# Run sqlplus command to check DB backup mode as the user oracle
+			######################################################
+			if [ ${REMOTE_HOST} = ${HOST} -a ${USER} = root ];then
+		
+				DB_HOTBACKUP_MODE_SUPPORT=`su oracle -c "echo -e "\r\r\r" | ${SQLPLUS} / as sysdba @${ORACLE_SCRIPTS_DIR}/check_backup_mode.sql" | grep "Database log mode" | cut -d' ' -f 4-` 1> /dev/null 2>&1
+	
+			elif [ ${REMOTE_HOST} = ${HOST} -a ${USER} = oracle ];then
+	
+				DB_HOTBACKUP_MODE_SUPPORT=`echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/check_backup_mode.sql | grep "Database log mode" | cut -d' ' -f 4-` 1> /dev/null 2>&1
+	
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = root ];then
+	
+				DB_HOTBACKUP_MODE_SUPPORT=`su oracle -c "ssh -nq ${REMOTE_HOST} \"export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/check_backup_mode.sql\"" 2>&1 | grep -v stty |  grep "Database log mode" | cut -d' ' -f 4-` 1> /dev/null 2>&1
+	
+			elif [ ${REMOTE_HOST} != ${HOST} -a ${USER} = oracle ];then
+	
+				DB_HOTBACKUP_MODE_SUPPORT=`ssh -nq ${REMOTE_HOST} "export ORACLE_SID=${ORACLE_SID}; export NLS_LANG=AMERICAN_AMERICA.UTF8;echo -e "\r\r\r" | ${SQLPLUS} -s / as sysdba @${ORACLE_SCRIPTS_DIR}/check_backup_mode.sql" 2>&1 | grep -v stty | grep "Database log mode" | cut -d' ' -f 4-` 1> /dev/null 2>&1
+			fi
+	
+		
+			# Confirm that the ${DB_HOTBACKUP_MODE_SUPPORT} is set and set properly
+			######################################################
+			if [ `echo ${DB_HOTBACKUP_MODE_SUPPORT} | grep -ic Archive` -eq 0 ];then
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"DB_HOTBACKUP_MODE_SUPPORT\" is not set for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to create new sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+				
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+		
+				# Move onto next DB
+				continue
+			fi
+	
+			# Confirm DB supports Hot-Backup Mode
+			######################################################
+			if [ `echo ${DB_HOTBACKUP_MODE_SUPPORT} | grep -ic No` -eq 1 ];then
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The DB \"${DB}\" is NOT configured to support Hot-Backup Mode on ${HOST}, ${DATE_TIME}. Unable to create new sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+		
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+		
+				# Move on to next DB
+				continue
+			fi
+		fi
+
+		# Stop/Remove the session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap 
+		# if it is already running and OPT_ARG = force-restart
+		######################################################
+		if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+			"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -ge 1 -a \
+			"${OPT_ARG}" = force-restart ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: The session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" has already been started, ${DATE_TIME}"
+	
+			[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+
+			# Confirm there are no active sessions using the same 
+			# reserve LUN, LUN $DB_DATA_LUN_NUMBER
+			######################################################
+			if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsnapshots | sed -n \
+				 "/SnapView logical unit name:\slun${DB_DATA_LUN_NUMBER}snap/, \
+				/State:/p" | grep -c Active` -eq 1 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the datafiles session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. There is an active session using the same reserve LUN, LUN \"lun${DB_DATA_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Do Not stop this datafiles session
+				STOP_DATAFILES_SESSION=NO
+			else
+
+				# Stop this datafiles session
+				STOP_DATAFILES_SESSION=YES
+			fi
+
+			# Confirm STOP_DATAFILES_SESSION is set to YES
+			######################################################
+			if [ "${STOP_DATAFILES_SESSION}" = YES ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Stoping the datafiles session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" on ${HOST}, ${DATE_TIME}"
+		
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+		
+				# Stop/Remove the session 
+				######################################################
+				${NAVICLI} -h ${DATA_CLARIION} snapview -stopsession session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap -o 1>> ${LOG} 2>&1
+	
+				# Wait 5 seconds then confirm the session stopped properly
+				sleep 5
+		
+				# Confirm session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap was stopped/removed
+				######################################################
+				if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+					"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -ge 1 ];then
+		
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: Failed to stop snapshot session \"session..datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Unable to create new sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+			
+	 					# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+
+					# Do Not start this datafiles session
+					START_DATAFILES_SESSION=NO
+				else
+
+					# Start this datafiles session
+					START_DATAFILES_SESSION=YES
+				fi
+			else
+
+				# Do Not start this datafiles session
+				START_DATAFILES_SESSION=NO
+			fi
+
+		# If the session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap 
+		# is already running and OPT_ARG != force-restart display notice to interactive users
+		######################################################
+		elif [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+			"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -ge 1 -a \
+			"${OPT_ARG}" != force-restart ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: There is already a \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" sessions running. Not starting a new datafiles session for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}."
+
+			echo ${MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Do Not start this datafiles session
+			START_DATAFILES_SESSION=NO
+
+		# Confirm that the current number of sessions assigned to DB_DATA_LUN_NUMBER
+		# is less than $MAX_NUM_OF_SESSIONS
+		######################################################
+		elif [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+			"session\.datafiles\.${DB}\.${CLUSTER}\..+\.lun${DB_DATA_LUN_NUMBER}snap"` -ge ${MAX_NUM_OF_SESSIONS} ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: There are already \"${MAX_NUM_OF_SESSIONS}\" \"session.datafiles.${DB}.${CLUSTER}.XXX.lun${DB_DATA_LUN_NUMBER}snap\" sessions running. Unable to start additional datafile sessions for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Please correct this problem before ${PROG} runs again."
+
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Do Not start this datafiles session
+			START_DATAFILES_SESSION=NO
+		else
+			# Add blank line for interactive users
+			[ ${INTERACTIVE} = YES ] && echo ""
+
+			# Start this datafiles session
+			START_DATAFILES_SESSION=YES
+		fi
+
+		# Place $DB into Hot Backup Mode as needed
+		######################################################
+		[ "${START_DATAFILES_SESSION}" = YES ] && START_HOT_BACKUP
+
+		# Confirm START_DATAFILES_SESSION is set to YES
+		######################################################
+		if [ "${START_DATAFILES_SESSION}" = YES ];then
+			
+			# Start Datafile session 
+			# session.datafiles.$DB.${CLUSTER}.$TODAY.lun${DB_DATA_LUN_NUMBER}snap
+			######################################################
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Starting the datafiles session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\", on ${HOST}, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+	
+			# Sync file systems before starting session
+			######################################################
+			sync; sync
+	
+			# Start the session 
+			######################################################
+			${NAVICLI} -h ${DATA_CLARIION} snapview -startsession session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap -snapshotname lun${DB_DATA_LUN_NUMBER}snap -persistence 1>> ${LOG} 2>&1
+
+			# Wait 5 seconds then confirm the session started properly
+			sleep 5
+
+			# Set FAIL_COUNT to 0
+			FAIL_COUNT=0
+	
+			# Confirm the session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap started properly
+			######################################################
+			while [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+				"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -eq 0 ]
+			do
+	
+				# Inrement FAIL_COUNT by 1
+				let FAIL_COUNT=${FAIL_COUNT}+1
+				export FAIL_COUNT
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Note: The session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap has not started yet. Pausing ${SLEEP_SECONDS} seconds to allow the sessions to start on ${HOST}, ${DATE_TIME}"
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+	
+				# Exit this loop if FAIL_COUNT is larger than
+				[ ${FAIL_COUNT} -ge 15 ] && break
+
+				# Wait an additional ${SLEEP_SECONDS} for session to start
+				sleep ${SLEEP_SECONDS}
+			done
+
+			# Report problem with session not starting as neeed
+			######################################################
+			if [ ${FAIL_COUNT} -ge 15 ];then
+			
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap failed\" to start on ${HOST}, ${DATE_TIME}. Unable to create new sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+	
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+	
+				# Return $DB to normal mode
+				RETURN_2_NORMAL
+	
+				# Move on to Next DB
+				continue
+			fi
+		fi
+
+	# Report that the datafiles session is being skipped because Skip file exists
+	######################################################
+	elif [ ${ACTION} = Start -a ${SESSION_TYPE} != ARCHIVE -a "${SKIP_DATA}" = YES ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: The Skip File \"${DATA_DB_DIR}/${SKIP_FILE}\" exists, Not starting \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap, datafiles being skipped on ${HOST}, ${DATE_TIME}."
+
+		echo ${MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${MESSAGE}" |
+			mail -s "${PROG} Note: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+	# Report to INTERACTIVE users that the datafiles session is being skipped
+	######################################################
+	elif [ ${ACTION} = Start -a ${SESSION_TYPE} = ARCHIVE ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: Not starting the session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap, datafiles being skipped on ${HOST}, ${DATE_TIME}."
+	
+		echo ${MESSAGE} >> ${LOG}
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+
+	# Stop Datafile
+	######################################################
+	elif [ ${ACTION} = Stop -a ${SESSION_TYPE} != ARCHIVE ];then
+
+		# Confirm there is a session named session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap to stop
+		######################################################
+		if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+			"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -ge 1 ];then
+
+			# Confirm there are no active sessions using the same 
+			# reserve LUN, LUN $DB_DATA_LUN_NUMBER
+			######################################################
+			if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsnapshots | sed -n \
+				 "/SnapView logical unit name:\slun${DB_DATA_LUN_NUMBER}snap/, \
+				/State:/p" | grep -c Active` -eq 1 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the datafiles session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. There is an active session using the same reserve LUN, LUN \"lun${DB_DATA_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+			# Confirm stopping this session will not reduce the number of sessions
+			# running for the reserve LUN lun${DB_DATA_LUN_NUMBER}snap to 0
+			######################################################
+			elif [ ${NUM_DATA_SESSIONS} -le 1 -a "${OPT_ARG}" != force-remove ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the datafile session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Removing it would leave no sessions running on the reserve LUN \"lun${DB_DATA_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+			else 	# Stop/Remove the session 
+				
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Stopping the datafiles session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" on ${HOST}, ${DATE_TIME}"
+	
+				[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+	
+				# Stop/Remove the session 
+				######################################################
+				${NAVICLI} -h ${DATA_CLARIION} snapview -stopsession session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap -o 1>> ${LOG} 2>&1
+
+				# Wait 5 seconds then confirm the session stopped properly
+				sleep 5
+	
+				# Confirm session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap was stopped/removed
+				######################################################
+				if [ `${NAVICLI} -h ${DATA_CLARIION} snapview -listsessions | egrep -c \
+					"session\.datafiles\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_DATA_LUN_NUMBER}snap"` -ge 1 ];then
+		
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" failed to stop on ${HOST}, ${DATE_TIME}. Unable to create new sessions for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+		
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+			
+	 					# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+
+					# Move on to Next DB
+					continue
+				fi
+			fi
+		else
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: There are NO \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" sessions on ${HOST} to ${ACTION}, ${DATE_TIME}. Unable to ${ACTION} datafile session for the DB \"${DB}\". Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+		fi
+
+	# Report to INTERACTIVE users that the datafiles session is being skipped
+	######################################################
+	elif [ ${ACTION} = Stop -a ${SESSION_TYPE} = ARCHIVE ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: Not stopping the session \"session.datafiles.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap, datafiles being skipped on ${HOST}, ${DATE_TIME}."
+	
+		echo ${MESSAGE} >> ${LOG}
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+	fi
+
+	######################################################
+	# ARCHIVE SECTION
+	######################################################
+
+	# Start the archive session
+	######################################################
+	if [ ${ACTION} = Start -a ${SESSION_TYPE} != DATAFILES -a "${SKIP_ARCHIVE}" != YES ];then
+
+		# Stop/Remove the session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap 
+		# if it is already running and OPT_ARG = forcse-restart
+		######################################################
+		if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+			"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge 1 -a \
+			"${OPT_ARG}" = force-restart ];then
+
+			# Start this archive session
+			START_ARCHIVE_SESSION=YES
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: The session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" has already been started, ${DATE_TIME}"
+	
+			[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+
+			# Confirm there are no active sessions using the same 
+			# reserve LUN, LUN $DB_ARCHIVE_LUN_NUMBER
+			######################################################
+			if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsnapshots | sed -n \
+				 "/SnapView logical unit name:\slun${DB_ARCHIVE_LUN_NUMBER}snap/, \
+				/State:/p" | grep -c Active` -eq 1 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the archive session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. There is an active session using the same reserve LUN, LUN \"lun${DB_ARCHIVE_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Return $DB to normal mode
+				RETURN_2_NORMAL
+
+				# Move on to Next DB
+				continue
+			fi
+
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Stopping session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" on ${HOST}, ${DATE_TIME}"
+		
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+		
+			# Stop/Remove the session 
+			######################################################
+			${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -stopsession session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap -o 1>> ${LOG} 2>&1
+	
+			# Wait 5 seconds then confirm the session stopped properly
+			sleep 5
+		
+			# Confirm session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap was removed
+			######################################################
+			if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+				"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge 1 ];then
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Attempted to stop snapshot session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" but it failed to stop for the DB \"${DB}\", Unable to ${ACTION} new snapshot session for \"${DB}\" on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+	
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Return $DB to normal mode
+				RETURN_2_NORMAL
+
+				# Move on to Next DB
+				continue
+			fi
+
+		# If the session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap 
+		# is already running and OPT_ARG != force-restart display notice to interactive users
+		######################################################
+		elif [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+			"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge 1 -a \
+			"${OPT_ARG}" != force-restart ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: There is already a \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_DATA_LUN_NUMBER}snap\" sessions running. Not starting a new archive session for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}."
+
+			echo ${MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Return $DB to normal mode
+			RETURN_2_NORMAL
+
+			# Move on to Next DB
+			continue
+
+		# Confirm that the current number of sessions assigned to DB_ARCHIVE_LUN_NUMBER
+		# is less than $MAX_NUM_OF_SESSIONS
+		######################################################
+		elif [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+			"session\.archive\.${DB}\.${CLUSTER}\..+\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge ${MAX_NUM_OF_SESSIONS} ];then
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: There are already ${MAX_NUM_OF_SESSIONS} session.archive.${DB}.${CLUSTER}.XXX.lun${DB_ARCHIVE_LUN_NUMBER}snap sessions running. Unable to start another archive sessions for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Please correct this problem before ${PROG} runs again."
+
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+
+			# Return $DB to normal mode
+			RETURN_2_NORMAL
+
+			# Move onto next DB
+			continue
+		fi
+
+		# If $SESSION_TYPE is set to ARCHIVE 
+		# Place $DB into Hot Backup Mode as needed
+		######################################################
+		[ "${SESSION_TYPE}" = ARCHIVE -o ${SKIP_DATA} = YES ] && START_HOT_BACKUP
+
+		# Confirm Database is still in Hot-Backup Mode
+		######################################################
+		if [ ${HOT_BACKUP_REQUIRED} = YES ];then  
+
+			STATUS_DB_MODE
+			# Zero means DB is in Normal Mode
+			if [ ${MODE_NUMBER} -eq 0 ];then
+				
+				# Report that $DB is no longer in Hot-Backup Mode
+				######################################################
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Note: The DB \"${DB}\" returned to Normal Mode on it own. Returning the DB \"${DB}\" back to Hot-Backup Mode on ${HOST}, ${DATE_TIME}"
+	
+				echo ${MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${MESSAGE}"
+				else
+	
+						# Send Email
+ 					echo "${MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+				# Place DB into Hot-Backup mode
+				######################################################
+				START_HOT_BACKUP
+	
+				# Confirm Database is in Hot-Backup mode
+				######################################################
+				STATUS_DB_MODE
+				# Zero means DB is in Normal Mode
+				if [ ${MODE_NUMBER} -eq 0 ];then
+		
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The DB \"${DB}\" failed to enter Hot-Backup Mode. Unable to ${ACTION} the archive session. Correct this problem before running ${PROG} again ${HOST}, ${DATE_TIME}"
+				
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+		
+						# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+	
+					# Move on to Next DB
+					continue
+				else
+					# Set Trap to run RETURN_2_NORMAL if someone hits ctrl C (^C)
+					trap 'RETURN_2_NORMAL;exit 1' 1 2 3 6 15
+				fi
+			fi
+		fi
+	
+		# Start Archive session session.$DB.${CLUSTER}.$TODAY.lun${DB_ARCHIVE_LUN_NUMBER}snap
+		######################################################
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Starting the archive session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\", on ${HOST}, ${DATE_TIME}"
+		[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+		echo ${MESSAGE} >> ${LOG}
+	
+		# Sync file systems before starting session
+		######################################################
+		sync; sync
+
+		# Start the session 
+		######################################################
+		${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -startsession session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap -snapshotname lun${DB_ARCHIVE_LUN_NUMBER}snap -persistence 1>> ${LOG} 2>&1
+
+		# Wait 5 seconds then confirm the session started properly
+		sleep 5
+
+		# Set FAIL_COUNT to 0
+		FAIL_COUNT=0
+	
+		# Confirm the session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap started properly
+		######################################################
+		while [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+			"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -eq 0 ]
+		do
+
+			# Inrement FAIL_COUNT by 1
+			let FAIL_COUNT=${FAIL_COUNT}+1
+			export FAIL_COUNT
+
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			MESSAGE="Note: The session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap has not started yet. Pausing ${SLEEP_SECONDS} seconds to allow the sessions to start on ${HOST}, ${DATE_TIME}"
+			[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+			echo ${MESSAGE} >> ${LOG}
+
+			# Exit this loop if FAIL_COUNT is larger than
+			[ ${FAIL_COUNT} -ge 15 ] && break
+
+			# Wait an additional ${SLEEP_SECONDS} for session to start
+			sleep ${SLEEP_SECONDS}
+		done
+
+		# Report problem with session not starting as neeed
+		######################################################
+		if [ ${FAIL_COUNT} -ge 15 ];then
+		
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" failed to start on ${HOST}. The DB \"${DB}\" will not have the archive file system available for backup today, ${DATE_TIME}"
+			
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+		
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+		fi
+
+		# Confirm Database is still in Hot-Backup mode
+		######################################################
+		if [ ${HOT_BACKUP_REQUIRED} = YES ];then  
+
+			STATUS_DB_MODE
+			# One or greater means DB is in Hot-Backup mode
+			if [ ${MODE_NUMBER} -ge 1 ];then
+		
+				# Return $DB to normal mode
+				RETURN_2_NORMAL
+			
+			else
+				# Zero means DB is in Normal Mode
+				# DB is already in Normal Mode
+		
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Note: The DB \"${DB}\" is returned to normal on it's own on ${HOST}, ${DATE_TIME}"
+				
+				echo ${MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${MESSAGE}"
+				else
+		
+					# Send Email
+ 					echo "${MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+			fi
+		fi
+
+	# Report that the archive session is being skipped because Skip file exists
+	######################################################
+	elif [ ${ACTION} = Start -a ${SESSION_TYPE} != DATAFILES -a "${SKIP_ARCHIVE}" = YES ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: The Skip File \"${ARCHIVE_DB_DIR}/${SKIP_FILE}\" exists, Not starting \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap, archive being skipped on ${HOST}, ${DATE_TIME}."
+
+		echo ${MESSAGE} >> ${LOG}
+		if [ ${INTERACTIVE} = YES ];then  
+			echo -e "\n${MESSAGE}"
+		else
+
+			# Send Email
+ 			echo "${MESSAGE}" |
+			mail -s "${PROG} Note: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+		fi
+
+		# Turn off Hot Backup Mode as needed
+		######################################################
+		[ "${START_DATAFILES_SESSION}" = YES ] && RETURN_2_NORMAL
+
+	# Report to INTERACTIVE users that the archive session is being skipped
+	######################################################
+	elif [ ${ACTION} = Start -a ${SESSION_TYPE} = DATAFILES ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: Not starting the session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap, archive session being skipped on ${HOST}, ${DATE_TIME}."
+	
+		echo ${MESSAGE} >> ${LOG}
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+
+		# Turn off Hot Backup Mode as needed
+		######################################################
+		[ "${START_DATAFILES_SESSION}" = YES ] && RETURN_2_NORMAL
+
+	# Stop Archive sessions
+	######################################################
+	elif [ ${ACTION} = Stop -a ${SESSION_TYPE} != DATAFILES ];then
+
+		# Confirm the session session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap exist to stop
+		######################################################
+		if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+			"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge 1 ];then
+
+			# Confirm there are no active sessions using the same 
+			# reserve LUN, LUN $DB_ARCHIVE_LUN_NUMBER
+			######################################################
+			if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsnapshots | sed -n \
+				 "/SnapView logical unit name:\slun${DB_ARCHIVE_LUN_NUMBER}snap/, \
+				/State:/p" | grep -c Active` -eq 1 ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the archive session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. There is an active session using the same reserve LUN, LUN \"lun${DB_ARCHIVE_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+			# Confirm stopping this session will not reduce the number of sessions
+			# running for the reserve LUN lun${DB_ARCHIVE_LUN_NUMBER}snap to 0
+			######################################################
+			elif [ ${NUM_ARCHIVE_SESSIONS} -le 1 -a "${OPT_ARG}" != force-remove ];then
+	
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: Unable to remove the archive session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" for the DB \"${DB}\" on ${HOST}, ${DATE_TIME}. Removing it would leave no sessions running on the reserve LUN \"lun${DB_ARCHIVE_LUN_NUMBER}snap\". Correct this problem before ${PROG} runs again."
+
+				echo ${ERROR_MESSAGE} >> ${LOG}
+				if [ ${INTERACTIVE} = YES ];then  
+					echo -e "\n${ERROR_MESSAGE}"
+				else
+	
+					# Send Email
+ 					echo "${ERROR_MESSAGE}" |
+					mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+				fi
+
+			else 	# Stop/Remove the session 
+
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				MESSAGE="Stopping the archive session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" on ${HOST}, ${DATE_TIME}"
+	
+				[ ${INTERACTIVE} = YES ] && echo "${MESSAGE}"
+				echo ${MESSAGE} >> ${LOG}
+	
+				# Stop/Remove the session 
+				######################################################
+				${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -stopsession session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap -o 1>> ${LOG} 2>&1
+
+				# Wait 5 seconds then confirm the session stopped properly
+				sleep 5
+	
+				# Confirm session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap was removed
+				######################################################
+				if [ `${NAVICLI} -h ${ARCHIVE_CLARIION} snapview -listsessions | egrep -c \
+					"session\.archive\.${DB}\.${CLUSTER}\.${TODAY}\.lun${DB_ARCHIVE_LUN_NUMBER}snap"` -ge 1 ];then
+		
+					DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+					ERROR_MESSAGE="Error: The snapshot session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap\" failed to stop for the DB \"${DB}\", Unable to stop snapshot session for \"${DB}\" on ${HOST}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+		
+					echo ${ERROR_MESSAGE} >> ${LOG}
+					if [ ${INTERACTIVE} = YES ];then  
+						echo -e "\n${ERROR_MESSAGE}"
+					else
+	
+							# Send Email
+ 						echo "${ERROR_MESSAGE}" |
+						mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+					fi
+				fi
+			fi
+		else
+	
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: There are NO \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap sessions\" on ${HOST} to ${ACTION}, ${DATE_TIME}. Correct this problem before you run ${PROG} again."
+	
+			echo ${ERROR_MESSAGE} >> ${LOG}
+			if [ ${INTERACTIVE} = YES ];then  
+				echo -e "\n${ERROR_MESSAGE}"
+			else
+	
+				# Send Email
+ 				echo "${ERROR_MESSAGE}" |
+				mail -s "${PROG} Error: on ${HOST}, ${DATE_TIME}" ${ERROR_EMAIL_LIST}
+			fi
+		fi
+
+	# Report to INTERACTIVE users that the archive session is being skipped
+	######################################################
+	elif [ ${ACTION} = Stop -a ${SESSION_TYPE} = DATAFILES ];then
+			
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		MESSAGE="Note: Not stopping the session \"session.archive.${DB}.${CLUSTER}.${TODAY}.lun${DB_ARCHIVE_LUN_NUMBER}snap, archive session being skipped on ${HOST}, ${DATE_TIME}."
+	
+		echo ${MESSAGE} >> ${LOG}
+		[ ${INTERACTIVE} = YES ] && echo -e "\n${MESSAGE}"
+	fi
+done

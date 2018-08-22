@@ -1,0 +1,641 @@
+#!/bin/bash
+# rsync_data
+# Purpose: This scripts job is to rsync multiple data areas at the same time using 
+# the config data from the source file supplied as an argument to this script. 
+
+# Written By: Jon Swift 06/12
+# Updated 11/13, Added support for Solaris & email reporting
+# Updated 02/12/16, Changed EMAIL_LIST email address
+# Updated 03/16/17, Added an exclude option
+
+
+HOST=`uname -n`
+PROG=`basename $0`
+LOG_DIR=/var/tmp/${PROG}
+LOG=/tmp/${PROG}.log
+RSYNC=NO
+STATUS=NO
+OS=`uname -s`
+KILL=NO
+PWR_AUTO="^/home/.+|^/data/.+|^/apps/.+|^/scratch/.+"
+PW_AUTO="^/pw/data/.+|^/pw/prod/.+|^/pw/devl/.+|^/pw/test/.+"
+MAX_JOBS=5
+EMAIL_LIST=jon.swift@rocket.com
+unset RSYNC_PIDS[*]
+unset RSYNC_PPIDS[*]
+WAIT_SECONDS=60
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/ucb
+
+# Confirm this script is being run as root
+################################################################################
+if [ `whoami` != root ];then
+	echo -e "\nError: ${PROG} must be run as root\n"
+	exit
+fi
+
+# Determine if this script is being run interactively
+######################################################
+tty -s
+if [ $? != 0 ];then
+        INTERACTIVE=NO
+else
+        INTERACTIVE=YES
+fi
+
+# The USAGE function is used to display usage info
+################################################################################
+USAGE () {
+	echo -e "\n"
+	echo "Usage: ${PROG}"
+	echo "${PROG} -f file-name,	file containing rsync job config data"
+	echo "${PROG} -s, 			Status current rsync jobs"
+	echo "${PROG} -k,			Kill all rsync jobs started with this script"
+	echo "   Note: All options are exclusive, and can only be run 1 at a time"
+	echo ""
+	echo ""
+	echo "Required format for rsync job config data as follows:"
+	echo " Source-File-Server Full-Path-to-Source-Directory to rsync \\"
+	echo " Target-File-Server Full-Path-to-Target-Directory to rsync"
+	echo ""
+	echo " All 4 of these fields in rsync config file must be listed on a single"
+	echo " line. Only listed on multiple lines here to improve read ability."
+	echo " i.e. Source-File-Server /Source/Directory Taget-File-Server /Target/Directory"
+	echo -e "\n"
+	exit
+}
+
+# Display usage as needed
+################################################################################
+[ $# -eq 0 ] && USAGE
+
+# Parse command line options
+################################################################################
+while getopts "f:ks" OPT
+do
+        case ${OPT} in
+
+		f) # Define RSYNC_CONFIG
+	   	   RSYNC_CONFIG=${OPTARG}
+	   	   RSYNC=YES
+	
+	   	   # Confirm $RSYNC_CONFIG exists
+	   	   if [ ! -s ${RSYNC_CONFIG} ];then
+			echo -e "\nError: The required rsync config file \"${RSYNC_CONFIG}\" does not exist\n" | tee -a ${LOG}
+			exit
+	   	   fi
+		;;
+	
+		s) # Set STATUS to yes
+	   	   STATUS=YES
+		   [ ${INTERACTIVE} = NO ] && exit
+		;;
+		
+		k) # Set KILL to yes
+	   	   KILL=YES
+		   [ ${INTERACTIVE} = NO ] && exit
+		;;
+	
+		*) # Error
+		   [ ${INTERACTIVE} = NO ] && exit
+           	   echo -e "\nInvalid syntax"
+           	   sleep 2
+           	   USAGE
+		;;
+	esac
+done
+	
+# The EMAIL Function is used to send out email if there is a problem detected
+################################################################################
+EMAIL () {
+	# set -x
+	ERROR_MESSAGE="$1"
+
+	# Send email then exit
+        echo "${ERROR_MESSAGE}" |
+        mailx -s "${PROG} Error on ${HOST}, ${DATE_TIME}" ${EMAIL_LIST}
+}
+
+# The PING Function is used to determine if systems are up
+################################################################################
+if [ ${OS} = Linux ];then
+	PING () {
+		# set -x
+
+		SYSTEM=""
+		SYSTEM=$1
+		ping -f -i .3 -w 1 ${SYSTEM} | grep -c '100% packet loss'
+}
+elif [ ${OS} = SunOS ];then
+	PING () {
+		# set -x
+
+		SYSTEM=""
+		SYSTEM=$1
+		ping -c2 ${SYSTEM} 2 | grep -c 'no answer'
+}
+else
+	echo -e "\nError: ${PROG} only supported on Linux and SunOS\n"
+	exit
+fi
+	
+# The RSYNC Function is used to rsync the data from ${SOURCE_SERVER} to ${TARGET_SERVER}
+################################################################################
+RSYNC () {
+	# set -x
+
+	SOURCE=""
+	TARGET=""
+	RSYNC_LOG=""
+	EXCLUDE=""
+	EXCLUDED=""
+	SOURCE=$1
+	TARGET=$2
+	RSYNC_LOG=$3
+	EXCLUDE=$4
+	
+	# Confirm $SOURCE is set
+	#######################################################
+	if [ "${SOURCE}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"SOURCE\" not set, ${HOST} ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG_DIR}/${RSYNC_LOG}
+		else
+			echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG_DIR}/${RSYNC_LOG}
+			EMAIL "${ERROR_MESSAGE}"
+		fi
+		exit
+	fi
+
+	# Confirm $TARGET is set
+	#######################################################
+	if [ "${TARGET}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"TARGET\" not set, ${HOST} ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG_DIR}/${RSYNC_LOG}
+		else
+			echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG_DIR}/${RSYNC_LOG}
+			EMAIL "${ERROR_MESSAGE}"
+		fi
+		exit
+	fi
+
+	# Confirm $RSYNC_LOG is set
+	#######################################################
+	if [ "${RSYNC_LOG}" = "" ];then
+		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+		ERROR_MESSAGE="Error: The required variable \"RSYNC_LOG\" not set, ${HOST} ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG_DIR}/${RSYNC_LOG}
+		else
+			echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG_DIR}/${RSYNC_LOG}
+			EMAIL "${ERROR_MESSAGE}"
+		fi
+		exit
+	fi
+
+	# If EXCLUDE is set EXCLUDED based on the number excluded dirs listed
+	#######################################################
+	if [ "${EXCLUDE}" != "" ];then
+		if [ `echo ${EXCLUDE} | grep -c ','` -eq 0 ];then
+			EXCLUDED="${EXCLUDE}"
+		else
+			EXCLUDED=`echo ${EXCLUDE} | sed "s{,{ --exclude {g"`
+		fi
+	fi
+
+	# Start rsync job
+	#######################################################
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+
+	#rsync -axHe "ssh -i /root/.ssh/rsync" --delete ${SOURCE}/ ${TARGET} --log-file=${LOG_DIR}/${RSYNC_LOG}
+	if [ "${EXCLUDE}" = "" ];then
+		MESSAGE="Starting rsync job, rsync -axH --delete-before ${SOURCE}/ ${TARGET}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}\n" >> ${LOG}
+		fi
+		echo -e "\n${MESSAGE}\n" > ${LOG_DIR}/${RSYNC_LOG}
+
+		rsync -axH --delete-before ${SOURCE}/ ${TARGET} --log-file=${LOG_DIR}/${RSYNC_LOG} 2>&1
+		STATUS=$?
+	else
+		MESSAGE="Starting rsync job, rsync -axH --exclude ${EXCLUDED} --delete-before ${SOURCE}/ ${TARGET}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}\n" >> ${LOG}
+		fi
+		echo -e "\n${MESSAGE}\n" > ${LOG_DIR}/${RSYNC_LOG}
+		rsync -axH --exclude ${EXCLUDED} --delete-before ${SOURCE}/ ${TARGET} --log-file=${LOG_DIR}/${RSYNC_LOG} 2>&1
+		STATUS=$?
+	fi
+
+	# Add completion line to log file
+	#######################################################
+	if [ ${STATUS} = 0 ];then
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="rsync job ${SOURCE}/ ${TARGET}, completeted succesfully, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}\n" >> ${LOG}
+		fi
+		echo "${MESSAGE}" >> ${LOG_DIR}/${RSYNC_LOG}
+	else
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="rsync job ${SOURCE}/ ${TARGET}, completeted unsuccesfully, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}\n" >> ${LOG}
+		fi
+		echo "${MESSAGE}" >> ${LOG_DIR}/${RSYNC_LOG}
+		ERROR_MESSAGE=${MESSAGE}
+		EMAIL "${ERROR_MESSAGE}"
+	fi
+}
+
+# The SET_JOBS Function is used to set $JOBS to the number of unique rsync jobs being run
+################################################################################
+SET_JOBS () {
+	# set -x
+
+	# Set JOBS to the current number of rsync jobs started by this script
+	#######################################################
+	PID_COUNT=0
+	for RSYNC_PID in `ps -aef | grep rsync | grep log-file= | grep -v grep | 
+		awk '{print $2}'`
+	do
+
+		# Add $RSYNC_PID to the array $RSYNC_PIDS
+		RSYNC_PIDS[${PID_COUNT}]=${RSYNC_PID}
+
+		# Increment $PID_COUNT
+		let PID_COUNT=${PID_COUNT}+1
+	done
+
+	PPID_COUNT=0
+	for RSYNC_PPID in `ps -aef | grep rsync | grep log-file= | grep -v grep | 
+		awk '{print $3}'`
+	do
+
+		# Add $RSYNC_PPID to the array $RSYNC_PPIDS
+		RSYNC_PPIDS[${PPID_COUNT}]=${RSYNC_PPID}
+
+		# Increment $PPID_COUNT
+		let PPID_COUNT=${PPID_COUNT}+1
+	done
+
+	# Pre Set JOBS to $PID_COUNT
+	JOBS=${PID_COUNT}
+
+	# Decrement $JOBS for every $RSYNC_PPID PID that is the same as 1 of the RSYNC_PID's
+	#######################################################
+	PID_COUNT=0
+	while [ "${RSYNC_PIDS[${PID_COUNT}]}" ]
+	do
+
+		# Set RSYNC_PID to the PID contained in ${RSYNC_PIDS[${PID_COUNT}]}
+		RSYNC_PID=""
+		RSYNC_PID=${RSYNC_PIDS[${PID_COUNT}]}
+
+		# Confirm $RSYNC_PID is set
+		#######################################################
+		if [ "${RSYNC_PID}" = "" ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"RSYNC_PID\" not set, ${HOST} ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+			exit
+		fi
+		
+		PPID_COUNT=0
+
+		while [ "${RSYNC_PPIDS[${PPID_COUNT}]}" ]
+ 		do
+			# Set RSYNC_PPID to the PID contained in ${RSYNC_PPIDS[${PPID_COUNT}]}
+			#######################################################
+			RSYNC_PPID=""
+			RSYNC_PPID=${RSYNC_PPIDS[${PPID_COUNT}]}
+
+			# Confirm $RSYNC_PPID is set
+			#######################################################
+			if [ "${RSYNC_PPID}" = "" ];then
+				DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+				ERROR_MESSAGE="Error: The required variable \"RSYNC_PPID\" not set, ${HOST} ${DATE_TIME}"
+				if [ ${INTERACTIVE} = YES ];then
+					echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+				else
+					echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+					EMAIL "${ERROR_MESSAGE}"
+				fi
+				exit
+			fi
+
+			# Decrement $JOBS if ${RSYNC_PID} is the same as ${RSYNC_PPID}
+			#######################################################
+			[ ${RSYNC_PID} = ${RSYNC_PPID} ] && let JOBS=${JOBS}-1
+
+			# Increment $PPID_COUNT
+			#######################################################
+			let PPID_COUNT=${PPID_COUNT}+1
+		done
+
+		# Increment $PID_COUNT
+		#######################################################
+		let PID_COUNT=${PID_COUNT}+1
+	done
+}
+	
+# Create $LOG_DIR as needed
+################################################################################
+[ ! -d ${LOG_DIR} ] && mkdir ${LOG_DIR}
+
+# Confirm Syntax used is correct
+################################################################################
+if [ ${RSYNC} = YES -a ${STATUS} = NO -a ${KILL} = NO ];then
+	true
+elif [ ${RSYNC} = NO -a ${STATUS} = YES -a ${KILL} = NO ];then
+	true
+elif [ ${RSYNC} = NO -a ${STATUS} = NO -a ${KILL} = YES ];then
+	true
+else
+       	echo -e "\nInvalid syntax"
+       	sleep 2
+	USAGE
+fi
+
+# Rsync all data in $RSYNC_CONFIG
+################################################################################
+if [ ${RSYNC} = YES ];then
+
+	# Set LOOP to 0
+	LOOP=0
+
+	TOTAL_JOBS=`cat ${RSYNC_CONFIG} | grep -v '^#' | wc -l`
+	
+	# Start rsync
+	#######################################################
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE1="Starting master rsync job, ${DATE_TIME}."
+	MESSAGE2="Rsyning ${TOTAL_JOBS} different areas"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE1}\n" | tee -a ${LOG}
+		echo -e "\n${MESSAGE2}\n" | tee -a ${LOG}
+	else
+		echo -e "\n${MESSAGE1}\n" >> ${LOG}
+		echo -e "\n${MESSAGE2}\n" >> ${LOG}
+	fi
+
+	# Confirm all data in $RSYNC_CONFIG is correct
+	#######################################################
+	cat ${RSYNC_CONFIG} | grep -v '^#' | while read SOURCE_SERVER SOURCE_DATA TARGET_SERVER TARGET_DATA EXCLUDE JUNK
+	do
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+
+		# Confirm all variables are set
+		#######################################################
+		if [ "${SOURCE_SERVER}" = "" -o "${SOURCE_DATA}" = "" -o "${TARGET_SERVER}" = "" -o "${TARGET_DATA}" = "" ];then
+			echo -e "\nError: Format error in rsync config file ${RSYNC_CONFIG} on line ${LOOP}, ${DATE_TIME}\n" | tee -a ${LOG}
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The required variable \"RSYNC_PPID\" not set, ${HOST} ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+			exit
+		fi
+
+		# Confirm $JUNK is not set
+		#######################################################
+		if [ "${JUNK}" != "" ];then
+			DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: Format error in rsync config file ${RSYNC_CONFIG} on line ${LOOP}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+			exit
+		fi
+
+		# Confirm $SOURCE_SERVER is up
+		#######################################################
+		if [ `PING ${SOURCE_SERVER}` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The system ${SOURCE_SERVER} is down, unable to rsync data from ${SOURCE_SERVER}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+			continue
+		fi
+
+		# Confirm $TARGET_SERVER is up
+		#######################################################
+		if [ `PING ${TARGET_SERVER}` -eq 1 ];then
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: The system ${TARGET_SERVER} is down, unable to rsync data to ${TARGET_SERVER}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+			continue
+		fi
+
+		# Determine if $SOURCE_DATA is using auto mount point
+		#######################################################
+		if [ `echo ${SOURCE_DATA} | egrep -c "${PWR_AUTO}|${PW_AUTO}"` -eq 1 ];then
+			SOURCE_DATA_AUTO=YES
+		else
+			SOURCE_DATA_AUTO=NO
+		fi
+
+		# Determine if $TARGET_DATA is using auto mount point
+		#######################################################
+		if [ `echo ${TARGET_DATA} | egrep -c "${PWR_AUTO}|${PW_AUTO}"` -eq 1 ];then
+			TARGET_DATA_AUTO=YES
+		else
+			TARGET_DATA_AUTO=NO
+		fi
+
+		# Set SHARE to the last name listed in $SOURCE_DATA
+		#######################################################
+		SHARE=""
+		SHARE=`basename ${SOURCE_DATA}`
+
+		# Set JOBS
+		SET_JOBS
+
+		# Confirm $JOBS less than $MAX_JOBS
+		#######################################################
+		while [ ${JOBS} -ge ${MAX_JOBS} ]
+		do
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			MESSAGE1="Notice: ${DATE_TIME}, There are \"${JOBS}\" rsync jobs currently running"
+			MESSAGE2="Waiting for the number of rsync jobs to fall below ${MAX_JOBS}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${MESSAGE1}\n" | tee -a ${LOG}
+				echo -e "\n${MESSAGE2}\n" | tee -a ${LOG}
+			else
+				echo -e "\n${MESSAGE1}\n" >> ${LOG}
+				echo -e "\n${MESSAGE2}\n" >> ${LOG}
+			fi
+			sleep ${WAIT_SECONDS}
+
+			# Set JOBS
+			SET_JOBS
+		done
+
+		#echo SOURCE_SERVER = \"$SOURCE_SERVER\"
+		#echo SOURCE_DATA = \"$SOURCE_DATA\"
+		#echo TARGET_SERVER = \"$TARGET_SERVER\"
+		#echo TARGET_DATA = \"$TARGET_DATA\"
+		#echo SHARE = \"$SHARE\"
+		#echo HOST = \"$HOST\"
+		#echo TARGET_DATA_AUTO = \"$TARGET_DATA_AUTO\"
+		#echo SOURCE_DATA_AUTO = \"$SOURCE_DATA_AUTO\"
+		#echo EXCLUDE = $EXCLUDE
+
+		# Launch rsync job in background using RSYNC function using the 
+		# correct rsync command for the source and target data
+		#######################################################
+		DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+		MESSAGE="Starting rsync job number ${LOOP}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+		else
+			echo -e "\n${MESSAGE}\n" >> ${LOG}
+		fi
+
+		# Source server local, Target server local
+		# Actual path to source data, Automount for target data
+		#######################################################
+		if [ "`echo ${SOURCE_SERVER} | awk -F. '{print $1}'`" = "${HOST}" -a \
+			"${TARGET_DATA_AUTO}" = YES ];then
+
+			RSYNC ${SOURCE_DATA} ${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+
+		# Source server local, Target server remote
+		# Actual path to source data, Rsync to remote server using actual path 
+		#######################################################
+		elif [ "`echo ${SOURCE_SERVER} | awk -F. '{print $1}'`" = "${HOST}" -a \
+			"${TARGET_DATA_AUTO}" = NO ];then
+
+			RSYNC ${SOURCE_DATA} ${TARGET_SERVER}:${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+
+		# Source server local, Target server local
+		# Automount to source data, Actual path to target data
+		#######################################################
+		elif [ "`echo ${TARGET_SERVER} | awk -F. '{print $1}'`" = "${HOST}" -a \
+			"${SOURCE_DATA_AUTO}" = YES ];then
+
+			RSYNC ${SOURCE_DATA} ${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+
+		# Source server remote, Target server local
+		# Rsync to source data using actual path, Actual path to target data
+		#######################################################
+		elif [ "`echo ${TARGET_SERVER} | awk -F. '{print $1}'`" = "${HOST}" -a \
+			"${SOURCE_DATA_AUTO}" = NO ];then
+
+			RSYNC ${SOURCE_SERVER}:${SOURCE_DATA} ${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+
+		# Source server local, Target server local
+		# Automount for source data, Automount for target data
+		#######################################################
+		elif [ "${SOURCE_DATA_AUTO}" = YES -a "${TARGET_DATA_AUTO}" = YES ];then
+			RSYNC ${SOURCE_DATA} ${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+
+		# Source server local, Target server remote
+		# Automount to source data, Rsync to remote server using actual path
+		#######################################################
+		elif [ "${SOURCE_DATA_AUTO}" = YES -a "${TARGET_DATA_AUTO}" = NO ];then
+			RSYNC ${SOURCE_DATA} ${TARGET_SERVER}:${TARGET_DATA} ${SHARE} &
+
+		# Source server remote, Target server local
+		# Rsync to source data using actual path, Automount for target data 
+		#######################################################
+		elif [ "${SOURCE_DATA_AUTO}" = NO -a "${TARGET_DATA_AUTO}" = YES ];then
+			RSYNC ${SOURCE_SERVER}:${SOURCE_DATA} ${TARGET_SERVER} ${SHARE} "${EXCLUDE}" &
+
+		# Source server remote, Target server remote
+		# Rsync to source data using actual path, Rsync to remote server using actual path
+		#######################################################
+		elif [ "${SOURCE_DATA_AUTO}" = NO -a "${TARGET_DATA_AUTO}" = NO ];then
+			RSYNC ${SOURCE_SERVER}:${SOURCE_DATA} ${TARGET_SERVER}:${TARGET_DATA} ${SHARE} "${EXCLUDE}" &
+		else
+			DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+			ERROR_MESSAGE="Error: Unexpected error, unable to rsync ${SOURCE_SERVER} ${SOURCE_DATA} to ${TARGET_SERVER} ${TARGET_DATA}, ${DATE_TIME}"
+			if [ ${INTERACTIVE} = YES ];then
+				echo -e "\n${ERROR_MESSAGE}\n" | tee -a ${LOG_DIR}/${RSYNC_LOG}
+			else
+				echo -e "\n${ERROR_MESSAGE}\n" >> ${LOG_DIR}/${RSYNC_LOG}
+				EMAIL "${ERROR_MESSAGE}"
+			fi
+		fi
+	done
+
+	# Master rsync job completed
+	#######################################################
+	DATE_TIME=`date '+%m-%d-%y %H:%M:%S'`
+	MESSAGE="Master rsync job completed, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+	else
+		echo -e "\n${MESSAGE}\n" >> ${LOG}
+	fi
+
+# Status job started/running by this script
+################################################################################
+elif [ ${STATUS} = YES ];then
+
+	# Set JOBS
+	SET_JOBS
+
+	echo -e "\nThere are \"${JOBS}\" rsync jobs running\n"
+
+# Kill all rsync jobs started by this script
+################################################################################
+elif [ ${KILL} = YES ];then
+
+	# Set JOBS
+	SET_JOBS
+
+	PID_COUNT=0
+	echo ""
+	while [ "${RSYNC_PIDS[${PID_COUNT}]}" ]
+	do
+
+		# Set RSYNC_PID to the PID contained in ${RSYNC_PIDS[${PID_COUNT}]}
+		RSYNC_PID=""
+		RSYNC_PID=${RSYNC_PIDS[${PID_COUNT}]}
+
+		# Confirm $RSYNC_PID is set
+		if [ "${RSYNC_PID}" = "" ];then
+			echo -e "\nError: The required variable \"RSYNC_PID\" not set\n"
+			exit
+		fi
+
+		echo  "Killing rsync PID, ${RSYNC_PID}"
+		kill -9 ${RSYNC_PID}
+
+		# Increment $PID_COUNT
+		let PID_COUNT=${PID_COUNT}+1
+	done
+fi

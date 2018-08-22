@@ -1,0 +1,1894 @@
+#!/bin/bash
+# report_admin_events
+# Purpose: This scripts job is to go through /var/{adm,log}/authlog file looking
+# for and reporting on several different key things. The key things are "Failed su's 
+# to any account", "Successful su's to root", "Successful su's to root2", "Successful 
+# logins directly as root (non console)", and "Failed logins as root". This script 
+# is intended to be be run once a day by cron as root.
+
+# Written By: Jon Swift 06/06
+# Updated 3/30/07, Corrected bug in logic reporting root2 accounts
+# Updated06/11/08, Added logic to check for the size mount option for /tmp on Solaris,
+#	corrected the direct login ssh section 
+# Updated 10/28/09, added support for SuSE Linux 10 SP2
+# 12/09, Added support for RHEL5, using pam_tally2 rather than pam_tally
+# 01/10, Added section to confirm users configured to use su through sudo are authorized.
+# 02/10, Added section to report on select SERVICES that should be turned off
+# 03/26/10, Converted $ROOT_AUTH_FILE to use 1 security group named SYSTEMS and this script
+#	to use just the 1 security group
+# 06/10, Add logic to attempt anonymous ftp to localhost, and report succesful attempts
+# 01/11, Added support for EL6
+# 02/11, Improved logic used to check for enabled services
+# 02/11, Removed sudo check section, not compatable with common sudoers file
+# 03/11, Updated logic to allow EL5 systems to report su's to root properly
+# 03/11, Added more services removed from all systems, Steve Marten
+# 04/11, Updated root authorization check logic to use sudo sections in $ROOT_AUTH_FILE
+# 08/11, Added additional services to the SERVICES variable in all OS sections
+# 11/11, Improved logic checking for /data/security
+# 11/11, Added logic to check for accounts with no password and to check for accounts
+#	with a UID of 0. Added logic to report what is being checked.
+# 12/01/11, Corrected bug in insecure services check section
+# 12/14/11, Added additional logic to check for rquotad on Linux in /etc/sysconfig/nfs
+# 02/02/12, Updated to support SuSE 11
+# 03/01/12, Added support for reading sudoers file to confirm use of sudo or su. 
+#	No longer using $ROOT_AUTH_FILE to confirm use of sudo or su.
+# 03/13/12, Corrected bug in new Solaris sudoers check section. Forced to use 
+#	alrenate version of egrep
+# 05/14/14, Added variable SYSLOGD to support rsyslogd used in EL6
+# 12/13/16, Removed Annoymous FTP section
+
+
+# Misc. Variables
+HOST=`uname -n`
+OS=`uname -s`
+PROG=`basename $0`
+PID=$$
+eval `date '+DAY=%d MONTH=%b YEAR=%Y START_TIME=%H:%M'`
+COUNT=1
+RETRY_COUNT=10
+FAIL_COUNT=5
+UPDATE_MAIL_LIST=security_team@pwrutc.com
+ERROR_EMAIL_LIST=security_error@pwrutc.com
+#UPDATE_MAIL_LIST=jsswift
+#ERROR_EMAIL_LIST=jsswift
+ADMIN_AUDIT=/data/security/admin_audit.${MONTH}.${YEAR}
+ROOT_AUTH_FILE=/stds/admin/data/root_password_authorization_list
+SECURITY_ALERT_FILE=/var/tmp/security_alert
+LOCAL_ADMIN_AUDIT=/var/tmp/local_admin_audit
+US_SYSTEMS='us[0-9][0-9][0-9]|ustest03'
+SECURITY_GRP=SYSTEMS
+YPCAT=/usr/bin/ypcat
+YPMATCH=/usr/bin/ypmatch
+HOME_DIR=/home/svccpcnfs
+IFS_ORIG=${IFS}
+EXIT=NO
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/ucb:/usr/local/bin
+> ${LOCAL_ADMIN_AUDIT}
+> ${SECURITY_ALERT_FILE}
+
+###################################################################################
+# Determine is this script is being run from the command line or from cron
+###################################################################################
+tty -s
+if [ $? = 0 ];then
+        INTERACTIVE=YES
+else
+        INTERACTIVE=NO
+fi
+
+###################################################################################
+# Make sure this script is run only on  Linux and Solaris
+###################################################################################
+if [ ${OS} = Linux ];then
+
+	# Set OS specific variables
+	MAIL=/bin/mail
+	AUTH_DIR=/var/log
+	AUTH_BACKUP_DIR=${AUTH_DIR}/auth_backup
+	PAM=/etc/pam.d/system-auth
+	PAM_MOD=pam_tally.*so
+	CUSTOM_FILE=/root/.bashrc
+	UNLOCK_COMMAND=faillog
+	FSTAB=/etc/fstab
+	SUDOERS=/etc/sudoers
+
+	if [ -f /etc/redhat-release ];then
+		if [ `egrep -c 'release 3' /etc/redhat-release 2>/dev/null` -eq 1 ];then
+			EL_VER=3
+			AUTH_FILE=authlog
+			SYSLOGD=syslogd
+
+		elif [ `egrep -c 'release 4' /etc/redhat-release 2>/dev/null` -eq 1 ];then
+			EL_VER=4
+			AUTH_FILE=authlog
+			SYSLOGD=syslogd
+			SERVICES="rexec|finger|echo|echo-udp|discard|daytime|daytime-udp|chargen|chargen-udp|talk|ntalk|ktalk|time|time-udp|rusersd|bootparamd|vsftpd|netstat|rquotad|rstatd|walld|ekrb5-telnet|krb5-telnet|telnet|dtspcd|sadmind|ttdserver|amiserv|uucp"
+
+		elif [ `egrep -c 'release 5' /etc/redhat-release 2>/dev/null` -eq 1 ];then
+			EL_VER=5
+			AUTH_FILE=secure
+			SYSLOGD=syslogd
+			SERVICES="rexec|finger|echo-dgram|echo-stream|discard-dgram|discard-stream|daytime-dgram|daytime-stream|chargen-dgram|chargen-stream|talk|ntalk|ktalk|time-dgram|time-stream|rusersd|bootparamd|vsftpd|netstat|rquotad|rstatd|ekrb5-telnet|krb5-telnet|telnet|dtspcd|sadmind|ttdserver|amiserv|uucp"
+
+		elif [ `egrep -c 'release 6' /etc/redhat-release 2>/dev/null` -eq 1 ];then
+			EL_VER=6
+			AUTH_FILE=secure
+			SYSLOGD=rsyslogd
+			SERVICES="rexec|finger|echo-dgram|echo-stream|discard-dgram|discard-stream|daytime-dgram|daytime-stream|chargen-dgram|chargen-stream|talk|ntalk|ktalk|time-dgram|time-stream|rusersd|bootparamd|vsftpd|netstat|rquotad|rstatd|ekrb5-telnet|krb5-telnet|telnet|dtspcd|sadmind|ttdserver|amiserv|uucp"
+
+		else
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "Error: ${PROG} only supported on RHEL3, RHEL4, RHEL5, SuSE 10 and  SuSE 11 Linux"
+			exit
+		fi
+
+		AUTHLOG=${AUTH_DIR}/${AUTH_FILE}
+
+	elif [ -f /etc/SuSE-release ];then
+		EL_VER=5
+		AUTH_FILE=warn
+		SYSLOGD=syslogd
+		AUTHLOG=${AUTH_DIR}/${AUTH_FILE}
+		SERVICES="rexec|finger|echo|echo-udp|discard|daytime|daytime-udp|chargen|chargen-udp|talk|ntalk|ktalk|time|time-udp|rusersd|pure-ftpd|netstat|rquotad|rstatd|walld|ekrb5-telnet|krb5-telnet|telnet|dtspcd|sadmind|ttdserver|amiserv|uucp"
+
+		if [ `egrep -c 'VERSION = 10' /etc/SuSE-release 2>/dev/null` -eq 1 ];then
+			PAM=/etc/pam.d/login
+		elif [ `egrep -c 'VERSION = 11' /etc/SuSE-release 2>/dev/null` -eq 1 ];then
+			PAM=/etc/pam.d/common-auth
+
+		else
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "Error: ${PROG} only supported on RHEL3, RHEL4, RHEL5 & SuSE 10 Linux"
+			exit
+		fi
+	else
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "Error: ${PROG} only supported on RHEL3, RHEL4, RHEL5, SuSE 10 and  SuSE 11 Linux"
+		exit
+	fi
+
+elif [ ${OS} = SunOS ];then
+
+	# Set OS specific variables
+	MAIL=/bin/mailx
+	AUTH_DIR=/var/adm
+	AUTH_BACKUP_DIR=${AUTH_DIR}/auth_backup
+	AUTH_FILE=authlog
+	AUTHLOG=${AUTH_DIR}/${AUTH_FILE}
+	SYSLOGD=syslogd
+	PAM=/etc/pam.conf
+	PAM_MOD=pam_login_limit.so
+	CUSTOM_FILE=/etc/plan
+	UNLOCK_COMMAND=login_limit
+	EL_VER=NA
+	FSTAB=/etc/vfstab
+	EGREP=/apps/gnu/bin/egrep
+	OS_VER=`uname -r`
+	SUDOERS=/usr/local/etc/sudoers
+	SERVICES="bootps|tftp|ftp|exec|finger|systat|netstat|echo|discard|daytime|chargen|rexd|walld|sprayd|dtspc|rquotad/|rusers|rpc.cmsd|talk|rquotad/1|rstatd/2-4|rusersd/2-3|walld/1|sprayd/|telnet|time|/usr/sbin/sadmind|/usr/dt/bin/rpc.ttdbserverd|/usr/lib/security/amiserv|uucp|/opt/SUNWvts/bin/sunvts|sun-dr|/usr/sbin/in.tnamed|/usr/sbin/rpc.metamhd|/usr/sbin/rpc.metamedd|/usr/sbin/rpc.metad|/usr/sbin/rpc.mdcommd|/usr/sbin/in.rshd|/usr/sbin/in.rlogind"
+
+else
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "Error: ${PROG} only supported on Linux and SunOS"
+	exit
+fi
+
+###################################################################################
+# The SECURITY_EMAIL function is used to send a single email that may containg one
+# or more security  issues listed.
+###################################################################################
+SECURITY_EMAIL () {
+	
+###################################################################################
+# Send Security Alert email and update $ADMIN_AUDIT as needed
+###################################################################################
+if [ -s ${LOCAL_ADMIN_AUDIT} ];then
+	
+	# Send Email to Security team
+	if [ -s ${SECURITY_ALERT_FILE} ];then
+		cat ${SECURITY_ALERT_FILE} | ${MAIL} -s "${PROG} Security Alert on ${HOST}" ${UPDATE_MAIL_LIST}
+	fi
+	
+	# Confirm that the ${ADMIN_AUDIT} file is Accessible
+	ls /data/security 1> /dev/null 2>&1
+	if [ ! -d /data/security ];then
+	
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: Unable to access /data/security from ${HOST}, suspect problems with NFS. It may be a good idea to update ${ADMIN_AUDIT} file after the problem has been corrected, ${DATE_TIME}"
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	
+		exit
+	fi
+	
+	# Update the global security log file $ADMIN_AUDIT
+	if [ -f ${ADMIN_AUDIT}.lock ];then
+
+		# Wait for lock file to be removed
+		while [ ${COUNT} -le ${RETRY_COUNT} ]
+		do
+       			# Wait 5 seconds
+       			sleep 5
+	
+       			# Exit this loop if the lock file no longer exists
+       			[ ! -f ${ADMIN_AUDIT}.lock ] && break
+	
+       			# Increment $COUNT
+       			COUNT=`expr ${COUNT} + 1`
+		done
+	fi
+	
+	# Make sure ${COUNT} is not greater than ${RETRY_COUNT}
+	if [ ${COUNT} -gt ${RETRY_COUNT} ];then
+	
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: The lock file ${ADMIN_AUDIT}.lock still exists after waiting about 1 minute, removing the lock file ${ADMIN_AUDIT}.lock, ${HOST}, ${DATE_TIME}"
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	
+		# Remove lock file
+		rm -f {ADMIN_AUDIT}.lock
+	fi
+	
+	# Set trap to remove lock file if someone hits Ctrl C during the running of this script
+	trap "rm -f ${ADMIN_AUDIT}.lock; exit 1" 1 2 3 6 15
+	
+	# Create lock file
+	> ${ADMIN_AUDIT}.lock
+	
+	# Append ${LOCAL_ADMIN_AUDIT} to {$ADMIN_AUDIT}
+	cat ${LOCAL_ADMIN_AUDIT} >> ${ADMIN_AUDIT}
+	
+	# Remove the lock file
+	rm -f ${ADMIN_AUDIT}.lock
+	
+	# Remove ${SECURITY_ALERT_FILE} and ${LOCAL_ADMIN_AUDIT}
+	rm -f ${SECURITY_ALERT_FILE} ${LOCAL_ADMIN_AUDIT}
+else
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "No security problems to report for ${HOST}, ${DATE_TIME}"
+fi
+
+# Exit Now
+exit
+
+}	# End of SECURITY_EMAIL
+
+###################################################################################
+# Make sure this script is run only as root
+###################################################################################
+if [ `whoami` != root ];then
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "Error: Must be root to execute ${PROG}"
+	exit
+fi
+
+###################################################################################
+# Make sure this system has had the required changes to support login logging
+###################################################################################
+if [ ${EL_VER} = 6 ];then 
+	[ ${INTERACTIVE} = YES ] && echo "Confirm custom lines in /etc/rsyslog.conf have been added"
+	if [ `egrep '^auth.debug|^auth.notice' /etc/rsyslog.conf | grep -c authlog` -eq 0 ];then
+
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: The system \"${HOST}\" has not been configured to support login reporting, /etc/rsyslog.conf missing required update, ${DATE_TIME}"
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	
+		# Set EXIT
+		EXIT=YES
+	fi
+
+else
+	[ ${INTERACTIVE} = YES ] && echo "Confirm custom lines in /etc/syslog.conf have been added"
+	if [ `egrep '^auth.debug|^auth.notice' /etc/syslog.conf | grep -c authlog` -eq 0 ];then
+
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: The system \"${HOST}\" has not been configured to support login reporting, /etc/syslog.conf missing required update, ${DATE_TIME}"
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	
+		# Set EXIT
+		EXIT=YES
+	fi
+fi
+
+###################################################################################
+# Make sure the required pam config file has been updated
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm custom pam config files have been installed"
+if [ `egrep -c ${PAM_MOD} ${PAM}` -eq 0 ];then
+
+	# Set ERROR_MESSAGE
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	ERROR_MESSAGE="${PROG} Error: The system \"${HOST}\" has not been configured to support login reporting, ${PAM} missing required updates, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Send ERROR_MESSAGE email
+	echo "${ERROR_MESSAGE}" | 
+	${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+	# Set EXIT
+	EXIT=YES
+fi
+
+[ ${INTERACTIVE} = YES ] && echo "Confirm ${HOST} is listed in ${ROOT_AUTH_FILE}"
+# Confirm ${HOST} is listed in ${ROOT_AUTH_FILE}
+NUM_ENTRYS=`sed -n "/${SECURITY_GRP}/,/^#/"p ${ROOT_AUTH_FILE} | grep 'Systems:' |
+	grep -c " ${HOST}"`
+
+# Examine the security groups one at a time
+if [ "${NUM_ENTRYS}" -gt 1 ];then
+
+	# Set ERROR_MESSAGE
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	ERROR_MESSAGE="${PROG} Warning: The host name \"${HOST}\" is listed in the root authorization file ${ROOT_AUTH_FILE} ${NUM_ENTRYS} times, it should only be listed once, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Send ERROR_MESSAGE email
+	echo "${ERROR_MESSAGE}" | 
+	${MAIL} -s "${PROG} Warning on ${HOST}" ${ERROR_EMAIL_LIST}
+
+elif [ "${NUM_ENTRYS}" -eq 0 ];then
+
+	# Set ERROR_MESSAGE
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	ERROR_MESSAGE="${PROG} Warning: The host name \"${HOST}\" is not listed in the root authorization file ${ROOT_AUTH_FILE}, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Send ERROR_MESSAGE email
+	echo "${ERROR_MESSAGE}" | 
+	${MAIL} -s "${PROG} Warning on ${HOST}" ${ERROR_EMAIL_LIST}
+fi
+
+###################################################################################
+# Make sure the required custom unlock file has been installed
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm custom unlock file has been installed"
+if [ "`grep -c ${UNLOCK_COMMAND} ${CUSTOM_FILE} 2>/dev/null`" = 0 ];then
+
+	# Set ERROR_MESSAGE
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	ERROR_MESSAGE="${PROG} Error: The required custom file ${CUSTOM_FILE} with the additional line ${UNLOCK_COMMAND} added has not been installed on ${HOST}, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+	# Send ERROR_MESSAGE email
+	echo "${ERROR_MESSAGE}" | 
+	${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+fi
+
+###################################################################################
+# Make sure this system is not configured to allow direct logins as root
+###################################################################################
+
+[ ${INTERACTIVE} = YES ] && echo "Confirm no direct login access as root"
+# Set ERROR_MESSAGE
+DATE_TIME=`date '+%b %d %Y, %H:%M'`
+ERROR_MESSAGE="${PROG} Error: \"${HOST}\" is configured to allow direct logins as root, ${DATE_TIME}"
+
+if [ ${OS} = SunOS ];then
+	if [ "`grep -c '^CONSOLE=/dev/console' /etc/default/login 2>/dev/null`" -eq 0 ];then
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	fi
+
+elif [ ${OS} = Linux ];then
+
+	if [  "${EL_VER}" = 3 -a `egrep -c '^telnet|^rlogin' /etc/securetty 2>/dev/null` -ne 0 ];then
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+	elif [ "${EL_VER}" -ge 4 -a `egrep -c '^pts/[0-9]' /etc/securetty 2>/dev/null` -ne 0 ];then
+	
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+	
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	fi
+fi
+
+###################################################################################
+# Confirm that there are no root2 accounts, accounts with a UID of 0
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm no user accounts have root privledge"
+for ACCT in `cat /etc/passwd | awk -F: '{if($3==0)print $1}'`
+do
+        # Skip $ACCT if it's root
+        [ ${ACCT} = root ] && continue
+
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+        MESSAGE="${PROG} Error: The user account \"${ACCT}\" on ${HOST} has root privledge, ${DATE_TIME}"
+        if [ ${INTERACTIVE} = YES ];then
+                echo -e "\n${MESSAGE}\n"
+        else
+                echo "${MESSAGE}" | ${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        fi
+done
+
+###################################################################################
+# Confirm that all local account have a password
+###################################################################################
+CHK_PW () {
+
+# set -x
+PASS_FILE=$1
+
+IFS='
+'
+for USERID in `egrep -v '^\+\@.*:|^\+:' ${PASS_FILE} | awk -F: '{if($2=="")print $1}'`
+do
+	IFS=${IFS_ORIG}
+
+	# Confirm $USERID is Set
+	if [ "${USERID}" = "" ];then
+
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: problem reading ${PASS_FILE} on ${HOST}, ${DATE_TIME}"
+		if [ ${INTERACTIVE} = YES ];then
+			echo -e "\n${ERROR_MESSAGE}\n"
+		else
+			echo -e "${ERROR_MESSAGE}" | ${MAIL} -s "${PROG} error on ${HOST}" ${EMAIL_ERRORS}
+		fi
+		break
+	fi
+
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	ERROR_MESSAGE="${PROG} Error: The user \"${USERID}\" does not have a password set on ${HOST}, ${DATE_TIME}"
+	if [ ${INTERACTIVE} = YES ];then
+		echo -e "\n${ERROR_MESSAGE}\n"
+	else
+		echo -e "${ERROR_MESSAGE}" | ${MAIL} -s "${PROG} error on ${HOST}" ${EMAIL_ERRORS}
+	fi
+done
+}
+
+if [ -f /etc/shadow ];then
+	[ ${INTERACTIVE} = YES ] && echo "Confirm all accounts in /etc/shadow have passwords"
+	CHK_PW /etc/shadow
+else
+	[ ${INTERACTIVE} = YES ] && echo "Confirm all accounts in /etc/passwd have passwords"
+	CHK_PW /etc/passwd
+fi
+IFS=${IFS_ORIG}
+
+####################################################################################
+#	Check the ownership, group and permissions on ypcat and ypmatch
+####################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm yp commands are restricted"
+
+# Set YPCAT_OWNER and YPMATCH_OWNER to the owner of ypcat and ypmatch
+YPCAT_OWNER=`ls -la ${YPCAT} 2>/dev/null | awk '{print $3}'`
+YPMATCH_OWNER=`ls -la ${YPMATCH} 2>/dev/null | awk '{print $3}'`
+
+# Confirm that ypcat is owned by root
+if [ "${YPCAT_OWNER}" != root ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The ownership assigned to the command \"${YPCAT}\" has been changed on \"${HOST}\" from \"${YPCAT_OWNER}\", to \"root\", ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the owner of ypcat to root
+	chown root ${YPCAT}
+fi
+
+# Confirm that ypmatch is owned by root
+if [ "${YPMATCH_OWNER}" != root ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The ownership assigned to the command \"${YPMATCH}\" has been changed on \"${HOST}\" from \"${YPMATCH_OWNER}\", to \"root\", ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the owner of ypmatch to root
+	chown root ${YPMATCH}
+fi
+
+# Set YPCAT_GROUP and YPMATCH_GROUP to the group of ypcat and ypmatch
+YPCAT_GROUP=`ls -la ${YPCAT} 2>/dev/null | awk '{print $4}'`
+YPMATCH_GROUP=`ls -la ${YPMATCH} 2>/dev/null | awk '{print $4}'`
+
+# Confirm that group for ypcat is ypgrp
+if [ "${YPCAT_GROUP}" != ypgrp ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The group assigned to the command \"${YPCAT}\" has been changed on \"${HOST}\" from \"${YPCAT_GROUP}\", to \"ypgrp\", ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the group of ypcat to ypgrp
+	chgrp ypgrp ${YPCAT}
+fi
+
+# Confirm that group for ypmatch is ypgrp
+if [ "${YPMATCH_GROUP}" != ypgrp ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The group assigned to the command \"${YPMATCH}\" has been changed on \"${HOST}\" from \"${YPMATCH_GROUP}\", to \"ypgrp\", ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the group to ypgrp on ypcat
+	chgrp ypgrp ${YPMATCH}
+fi
+
+# Set YPCAT_PERMS and YPMATCH_PERMS to the permissions of each command
+YPCAT_PERMS=`ls -la ${YPCAT} 2>/dev/null | awk '{print $1}' | sed 's/-//'`
+YPMATCH_PERMS=`ls -la ${YPMATCH} 2>/dev/null | awk '{print $1}' | sed 's/-//'`
+
+# Confirm that the permissions on ypcat are 550
+if [ "${YPCAT_PERMS}" != 'r-xr-x---' ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The permissions assigned to the command \"${YPCAT}\" have been changed on \"${HOST}\" from \"${YPCAT_PERMS}\", to r-xr-x--- (550),  ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the permssions f ypcat to 550
+	chmod 550 ${YPCAT}
+fi
+
+# Confirm that the permissions on ypmatch are 550
+if [ "${YPMATCH_PERMS}" != 'r-xr-x---' ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Security Alert: The permissions assigned to the command \"${YPMATCH}\" have been changed on \"${HOST}\" from \"${YPMATCH_PERMS}\", to r-xr-x--- (550),  ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+	# Set the permssions on ypmatch to 500
+	chmod 550 ${YPMATCH}
+fi
+
+# Report any SunOS servers that are not using the "size=1234" mount option for /tmp
+###################################################################################
+[ ${INTERACTIVE} = YES -a ${OS} = SunOS ] && echo "Confirm size=1234 mount option for /tmp has been set"
+if [ ${OS} = SunOS -a `echo ${HOST} | egrep -c "${US_SYSTEMS}"` -eq 0 -a \
+	`grep "[ ,	]/tmp[ ,	]" ${FSTAB} | awk '{print $7}' | grep -c size=` -eq 0 ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="${PROG} Notice: The \"size\" mount option is NOT being used for /tmp on ${HOST}, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+fi
+
+# Build the arrays HOST_ALIASES and USER_ALIASES. Add the sudo Host_Alias names
+# to HOST_ALIASES and add the sudo User_Alias names to USER_ALIASES
+###################################################################################
+unset HOST_ALIASES[*]
+unset USER_ALIASES[*]
+
+# Set Inter field seperator to end of line
+IFS='
+'
+
+# Pre Set LOOP to 0
+LOOP=0
+
+# Add the sudo Host_Alias names to the array HOST_ALIASES
+for HOST_ALIAS in `grep "^Host_Alias" ${SUDOERS} | tr '	' ' ' | cut -d' ' -f2- | 
+	sed 's/=//;s/,/ /g;s/  */ /g;s/^ //'`
+do
+
+	# Set IFS to it's original value
+	IFS=${IFS_ORIG}
+
+	# Add $HOST_ALIAS to the array 
+	HOST_ALIASES[${LOOP}]="${HOST_ALIAS}"
+
+	# Increment
+	let LOOP=${LOOP}+1
+done
+
+# Set Inter field seperator to end of line
+IFS='
+'
+
+# Pre Set LOOP to 0
+LOOP=0
+
+# Add the sudo User_Alias names to the array USER_ALIASES
+for USER_ALIAS in `grep "^User_Alias" ${SUDOERS} | tr '	' ' ' | cut -d' ' -f2- | 
+	sed 's/=//;s/,/ /g;s/  */ /g;s/^ //'`
+do
+
+	# Set IFS to it's original value
+	IFS=${IFS_ORIG}
+
+	# Add $USER_ALIAS to the array
+	USER_ALIASES[${LOOP}]="${USER_ALIAS}"
+
+	# Increment
+	let LOOP=${LOOP}+1
+done
+
+# Set IFS to it's original value
+IFS=${IFS_ORIG}
+
+# The FIND_USER_ALIAS function is used to set the variable SUDO_USER_ALIASES. It add
+# sudo User_Alias names that contain the user name provided as an argument to SUDO_USER_ALIASES.
+###################################################################################
+FIND_USER_ALIAS () {
+	# set -x
+
+	# Pre Set SUDO_USER_ALIASES to a null
+	SUDO_USER_ALIASES=""	
+
+	# Set SUDO_USER to the 1st argument to this function
+	SUDO_USER=$1
+
+	# Confirm $SUDO_USER is set
+	if [ "${SUDO_USER}" = "" ];then
+
+        	DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        	ERROR_MESSAGE="Error: Required variable \"SUDO_USER\" not set in the function FIND_USER_ALIAS on ${HOST}, ${DATE_TIME}"
+        	if [ ${INTERACTIVE} = YES ];then
+                	echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+        	else
+                	echo -e "\n${MESSAGE}\n" >> ${LOG}
+			echo "${ERROR_MESSAGE}" | 
+			${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        	fi
+        	exit
+	fi
+
+	# Pre Set LOOP to 0
+	LOOP=0
+
+	# Go through each sudo User_Alias looking for aliases that have $SUDO_USER
+	# as a member
+	while [ "${USER_ALIASES[${LOOP}]}" ]
+	do
+
+		# Set USER_ALIAS to the first field of values in ${USER_ALIASES[${LOOP}]}
+		USER_ALIAS=`echo ${USER_ALIASES[${LOOP}]} | awk '{print $1}'`
+
+		# Confirm $USER_ALIAS is set
+		if [ "${USER_ALIAS}" = "" ];then
+
+        		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        		ERROR_MESSAGE="Error: Required variable \"USER_ALIAS\" not set in the function FIND_USER_ALIAS on ${HOST}, ${DATE_TIME}"
+        		if [ ${INTERACTIVE} = YES ];then
+                		echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+        		else
+                		echo -e "\n${MESSAGE}\n" >> ${LOG}
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        		fi
+        		exit
+		fi
+
+		# Set USER_ALIASES to all the fields starting with field 2
+		USER_ALIASES=`echo ${USER_ALIASES[${LOOP}]} | cut -d' ' -f2-`
+
+		# Confirm $USER_ALIASES is set
+		if [ "${USER_ALIASES}" = "" ];then
+	
+        		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        		ERROR_MESSAGE="Error: Required variable \"USER_ALIASES\" not set in the function FIND_USER_ALIAS on ${HOST}, ${DATE_TIME}"
+        		if [ ${INTERACTIVE} = YES ];then
+                		echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+        		else
+                		echo -e "\n${MESSAGE}\n" >> ${LOG}
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        		fi
+        		exit
+		fi
+
+		# Go through each user in $USER_ALIASES looking for ones that match $SUDO_USER
+		# Add the name of the sudo User_Alias to the array SUDO_USER_ALIASS that match
+		for SUDO_USER_ALIAS in ${USER_ALIASES}
+		do
+			# Add $USER_ALIAS to $SUDO_USER_ALIASES
+			if [ "${SUDO_USER}" = "${SUDO_USER_ALIAS}" ];then
+				if [ "${SUDO_USER_ALIASES}" = "" ];then
+					SUDO_USER_ALIASES="${USER_ALIAS}"
+				else
+					SUDO_USER_ALIASES="${SUDO_USER_ALIASES}|${USER_ALIAS}"
+				fi
+			fi
+		done
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+	done
+}
+
+# The FIND_HOST_ALIAS function is used to set the variable SUDO_HOST_ALIASES. It adds
+# sudo Host_Alias names that contain the hostname $HOST to SUDO_HOST_ALIASES.
+###################################################################################
+FIND_HOST_ALIAS () {
+	# set -x
+
+	# Pre Set SUDO_HOST_ALIASES to a null
+	SUDO_HOST_ALIASES=""	
+
+	# Pre Set LOOP to 0
+	LOOP=0
+
+	# Go through each sudo Host_Alias looking for aliases that have $HOST
+	# as a member
+	while [ "${HOST_ALIASES[${LOOP}]}" ]
+	do
+
+		# Set HOST_ALIAS to the first field of values in ${HOST_ALIASES[${LOOP}]}
+		HOST_ALIAS=`echo ${HOST_ALIASES[${LOOP}]} | awk '{print $1}'`
+
+		# Confirm $HOST_ALIAS is set
+		if [ "${HOST_ALIAS}" = "" ];then
+
+        		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        		ERROR_MESSAGE="Error: Required variable \"HOST_ALIAS\" not set in the function FIND_HOST_ALIAS on ${HOST}, ${DATE_TIME}"
+        		if [ ${INTERACTIVE} = YES ];then
+                		echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+        		else
+                		echo -e "\n${MESSAGE}\n" >> ${LOG}
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        		fi
+        		exit
+		fi
+
+		# Set HOST_ALIASES to all the fields starting with field 2
+		HOST_ALIASES=`echo ${HOST_ALIASES[${LOOP}]} | cut -d' ' -f2-`
+
+		# Confirm $HOST_ALIASES is set
+		if [ "${HOST_ALIASES}" = "" ];then
+	
+        		DATE_TIME=`date '+%m/%d/%y %H:%M:%S'`
+        		ERROR_MESSAGE="Error: Required variable \"HOST_ALIASES\" not set in the function FIND_HOST_ALIAS on ${HOST}, ${DATE_TIME}"
+        		if [ ${INTERACTIVE} = YES ];then
+                		echo -e "\n${MESSAGE}\n" | tee -a ${LOG}
+        		else
+                		echo -e "\n${MESSAGE}\n" >> ${LOG}
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+        		fi
+        		exit
+		fi
+
+		# Go through each host in $HOST_ALIASES looking for ones that match $HOST
+		# Add the name of the sudo Host_Alias to the array SUDO_HOST_ALIASES that match
+		for SUDO_HOST_ALIAS in ${HOST_ALIASES}
+		do
+			# Add ${HOST_ALIAS}=(root) to $SUDO_HOST_ALIASE
+			if [ "${HOST}" = "${SUDO_HOST_ALIAS}" ];then
+				if [ "${SUDO_HOST_ALIASES}" = "" ];then
+					SUDO_HOST_ALIASES="${HOST_ALIAS}"
+				else
+					SUDO_HOST_ALIASES="${SUDO_HOST_ALIASES}|${HOST_ALIAS}"
+				fi
+			fi
+		done
+
+		# Increment $LOOP
+		let LOOP=${LOOP}+1
+	done
+}
+
+###################################################################################
+# Exit Now if EXIT is set to YES
+###################################################################################
+if [ "${EXIT}" = YES ];then 
+
+	SECURITY_EMAIL
+
+###################################################################################
+# Confirm the AUTHLOG file exists and has a file size greater than 0
+###################################################################################
+elif [ ! -f ${AUTHLOG} ];then
+	> ${AUTHLOG}
+	chmod 600 ${AUTHLOG}
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${AUTHLOG} file is zero sized, no failed login data to report"
+
+	SECURITY_EMAIL
+
+elif [ -f ${AUTHLOG} -a ! -s ${AUTHLOG} ];then
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${AUTHLOG} file is zero sized, no failed login data to report"
+
+	SECURITY_EMAIL
+fi 
+
+###################################################################################
+# Make sure this script is not already running
+###################################################################################
+
+# Set ParentPID to the parent process ID of $PID
+ParentPID=`ps -aef | grep -w ${PID} | grep -v grep | awk '{if ($2 = $PID) print $3}' | grep -v ${PID}`
+
+# Look for other process running with the same name
+if [ `ps -aef | grep ${0} | egrep -v "grep|${PID}|${ParentPID}" | wc -l` -ge 1 ];then
+
+	# Double check
+	echo "ParentPID = $ParentPID" > /tmp/report
+	echo "PID = $PID" >> /tmp/report
+	echo "START_TIME = $START_TIME" >> /tmp/report
+	ps -aef | grep ${0} >> /tmp/report
+	sleep 5
+	if [ `ps -aef | grep ${0} | egrep -v "grep|${PID}|${ParentPID}|${START_TIME}" | 
+		wc -l` -ge 1 ];then
+	
+
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: The script ${PROG} is already running on ${HOST}, suspect it is still running from the night before, ${DATE_TIME}"
+
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+	
+		# Exit
+		exit
+	fi
+fi
+
+###################################################################################
+# Solaris specific checks
+###################################################################################
+if [ ${OS} = SunOS ];then
+	[ ${INTERACTIVE} = YES ] && echo "Confirm insecure services have been disabled"
+
+	if [ ${OS_VER} = 5.8 -o ${OS_VER} = 5.9 ];then
+
+		for SERVICE in `echo ${SERVICES} | sed 's:|: :g'`
+		do
+
+			# Determine if $SERVICE is on/enabled
+			if [ `egrep "${SERVICE}[ ,	]" /etc/inet/inetd.conf |
+				grep -v '^#' | wc -l` -ge 1 ];then
+	
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The service \"${SERVICE}\" is enabled on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} |
+				grep -w "${ROOT_USER}" >> ${LOCAL_ADMIN_AUDIT}		
+			fi
+		done
+
+	else
+	# Solaris 10 and above
+
+		for SERVICE in `echo ${SERVICES} | sed 's:|: :g'`
+		do
+			# Determine if $SERVICE is online/enabled
+			if [ `svcs -a | grep "${SERVICE}[/,:]" | grep -c online` -ge 1 ];then
+	
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The service \"${SERVICE}\" is enabled on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} |
+				grep -w "${ROOT_USER}" >> ${LOCAL_ADMIN_AUDIT}		
+			fi
+		done
+				
+	fi
+
+###################################################################################
+# Display Message to interactive users
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm that there are no reported security issues in ${AUTHLOG}"
+
+###################################################################################
+# Check for "Failed su's" to any user, report failure if the number of failed attempts is at least
+# $FAIL_COUNT failures to the same account by the same user
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm no failed su's to any user"
+if [ `grep -w su ${AUTHLOG} | grep pam_unix | grep -c 'authentication failure'` -ge ${FAIL_COUNT} ];then
+
+	# Determine failures by the account being su-ed to, and by the user su-ing
+	for FAILED_SU_ACCOUNT in `egrep "\'su .*\' failed" ${AUTHLOG} | awk '{print $10}' |
+		sed "s/\'//" | sort -u`
+	do
+
+		# Make sure FAILED_SU_ACCOUNT is set
+		if [ "${FAILED_SU_ACCOUNT}" = "" ];then
+
+			# Set ERROR_MESSAGE
+			DATE_TIME=`date '+%b %d %Y, %H:%M'`
+			ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAILED_SU_ACCOUNT using the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+			# Display Message to interactive users
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+			# Send ERROR_MESSAGE email
+			echo "${ERROR_MESSAGE}" | 
+			${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+			# Skip to next FAILED_SU_ACCOUNT
+			continue
+		fi
+
+		# Report failed su's to $FAILED_SU_ACCOUNT for each user that exceeds $FAIL_COUNT
+		for SU_USER in `egrep "\'su ${FAILED_SU_ACCOUNT}\' failed" ${AUTHLOG} | 
+			awk '{print $13}' | sort -u`
+		do
+
+			# Make sure SU_USER is set
+			if [ "${SU_USER}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable SU_USER using FAILED_SU_ACCOUNT=${FAILED_SU_ACCOUNT} and the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next FAILED_SU_ACCOUNT
+				break
+			fi
+
+			# Set FAILED_SU_LOGIN_COUNT to the number of failed su's to $FAILED_SU_ACCOUNT by $SU_USER
+			FAILED_SU_LOGIN_COUNT=`grep "\'su ${FAILED_SU_ACCOUNT}\' failed" ${AUTHLOG} | 
+				grep -c "failed for ${SU_USER}"`
+
+			# Make sure FAILED_SU_LOGIN_COUNT is set
+			if [ "${FAILED_SU_LOGIN_COUNT}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAILED_SU_LOGIN_COUNT using FAILED_SU_ACCOUNT=${FAILED_SU_ACCOUNT} and the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next FAILED_SU_ACCOUNT
+				break
+			fi
+
+			# If the $FAILED_SU_LOGIN_COUNT for $FAILED_SU_ACCOUNT has at least 
+			# $FAIL_COUNT failed logins update $LOCAL_ADMIN_AUDIT
+			if [ ${FAILED_SU_LOGIN_COUNT} -ge ${FAIL_COUNT} ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${SU_USER}\" logged \"${FAILED_SU_LOGIN_COUNT}\" failed su's to the account \"${FAILED_SU_ACCOUNT}\" on ${HOST}, ${DATE_TIME}" 
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+	
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+	
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				grep "\'su ${FAILED_SU_ACCOUNT}\' failed" ${AUTHLOG} | 
+				grep "failed for ${SU_USER}" >> ${LOCAL_ADMIN_AUDIT}
+			fi
+		done
+	done
+fi
+fi
+
+###################################################################################
+# Linux Specific Checks
+###################################################################################
+if [ ${OS} = Linux ];then
+	[ ${INTERACTIVE} = YES ] && echo "Confirm insecure services have been disabled"
+
+	for SERVICE in `echo ${SERVICES} | sed 's:|: :g'`
+	do
+
+		# Determine if $SERVICE is on/enabled
+		if [ `/sbin/chkconfig --list ${SERVICE} 2>/dev/null | grep -c 'on'` -ge 1 ];then
+
+			# Set SECURITY_ALERT
+			DATE_TIME=`date '+%b %d %Y, %H:%M'`
+			SECURITY_ALERT="Security Alert: The service \"${SERVICE}\" is enabled on ${HOST}, ${DATE_TIME}"
+
+			# Display Message to interactive users
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+			# Build SECURITY_ALERT_FILE, used to send email
+			echo "" >> ${SECURITY_ALERT_FILE}
+			echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+			# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+			echo "" >> ${LOCAL_ADMIN_AUDIT}
+			echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+			egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} |
+			grep -w "${ROOT_USER}" >> ${LOCAL_ADMIN_AUDIT}		
+		fi
+	done
+
+	
+  # Confirm RQUOTAD=no is set in /etc/sysconfig/nfs if NFS is enabled
+  if [ `/sbin/chkconfig --list nfs 2>/dev/null | grep -c 'on'` -ge 1 ];then
+
+          # Set SECURITY_ALERT
+          DATE_TIME=`date '+%b %d %Y, %H:%M'`
+          SECURITY_ALERT="Security Alert: The service \"rquotad\" is enabled on ${HOST} because RQUOTAD=no is not set in the file /etc/sysconfig/nfs or does not exist, ${DATE_TIME}"
+
+          if [ ! -f /etc/sysconfig/nfs ];then
+
+                  # Display Message to interactive users
+                  [ ${INTERACTIVE} = YES ] && echo ""
+                  [ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+                  # Build SECURITY_ALERT_FILE, used to send email
+                  echo "" >> ${SECURITY_ALERT_FILE}
+                  echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+                  # Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+                  echo "" >> ${LOCAL_ADMIN_AUDIT}
+                  echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+
+          elif [ `grep -c "^RQUOTAD=no" /etc/sysconfig/nfs` -eq 0 ];then
+
+                  # Display Message to interactive users
+                  [ ${INTERACTIVE} = YES ] && echo ""
+                  [ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+                  # Build SECURITY_ALERT_FILE, used to send email
+                  echo "" >> ${SECURITY_ALERT_FILE}
+                  echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+                  # Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+                  echo "" >> ${LOCAL_ADMIN_AUDIT}
+                  echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+          fi
+  fi
+			
+
+###################################################################################
+# Check for "Failed su's" to any user, report failure if the number of failed attempts is at least
+# $FAIL_COUNT failures to the same account by the same user
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm no failed su's to any user"
+if [ `grep -w su ${AUTHLOG} | grep pam_unix | grep -c 'authentication failure'` -ge ${FAIL_COUNT} ];then
+	
+	# Determine failures by the account being su-ed to, and by the user su-ing
+	for FAILED_SU_ACCOUNT in `grep -w su ${AUTHLOG} | grep pam_unix | 
+		grep 'authentication failure' | awk -F\; '{print $2}' | 
+		awk '{print $1}' | sed 's/logname=//' | sort -u`
+	do
+
+		# Make sure FAILED_SU_ACCOUNT is set
+		if [ "${FAILED_SU_ACCOUNT}" = "" ];then
+
+			# Set ERROR_MESSAGE
+			DATE_TIME=`date '+%b %d %Y, %H:%M'`
+			ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAILED_SU_ACCOUNT using the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+			# Display Message to interactive users
+			[ ${INTERACTIVE} = YES ] && echo ""
+			[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+			# Send ERROR_MESSAGE email
+			echo "${ERROR_MESSAGE}" | 
+			${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+			# Skip to next FAILED_SU_ACCOUNT
+			continue
+		fi
+
+		# Report failed su's to $FAILED_SU_ACCOUNT for each user that exceeds $FAIL_COUNT
+		for FAILED_SU_LOGIN_COUNT in `grep -w su ${AUTHLOG} | grep pam_unix | 
+			grep 'authentication failure' | grep -c "logname=${FAILED_SU_ACCOUNT}"`
+		do
+
+			# Make sure FAILED_SU_LOGIN_COUNT is set properly
+			if [ "${FAILED_SU_LOGIN_COUNT}" = "" -o `echo ${FAILED_SU_LOGIN_COUNT} |
+				grep -c '[^0-9]'` -eq 1 ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAILED_SU_LOGIN_COUNT using logname=${FAILED_SU_ACCOUNT} and the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next FAILED_SU_ACCOUNT
+				break
+			fi
+
+			# If the $FAILED_SU_LOGIN_COUNT for $FAILED_SU_ACCOUNT has at least 
+			# $FAIL_COUNT failed logins update $LOCAL_ADMIN_AUDIT
+			if [ ${FAILED_SU_LOGIN_COUNT} -ge ${FAIL_COUNT} ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${SU_USER}\" logged \"${FAILED_SU_LOGIN_COUNT}\" failed su's to the account \"${FAILED_SU_ACCOUNT}\" on ${HOST}, ${DATE_TIME}" 
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "su\(pam_unix\)\[[0-9]+\]: authentication failure" ${AUTHLOG} |
+				grep "user=${FAILED_SU_ACCOUNT}" | grep "logname=${SU_USER}" >> ${LOCAL_ADMIN_AUDIT}
+			fi
+		done
+	done
+fi
+fi
+
+###################################################################################
+#  Confirm each user that became root is authorized on this system
+###################################################################################
+if [ "${SECURITY_GRP}" != "" ];then
+
+	[ ${INTERACTIVE} = YES ] && echo "Confirm users su-ing to root are authorized"
+	# Check for "Successful su's to root", confirm all users are authorized
+	###################################################################################
+	# Solaris
+	###################################################################################
+	if [ `egrep -c "\'su root\' succeeded" ${AUTHLOG}` -ge 1 ];then
+
+		# Confirm each user that became root is authorized
+		for ROOT_USER in `egrep "\'su root\' succeeded" ${AUTHLOG} | 
+			awk '{print $13}' | sort -u`
+		do
+
+			# Make sure ROOT_USER is set
+			if [ "${ROOT_USER}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable ROOT_USER using the file ${AUTHLOG}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next ROOT_USER
+				continue
+			fi
+
+			# Skip the check if the ${ROOT_USER} is root
+			[ ${ROOT_USER} = root ] && continue
+
+			# Pre Set VALID_USER to NO
+			VALID_USER=NO
+
+			# Determine if ${ROOT_USER} is authorized to use sudo on $HOST
+			if [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#'| grep -w SU |
+				grep -w ${ROOT_USER} | grep -wc "${HOST}"` -ge 1 ];then
+
+				VALID_USER=YES
+
+			# Determine if ${ROOT_USER} is authorized to use sudo on all hosts
+			elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+				grep -w ${ROOT_USER} | grep -c 'ALL=(ALL)'` -ge 1 ];then
+
+				VALID_USER=YES
+
+			else
+				# Set SUDO_USER_ALIASES to sudo User_Aliases used by $ROOT_USER
+				FIND_USER_ALIAS ${ROOT_USER}
+
+				# Set SUDO_HOST_ALIASES to the sudo Host_Aliases used by $HOST
+				FIND_HOST_ALIAS
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized 
+				# to use sudo on any of the host(s) in $SUDO_HOST_ALIASES
+				if [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' | 
+					grep -w SU | ${EGREP} -w "${SUDO_USER_ALIASES}" |
+					${EGREP} -wc "${SUDO_HOST_ALIASES}"` -ge 1 ];then
+					
+					VALID_USER=YES
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized
+				# to use sudo on $HOST
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					grep -w SU | ${EGREP} -w "${SUDO_USER_ALIASES}" |
+					grep -c "${HOST}"` -ge 1 ];then
+
+					VALID_USER=YES
+
+				# Determine if ${ROOT_USER} is authorized to use sudo on any 
+				# of the hosts in $SUDO_HOST_ALIASES
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					grep -w SU | grep -w ${ROOT_USER} |
+					${EGREP} -wc "${SUDO_HOST_ALIASES}"` -ge 1 ];then
+
+					VALID_USER=YES
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized
+				# to use sudo on ALL hosts
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					${EGREP} -w "${SUDO_USER_ALIASES}" | grep 'ALL=(ALL)' |
+					wc -l` -ge 1 ];then
+
+					VALID_USER=YES
+				fi
+			fi
+
+			# If VALID_USER is set to NO, report security problem
+			if [ ${VALID_USER} = NO ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${ROOT_USER}\" su to root on \"${HOST}\", but is not authorized, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su root\' succeeded" ${AUTHLOG} | 
+				grep -w ${ROOT_USER} >> ${LOCAL_ADMIN_AUDIT}
+			fi
+		done
+
+	# Check for "Successful su's to root", confirm all users are authorized
+	###################################################################################
+	# Linux
+	###################################################################################
+	elif [ `grep -w su ${AUTHLOG} | grep pam_unix | grep -c 'session opened for user root'` -ge 1 ];then
+
+		# Confirm each user that became root is authorized
+		for ROOT_USER in `grep -w su ${AUTHLOG} | grep 'session opened for user root' |
+			awk '{print $NF}' | awk -F\( '{print $1}' | sort -u`
+		do
+
+			# Make sure ROOT_USER is set
+			if [ "${ROOT_USER}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable ROOT_USER using the file ${AUTHLOG}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next ${ROOT_USER}
+				continue
+			fi
+
+			# Skip the check if the ${ROOT_USER} is root
+			[ ${ROOT_USER} = root ] && continue
+
+			# Pre Set VALID_USER to NO
+			VALID_USER=NO
+
+			# Determine if ${ROOT_USER} is authorized to use sudo on $HOST
+			if [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#'| grep -w SU |
+				grep -w ${ROOT_USER} | grep -wc "${HOST}"` -ge 1 ];then
+
+				VALID_USER=YES
+
+			# Determine if ${ROOT_USER} is authorized to use sudo on all hosts
+			elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+				grep -w ${ROOT_USER} | grep -c 'ALL=(ALL)'` -ge 1 ];then
+
+				VALID_USER=YES
+
+			else
+				# Set SUDO_USER_ALIASES to sudo User_Aliases used by $ROOT_USER
+				FIND_USER_ALIAS ${ROOT_USER}
+
+				# Set SUDO_HOST_ALIASES to the sudo Host_Aliases used by $HOST
+				FIND_HOST_ALIAS
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized 
+				# to use sudo on any of the host(s) in $SUDO_HOST_ALIASES
+				if [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' | 
+					grep -w SU | egrep -w "${SUDO_USER_ALIASES}" |
+					egrep -wc "${SUDO_HOST_ALIASES}"` -ge 1 ];then
+					
+					VALID_USER=YES
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized
+				# to use sudo on $HOST
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					grep -w SU | egrep -w "${SUDO_USER_ALIASES}" |
+					grep -c "${HOST}"` -ge 1 ];then
+
+					VALID_USER=YES
+
+				# Determine if ${ROOT_USER} is authorized to use sudo on any 
+				# of the hosts in $SUDO_HOST_ALIASES
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					grep -w SU | grep -w ${ROOT_USER} |
+					egrep -wc "${SUDO_HOST_ALIASES}"` -ge 1 ];then
+
+					VALID_USER=YES
+
+				# Determine if any of the $SUDO_USER_ALIASES are authorized
+				# to use sudo on ALL hosts
+				elif [ `sed -n "/# BODY #/,$"p ${SUDOERS} | grep -v '^#' |
+					egrep -w "${SUDO_USER_ALIASES}" | grep 'ALL=(ALL)' |
+					wc -l` -ge 1 ];then
+
+					VALID_USER=YES
+				fi
+			fi
+
+			# If VALID_USER is set to NO, report security problem
+			if [ ${VALID_USER} = NO ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${ROOT_USER}\" su to root on \"${HOST}\", but is not authorized, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su root\' succeeded" ${AUTHLOG} | 
+				grep -w ${ROOT_USER} >> ${LOCAL_ADMIN_AUDIT}
+			fi
+		done
+	fi
+fi
+
+###################################################################################
+# Set EXTRA_ROOT to the name of any root or root2 account
+###################################################################################
+for EXTRA_ROOT in `egrep '^.*:x:0:[0,1]:' /etc/passwd | awk -F: '{print $1}'`
+do
+
+	# If EXTRA_ROOT = root, Skip EXTRA_ROOT
+	[ "${EXTRA_ROOT}" = root ] && continue
+	[ ${INTERACTIVE} = YES ] && echo "Confirm users su-ing to root2 are authorized"
+
+	# Check for "Successful su's to secondary root accounts", confirm all users are authorized
+	###################################################################################
+	# Solaris
+	###################################################################################
+	if [ `egrep -c "\'su ${EXTRA_ROOT}\' succeeded" ${AUTHLOG}` -ge 1 ];then
+
+		# Confirm each ${EXTRA_ROOT} user is authorized
+		for ROOT_USER in `egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} | 
+			awk '{print $13}' | sort -u`
+		do
+
+			# Make sure ROOT_USER is set
+			if [ "${ROOT_USER}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable ROOT_USER using the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next ${ROOT_USER}
+				continue
+			fi
+
+			# Confirm the ${ROOT_USER} is authorized to be ${EXTRA_ROOT}/root2 on $HOST
+			if [ `sed -n "/${SECURITY_GRP}/,/^#/"p ${ROOT_AUTH_FILE} | 
+					grep 'IDs:' | grep -wc ${ROOT_USER}` -eq 0 ] &&
+			[ `sed -n "/sudo ${HOST}/,/^#/"p ${ROOT_AUTH_FILE} | 
+					grep 'IDs:' | grep -wc ${ROOT_USER}` -eq 0 ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${ROOT_USER}\" su to \"${EXTRA_ROOT}\" on ${HOST}, but is not authorized, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} |
+				grep -w "${ROOT_USER}" >> ${LOCAL_ADMIN_AUDIT}		
+			fi
+		done
+
+	# Check for "Successful su's to secondary root accounts", confirm all users are authorized
+	###################################################################################
+	# Linux
+	###################################################################################
+	elif [ `grep -w su ${AUTHLOG} | grep pam_unix | grep -c "session opened for user ${EXTRA_ROOT}"` -ge 1 ];then
+
+		# Confirm each ${EXTRA_ROOT} user is authorized
+		for ROOT_USER in `grep -w su ${AUTHLOG} | grep "session opened for user ${EXTRA_ROOT}" |
+			awk '{print $NF}' | awk -F\( '{print $1}' | sort -u`
+		do
+
+			# Make sure ROOT_USER is set
+			if [ "${ROOT_USER}" = "" ];then
+
+				# Set ERROR_MESSAGE
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				ERROR_MESSAGE="${PROG} Error: Problem setting the variable ROOT_USER using the file ${AUTHLOG} on ${HOST}, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+				# Send ERROR_MESSAGE email
+				echo "${ERROR_MESSAGE}" | 
+				${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+				# Skip to next ${ROOT_USER}
+				continue
+			fi
+
+			# Confirm the ${ROOT_USER} is authorized to be ${EXTRA_ROOT}/root2 on $HOST
+			if [ `sed -n "/${EXTRA_ROOT} ${HOST}/,/^#/"p ${ROOT_AUTH_FILE} |
+				grep 'IDs:' | grep -wc ${ROOT_USER}` -eq 0 ];then
+
+				# Set SECURITY_ALERT
+				DATE_TIME=`date '+%b %d %Y, %H:%M'`
+				SECURITY_ALERT="Security Alert: The user \"${ROOT_USER}\" su to \"${EXTRA_ROOT}\" on ${HOST}, but is not authorized, ${DATE_TIME}"
+
+				# Display Message to interactive users
+				[ ${INTERACTIVE} = YES ] && echo ""
+				[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+				# Build SECURITY_ALERT_FILE, used to send email
+				echo "" >> ${SECURITY_ALERT_FILE}
+				echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+				# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+				echo "" >> ${LOCAL_ADMIN_AUDIT}
+				echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+				egrep "\'su ${EXTRA_ROOT}\' succeeded for" ${AUTHLOG} |
+				grep -w "${ROOT_USER}" >> ${LOCAL_ADMIN_AUDIT}		
+			fi
+		done
+	fi
+done
+	
+###################################################################################
+# Check for Successful logins directly as root (non console)
+###################################################################################
+# Solaris, Non shh
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm no successful logins directly as root (non console)"
+if [ `egrep -c "login: \[ID [0-9]+ auth.notice\] ROOT LOGIN /dev/pts/" ${AUTHLOG}` -ge 1 ];then
+
+	# Set DIRECT_LOGINS to the number of direct logins as root
+	DIRECT_LOGINS=`egrep -c "login: \[ID [0-9]+ auth.notice\] ROOT LOGIN /dev/pts/" ${AUTHLOG}`
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Security Alert: The system \"${HOST}\" allowed \"${DIRECT_LOGINS}\" direct login(s) as root on a non-console, ${DATE_TIME}" 
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	egrep "login: \[ID [0-9]+ auth.notice\] ROOT LOGIN /dev/pts/" ${AUTHLOG} >> ${LOCAL_ADMIN_AUDIT}
+
+###################################################################################
+# Check for Successful logins directly as root (non console)
+###################################################################################
+# Linux, Non ssh
+###################################################################################
+elif [ `grep -w login ${AUTHLOG} | grep -c " ROOT LOGIN ON pts"` -ge 1 ];then
+
+	# Set DIRECT_LOGINS to the number of direct logins as root
+	DIRECT_LOGINS=`grep -w login ${AUTHLOG} | grep -c " ROOT LOGIN ON pts"`
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Security Alert: The system \"${HOST}\" allowed \"${DIRECT_LOGINS}\" direct login(s) as root on a non-console, ${DATE_TIME}" 
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	grep -w login ${AUTHLOG} | grep " ROOT LOGIN ON pts" >> ${LOCAL_ADMIN_AUDIT}
+
+###################################################################################
+# Check for Successful logins directly as root (non console)
+###################################################################################
+# Linux, ssh
+###################################################################################
+elif [ `grep -w sshd ${AUTHLOG} | grep pam_unix | grep -c "session opened for user root"` -ge 1 ];then
+
+	# Set DIRECT_LOGINS to the number of direct logins as root
+	DIRECT_LOGINS=`grep -w sshd ${AUTHLOG} | grep pam_unix | 
+		grep -c "session opened for user root"`
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Note: The system \"${HOST}\" allowed \"${DIRECT_LOGINS}\" non-interactive ssh login(s) as root on a non-console, ${DATE_TIME}" 
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	grep -w sshd ${AUTHLOG} | grep pam_unix | grep "session opened for user root" >> ${LOCAL_ADMIN_AUDIT}
+fi
+
+###################################################################################
+# Check for Failed logins as root, report if there are ${FAIL_COUNT} or more total
+###################################################################################
+# Solaris, Non ssh
+###################################################################################
+[ ${INTERACTIVE} = YES ] && echo "Confirm no failed logins as root"
+if [ `egrep "login: \[ID [0-9]+ auth.notice\] pam_login_limit\(auth\):" ${AUTHLOG} |
+	egrep -c "Unsuccessful attempt ${FAIL_COUNT} for user \'root\'"` -ge 1 ];then
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Security Alert: The system \"${HOST}\" logged \"${FAIL_COUNT}\" or more failed login's (not su) to root, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	egrep "login: \[ID [0-9]+ auth.notice\] pam_login_limit\(auth\):" ${AUTHLOG} |
+	egrep "Unsuccessful attempt [0-9]* for user \'root\'" >> ${LOCAL_ADMIN_AUDIT}
+
+###################################################################################
+# Check for Failed logins as root, report if there are ${FAIL_COUNT} or more
+###################################################################################
+# Linux, Non ssh
+###################################################################################
+elif [ `egrep "login\[[0-9]+\]: FAILED LOGIN" ${AUTHLOG} | 
+	grep -c 'FOR root, Authentication failure'` -ge ${FAIL_COUNT} -o \
+	`grep 'authentication failure' ${AUTHLOG} | grep -c 'logname= uid=0'` -ge ${FAIL_COUNT} ];then
+
+	# Set FAIL_ROOT_LOGIN_COUNT to the number of failed logins by ${ROOT_USER}
+	if [ `egrep "login\[[0-9]+\]: FAILED LOGIN" ${AUTHLOG} | 
+		grep -c 'FOR root, Authentication failure'` -ge ${FAIL_COUNT} ];then
+		FAIL_ROOT_LOGIN_COUNT=`egrep "login\[[0-9]+\]: FAILED LOGIN" ${AUTHLOG} |
+			grep -c 'FOR root, Authentication failure'`
+	else
+		FAIL_ROOT_LOGIN_COUNT=`grep 'authentication failure' ${AUTHLOG} | 
+			grep -c 'logname= uid=0'`
+	fi
+
+	# Make sure FAIL_ROOT_LOGIN_COUNT is set
+	if [ "${FAIL_ROOT_LOGIN_COUNT}" = "" ];then
+
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAIL_ROOT_LOGIN_COUNT using the file ${AUTHLOG}, ${DATE_TIME}"
+
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+		# exit
+		exit
+	fi
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Security Alert: The system \"${HOST}\" logged \"${FAIL_ROOT_LOGIN_COUNT}\" failed login's (not su) to root, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	if [ `egrep "login\[[0-9]+\]: FAILED LOGIN" ${AUTHLOG} | 
+		grep -c 'FOR root, Authentication failure'` -ge ${FAIL_COUNT} ];then
+		egrep "login\[[0-9]+\]: FAILED LOGIN" ${AUTHLOG} |
+		grep 'FOR root, Authentication failure' >> ${LOCAL_ADMIN_AUDIT}
+	else
+		grep 'authentication failure' ${AUTHLOG} | 
+			grep 'logname= uid=0' >> ${LOCAL_ADMIN_AUDIT}
+	fi
+
+###################################################################################
+# Check for Failed logins as root, report if there are ${FAIL_COUNT} or more
+###################################################################################
+# Linux, ssh
+###################################################################################
+elif [ `grep -w sshd ${AUTHLOG} | grep pam_unix | grep -c "authentication failure" |
+		grep -c 'uid=0 euid=0'` -ge ${FAIL_COUNT} ];then
+
+	# Set FAIL_ROOT_LOGIN_COUNT to the number of failed logins by ${ROOT_USER}
+	FAIL_ROOT_LOGIN_COUNT=`grep -w sshd ${AUTHLOG} | grep pam_unix | 
+		grep -c "authentication failure" | grep -c 'uid=0 euid=0'`
+
+	# Make sure FAIL_ROOT_LOGIN_COUNT is set
+	if [ "${FAIL_ROOT_LOGIN_COUNT}" = "" ];then
+
+		# Set ERROR_MESSAGE
+		DATE_TIME=`date '+%b %d %Y, %H:%M'`
+		ERROR_MESSAGE="${PROG} Error: Problem setting the variable FAIL_ROOT_LOGIN_COUNT using the file ${AUTHLOG}, ${DATE_TIME}"
+
+		# Display Message to interactive users
+		[ ${INTERACTIVE} = YES ] && echo ""
+		[ ${INTERACTIVE} = YES ] && echo "${ERROR_MESSAGE}"
+
+		# Send ERROR_MESSAGE email
+		echo "${ERROR_MESSAGE}" | 
+		${MAIL} -s "${PROG} Error on ${HOST}" ${ERROR_EMAIL_LIST}
+
+		# exit
+		exit
+	fi
+
+	# Set SECURITY_ALERT
+	DATE_TIME=`date '+%b %d %Y, %H:%M'`
+	SECURITY_ALERT="Security Alert: The system \"${HOST}\" logged \"${FAIL_ROOT_LOGIN_COUNT}\" failed ssh login's to root, ${DATE_TIME}"
+
+	# Display Message to interactive users
+	[ ${INTERACTIVE} = YES ] && echo ""
+	[ ${INTERACTIVE} = YES ] && echo "${SECURITY_ALERT}"
+
+	# Build SECURITY_ALERT_FILE, used to send email
+	echo "" >> ${SECURITY_ALERT_FILE}
+	echo "${SECURITY_ALERT}" >> ${SECURITY_ALERT_FILE}
+
+	# Build LOCAL_ADMIN_AUDIT, used to update $ADMIN_AUDIT
+	echo "" >> ${LOCAL_ADMIN_AUDIT}
+	echo "${SECURITY_ALERT}" >> ${LOCAL_ADMIN_AUDIT}
+	grep -w sshd ${AUTHLOG} | grep pam_unix | 
+		grep -c "authentication failure" | grep -c 'uid=0 euid=0' >> ${LOCAL_ADMIN_AUDIT}
+fi
+
+
+###################################################################################
+# Move $AUTHLOG to backup directory
+###################################################################################
+
+# Create the directory $AUTH_BACKUP_DIR as needed
+[ ! -d ${AUTH_BACKUP_DIR} ] && mkdir ${AUTH_BACKUP_DIR}
+
+# Copy ${AUTHLOG} to ${AUTH_BACKUP_DIR}/${AUTH_FILE}.${MONTH}.${DAY}.${YEAR}
+cp ${AUTHLOG} ${AUTH_BACKUP_DIR}/${AUTH_FILE}.${MONTH}.${DAY}.${YEAR}
+chmod 600 ${AUTH_BACKUP_DIR}/${AUTH_FILE}.${MONTH}.${DAY}.${YEAR}
+
+# Create new zero sized ${AUTHLOG} file
+> ${AUTHLOG}
+chmod 600 ${AUTHLOG}
+
+# Force syslogd to reread config file
+pkill -1 ${SYSLOGD}
+
+###################################################################################
+# Send Security Alert email and update $ADMIN_AUDIT as needed
+###################################################################################
+SECURITY_EMAIL
